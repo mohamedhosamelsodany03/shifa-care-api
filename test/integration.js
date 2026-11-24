@@ -54,6 +54,20 @@ const server = app.listen(PORT, async () => {
     check('legacy otp/verify returns token alias', r.status === 200 && typeof r.body.token === 'string' && r.body.role === 'provider', JSON.stringify(r.body).slice(0, 200));
     const provToken = r.body.token;
 
+    // 2b. phone-only login fallback (owner-authorized 24 Nov 2026: Meta OTP blocked)
+    r = await call('POST', '/api/auth/login-phone', { phone: '01000000001', role: 'provider' });
+    check('phone login demo provider -> 200 provider + token alias', r.status === 200 && typeof r.body.token === 'string' && r.body.role === 'provider' && r.body.providerId === 'prov_demo_starter', JSON.stringify(r.body).slice(0, 200));
+    r = await call('POST', '/api/auth/login-phone', { phone: '01012345678', role: 'provider' });
+    check('unknown provider phone with role=provider -> 403', r.status === 403, JSON.stringify(r.body).slice(0, 150));
+    r = await call('POST', '/api/auth/login-phone', { phone: '01099999999' });
+    check('phone login new patient -> 200 patient', r.status === 200 && r.body.role === 'patient' && typeof r.body.token === 'string', JSON.stringify(r.body).slice(0, 150));
+    const rlStatuses = [];
+    for (let i = 0; i < 6; i++) {
+      const rr = await call('POST', '/api/auth/login-phone', { phone: '01088888888' });
+      rlStatuses.push(rr.status);
+    }
+    check('phone login rate limit: 5 ok then 429', rlStatuses.slice(0, 5).every((s) => s === 200) && rlStatuses[5] === 429, JSON.stringify(rlStatuses));
+
     // 3. patient OTP via legacy path
     await call('POST', '/api/auth/otp/request', { phone: '01099999999', channel: 'whatsapp' });
     // patient code is in mock log only; use the admin mock-otp endpoint after admin login below — instead verify demo patient flow via a fresh OTP request + reading data file
