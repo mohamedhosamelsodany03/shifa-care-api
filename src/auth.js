@@ -1,5 +1,9 @@
 // JWT access (15 min) + revocable opaque refresh tokens (7 days).
-// Phone alone is NEVER accepted as auth anywhere.
+// POST /api/auth/login-phone is a phone-only fallback authorized by the
+// owner on 24 Nov 2026 while Meta WhatsApp OTP is blocked — see routes.js.
+// Phone alone is never accepted as an Authorization credential: every
+// protected route still requires a valid JWT issued by OTP verify or by
+// the phone-only login endpoint.
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const config = require('./config');
