@@ -1,0 +1,27 @@
+# Render free tier deployment. Set the env vars below in the Render dashboard
+# (never commit secrets here). Free tier sleeps when idle — first request
+# after idle may take ~30–60s to wake.
+services:
+  - type: web
+    name: shifa-care-api
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MOCK_OTP
+        value: "false"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_PIN
+        sync: false # set manually in the Render dashboard — the admin must know it
+      - key: CORS_ORIGIN
+        value: https://shifa-care.example.com
+      - key: PAYMENT_NUMBER
+        value: "01008629060"
+      - key: USD_EGP
+        value: "48"
+      - key: EUR_EGP
+        value: "52"
