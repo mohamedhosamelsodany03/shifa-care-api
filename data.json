@@ -1,16 +1,7 @@
 {
   "version": 1,
-  "createdAt": "2026-11-24T08:38:49.244Z",
-  "users": {
-    "01000000001": {
-      "phone": "01000000001",
-      "createdAt": "2026-11-24T08:38:56.647Z"
-    },
-    "01077777777": {
-      "phone": "01077777777",
-      "createdAt": "2026-11-24T08:39:14.675Z"
-    }
-  },
+  "createdAt": "2026-11-24T09:51:07.081Z",
+  "users": {},
   "providers": {
     "prov_demo_starter": {
       "id": "prov_demo_starter",
@@ -30,8 +21,8 @@
       "interviewStatus": "passed",
       "interviewScore": null,
       "ratingAvg": 4.8,
-      "completedVisits": 13,
-      "createdAt": "2026-11-24T08:38:49.243Z"
+      "completedVisits": 12,
+      "createdAt": "2026-11-24T09:51:07.071Z"
     },
     "prov_demo_pro": {
       "id": "prov_demo_pro",
@@ -57,313 +48,33 @@
       "interviewScore": null,
       "ratingAvg": 4.9,
       "completedVisits": 47,
-      "createdAt": "2026-11-24T08:38:49.244Z"
+      "createdAt": "2026-11-24T09:51:07.081Z"
     }
   },
   "providersByPhone": {
     "01000000001": "prov_demo_starter",
     "01000000002": "prov_demo_pro"
   },
-  "bookings": {
-    "bk_be178bcc0p9m": {
-      "id": "bk_be178bcc0p9m",
-      "kind": "standard",
-      "patientPhone": "01000000001",
-      "patientName": "Test Patient",
-      "serviceCode": "standard",
-      "serviceName": "Standard home visit",
-      "status": "provider_confirmed",
-      "amountEgp": 350,
-      "baseEgp": 250,
-      "distanceFeeEgp": 100,
-      "distanceKm": 8,
-      "distanceBand": "6–10km",
-      "distanceEstimate": true,
-      "transport": "none",
-      "hotelId": null,
-      "currency": "EGP",
-      "amountForeign": null,
-      "fxRate": null,
-      "paymentMethod": "cash_receipt",
-      "respectCharterAccepted": true,
-      "triage": {
-        "dangerSigns": [],
-        "notes": null
-      },
-      "address": null,
-      "scheduledAt": null,
-      "notes": null,
-      "alternateContact": null,
-      "providerId": "prov_demo_starter",
-      "commissionPct": 8,
-      "providerShareEgp": null,
-      "appShareEgp": null,
-      "vitals": {
-        "bpSystolic": 120,
-        "bpDiastolic": 80,
-        "pulse": 72,
-        "glucose": 110,
-        "oxygen": 98,
-        "temp": 36.6,
-        "at": "2026-11-24T08:38:56.872Z",
-        "notes": ""
-      },
-      "review": null,
-      "providerReview": null,
-      "complaint": false,
-      "cashCollectedByProvider": false,
-      "overdue": false,
-      "createdAt": "2026-11-24T08:38:56.746Z",
-      "acceptedAt": "2026-11-24T08:38:56.858Z",
-      "providerConfirmedAt": "2026-11-24T08:38:56.884Z",
-      "patientConfirmedAt": null,
-      "reviewedAt": null,
-      "releasedAt": null,
-      "releaseMode": null
-    },
-    "bk_80e12591135w": {
-      "id": "bk_80e12591135w",
-      "kind": "standard",
-      "patientPhone": "01077777777",
-      "patientName": "Live Patient",
-      "serviceCode": "standard",
-      "serviceName": "Standard home visit",
-      "status": "released",
-      "amountEgp": 350,
-      "baseEgp": 250,
-      "distanceFeeEgp": 100,
-      "distanceKm": 8,
-      "distanceBand": "6–10km",
-      "distanceEstimate": true,
-      "transport": "none",
-      "hotelId": null,
-      "currency": "EGP",
-      "amountForeign": null,
-      "fxRate": null,
-      "paymentMethod": "cash_receipt",
-      "respectCharterAccepted": true,
-      "triage": {
-        "dangerSigns": [],
-        "notes": null
-      },
-      "address": null,
-      "scheduledAt": null,
-      "notes": null,
-      "alternateContact": null,
-      "providerId": "prov_demo_starter",
-      "commissionPct": 8,
-      "providerShareEgp": 322,
-      "appShareEgp": 28,
-      "vitals": {
-        "bpSystolic": 120,
-        "bpDiastolic": 80,
-        "pulse": 72,
-        "glucose": 110,
-        "oxygen": 98,
-        "temp": 36.6,
-        "at": "2026-11-24T08:39:14.894Z",
-        "notes": ""
-      },
-      "review": {
-        "rating": 5,
-        "comment": "شكرًا",
-        "at": "2026-11-24T08:39:14.973Z"
-      },
-      "providerReview": null,
-      "complaint": false,
-      "cashCollectedByProvider": false,
-      "overdue": false,
-      "createdAt": "2026-11-24T08:39:14.756Z",
-      "acceptedAt": "2026-11-24T08:39:14.882Z",
-      "providerConfirmedAt": "2026-11-24T08:39:14.904Z",
-      "patientConfirmedAt": "2026-11-24T08:39:14.939Z",
-      "reviewedAt": "2026-11-24T08:39:14.973Z",
-      "releasedAt": "2026-11-24T08:39:14.974Z",
-      "releaseMode": "reviewed"
-    }
-  },
+  "bookings": {},
   "interviews": {},
   "otps": {},
-  "refreshTokens": {
-    "ea51c9ff-9a75-46e7-976a-0c7eea3e38ae": {
-      "id": "ea51c9ff-9a75-46e7-976a-0c7eea3e38ae",
-      "phone": "01000000001",
-      "role": "provider",
-      "providerId": "prov_demo_starter",
-      "hash": "3a7aa42f10ee8e28029cca3977c84bcde123cfe5e51cd9df7648ce4443c54bc4",
-      "expiresAt": "2026-12-01T08:38:56.650Z",
-      "revoked": false,
-      "createdAt": "2026-11-24T08:38:56.650Z"
-    },
-    "2c58ebae-c4b7-4ab9-b01a-5f2b0ea8a8ea": {
-      "id": "2c58ebae-c4b7-4ab9-b01a-5f2b0ea8a8ea",
-      "phone": "01000000001",
-      "role": "provider",
-      "providerId": "prov_demo_starter",
-      "hash": "351606b923debb5dd4556a1ce29bfdaa60c86ce042c3e9a2c0fed0beef0e91d4",
-      "expiresAt": "2026-12-01T08:39:04.004Z",
-      "revoked": false,
-      "createdAt": "2026-11-24T08:39:04.004Z"
-    },
-    "459c0ed6-c46b-4ddb-b1c1-0179b7521fda": {
-      "id": "459c0ed6-c46b-4ddb-b1c1-0179b7521fda",
-      "phone": "01077777777",
-      "role": "patient",
-      "providerId": null,
-      "hash": "b8df5648e7e9fc4ffd9527e579f146960eabcc0cc9fe107792a1905df38783be",
-      "expiresAt": "2026-12-01T08:39:14.676Z",
-      "revoked": false,
-      "createdAt": "2026-11-24T08:39:14.676Z"
-    }
-  },
+  "refreshTokens": {},
   "audit": [
     {
-      "ts": "2026-11-24T08:38:56.651Z",
-      "action": "auth.otp_verified",
-      "actor": "01000000001",
+      "ts": "2026-11-24T09:51:10.896Z",
+      "action": "admin.pin_failed",
+      "actor": "::1",
       "details": {
-        "role": "provider"
+        "failures": 1
       },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:38:56.746Z",
-      "action": "booking.created",
-      "actor": "01000000001",
-      "details": {
-        "bookingId": "bk_be178bcc0p9m",
-        "serviceCode": "standard",
-        "totalEgp": 350
-      },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:38:56.858Z",
-      "action": "booking.accepted",
-      "actor": "01000000001",
-      "details": {
-        "bookingId": "bk_be178bcc0p9m",
-        "providerId": "prov_demo_starter",
-        "commissionPct": 8
-      },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:38:56.873Z",
-      "action": "booking.vitals",
-      "actor": "01000000001",
-      "details": {
-        "bookingId": "bk_be178bcc0p9m"
-      },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:38:56.884Z",
-      "action": "booking.provider_confirmed",
-      "actor": "01000000001",
-      "details": {
-        "bookingId": "bk_be178bcc0p9m",
-        "note": "Provider confirmed completion before leaving; patient confirmation is separate."
-      },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:39:04.005Z",
-      "action": "auth.otp_verified",
-      "actor": "01000000001",
-      "details": {
-        "role": "provider"
-      },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:39:14.677Z",
-      "action": "auth.otp_verified",
-      "actor": "01077777777",
-      "details": {
-        "role": "patient"
-      },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:39:14.756Z",
-      "action": "booking.created",
-      "actor": "01077777777",
-      "details": {
-        "bookingId": "bk_80e12591135w",
-        "serviceCode": "standard",
-        "totalEgp": 350
-      },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:39:14.882Z",
-      "action": "booking.accepted",
-      "actor": "01000000001",
-      "details": {
-        "bookingId": "bk_80e12591135w",
-        "providerId": "prov_demo_starter",
-        "commissionPct": 8
-      },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:39:14.894Z",
-      "action": "booking.vitals",
-      "actor": "01000000001",
-      "details": {
-        "bookingId": "bk_80e12591135w"
-      },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:39:14.904Z",
-      "action": "booking.provider_confirmed",
-      "actor": "01000000001",
-      "details": {
-        "bookingId": "bk_80e12591135w",
-        "note": "Provider confirmed completion before leaving; patient confirmation is separate."
-      },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:39:14.939Z",
-      "action": "booking.patient_confirmed",
-      "actor": "01077777777",
-      "details": {
-        "bookingId": "bk_80e12591135w"
-      },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:39:14.973Z",
-      "action": "booking.reviewed",
-      "actor": "01077777777",
-      "details": {
-        "bookingId": "bk_80e12591135w",
-        "rating": 5
-      },
-      "ip": null
-    },
-    {
-      "ts": "2026-11-24T08:39:14.974Z",
-      "action": "escrow.released",
-      "actor": "prov_demo_starter",
-      "details": {
-        "bookingId": "bk_80e12591135w",
-        "mode": "reviewed",
-        "totalEgp": 350,
-        "appShareEgp": 28,
-        "providerShareEgp": 322
-      },
-      "ip": null
+      "ip": "::1"
     }
   ],
   "sos": [],
   "safetyReports": [],
   "adminPin": {
-    "hash": "$2a$10$/X5jW1eHXRKp7ZpdckB3iut/FIwONU6Y8s62Yy79od0u48mZyrSy.",
-    "failures": 0,
+    "hash": "$2a$10$3noBM5EoIqgDtsHl0sSPruNFP3BZr1qdkm4paC.A/UiYZDBWTwda2",
+    "failures": 1,
     "lockedUntil": null
   },
   "hotels": [
