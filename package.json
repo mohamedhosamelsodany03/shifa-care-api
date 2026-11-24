@@ -17,7 +17,10 @@
   "scripts": {
     "dev": "node server.js",
     "start": "node server.js",
-    "test": "node test/smoke.js"
+    "test": "node test/smoke.js",
+    "test:otp": "node test/test-otp-meta.js",
+    "test:integration": "node test/integration.js",
+    "test:all": "node test/smoke.js && node test/integration.js && node test/test-otp-meta.js"
   },
   "type": "commonjs",
   "version": "2.0.1"
