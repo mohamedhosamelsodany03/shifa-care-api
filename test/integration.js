@@ -10,6 +10,10 @@ const DATA = path.join(__dirname, '..', 'data-integration-test.json');
 process.env.DATA_FILE = DATA;
 process.env.MOCK_OTP = 'true';
 process.env.PORT = String(PORT);
+// Test-only admin PIN (mirrors smoke.js). Since the fail-closed fix
+// (commit 24a2246), no PIN is seeded by default, so the admin-login
+// checks below need an explicit test PIN.
+process.env.ADMIN_PIN = '123456';
 try { fs.unlinkSync(DATA); } catch (e) { /* ignore */ }
 
 const { createApp } = require('../src/app');
