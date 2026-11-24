@@ -43,11 +43,18 @@ const config = {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
-  // WhatsApp OTP provider (TODO — not implemented, see src/otp.js).
+  // WhatsApp OTP provider — Meta WhatsApp Cloud API (see src/otp.js).
+  // provider: 'meta' (Cloud API) | '' (unset = no real provider).
+  // WHATSAPP_API_KEY is kept as a legacy alias for the access token.
   whatsapp: {
-    provider: process.env.WHATSAPP_PROVIDER || '', // e.g. 'twilio' | 'meta'
+    provider: process.env.WHATSAPP_PROVIDER || '', // 'meta'
+    accessToken: process.env.WHATSAPP_ACCESS_TOKEN || process.env.WHATSAPP_API_KEY || '',
     apiKey: process.env.WHATSAPP_API_KEY || '',
-    sender: process.env.WHATSAPP_SENDER || '',
+    phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID || '',
+    sender: process.env.WHATSAPP_SENDER || '01222771626',
+    templateName: process.env.WHATSAPP_TEMPLATE_NAME || 'otp_code',
+    templateLang: process.env.WHATSAPP_TEMPLATE_LANG || 'en_US',
+    apiVersion: process.env.WHATSAPP_API_VERSION || 'v21.0',
   },
   sms: {
     provider: process.env.SMS_PROVIDER || '',
