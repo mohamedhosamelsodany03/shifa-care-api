@@ -49,9 +49,11 @@ function createApp() {
 
   // Rate limits.
   const otpLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many OTP requests from this IP.' } });
+  const phoneLoginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many login attempts from this IP.' } });
   const pinLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many PIN attempts from this IP.' } });
   const bookingLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 60, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many booking requests from this IP.' } });
   app.use('/api/otp/request', otpLimiter);
+  app.use('/api/auth/login-phone', phoneLoginLimiter);
   app.use('/api/admin/pin/verify', pinLimiter);
   app.use('/api/bookings', bookingLimiter);
   app.use('/api/tourist-bookings', bookingLimiter);
