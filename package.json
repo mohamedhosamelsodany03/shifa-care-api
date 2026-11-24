@@ -1,0 +1,24 @@
+{
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.4.1",
+    "helmet": "^7.2.0",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "description": "Shifa Care \u2014 home healthcare API (Phase 1 core, El Quseir only). Escrow bookings, OTP+JWT auth, provider MCQ interview, admin PIN, hotels, NPWT calculator.",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "server.js",
+  "name": "shifa-care-server",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "test": "node test/smoke.js"
+  },
+  "type": "commonjs",
+  "version": "2.0.1"
+}
