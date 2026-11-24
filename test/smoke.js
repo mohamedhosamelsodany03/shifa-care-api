@@ -90,6 +90,29 @@ async function main() {
     check('refresh token rotates to new access token', r.status === 200 && !!r.json?.accessToken, JSON.stringify(r.json));
     const patientToken2 = r.json?.accessToken;
 
+    // --- 3b. phone-only login fallback (owner-authorized 24 Nov 2026:
+    // Meta WhatsApp OTP blocked) --------------------------------------
+    console.log('\n[phone-only login fallback]');
+    r = await req('POST', '/api/auth/login-phone', { body: { phone: '01000000001', role: 'provider' } });
+    check('phone login demo provider -> 200 provider + token alias', r.status === 200 && r.json?.role === 'provider' && typeof r.json?.token === 'string' && r.json?.providerId === 'prov_demo_starter', JSON.stringify(r.json));
+    const phoneProvToken = r.json?.accessToken;
+    r = await req('GET', '/api/providers/me', { token: phoneProvToken });
+    check('phone-login provider token opens /providers/me', r.status === 200 && r.json?.phone === '01000000001', JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/login-phone', { body: { phone: '01012345678', role: 'provider' } });
+    check('unknown provider phone with role=provider -> 403', r.status === 403, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/login-phone', { body: { phone: '01077777777' } });
+    check('new patient phone -> 200 patient + token', r.status === 200 && r.json?.role === 'patient' && !!r.json?.accessToken, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/login-phone', { body: { phone: '123' } });
+    check('invalid phone -> 400', r.status === 400, JSON.stringify(r.json));
+    // per-phone rate limit: same 5/hour cap as OTP requests
+    const rlPhone = '01088888888';
+    let rlStatuses = [];
+    for (let i = 0; i < 6; i++) {
+      const rr = await req('POST', '/api/auth/login-phone', { body: { phone: rlPhone } });
+      rlStatuses.push(rr.status);
+    }
+    check('phone login rate limit: 5 ok then 429', rlStatuses.slice(0, 5).every((s) => s === 200) && rlStatuses[5] === 429, JSON.stringify(rlStatuses));
+
     // --- 4. triage + charter -------------------------------------------
     console.log('\n[triage + charter]');
     r = await req('POST', '/api/bookings', { token: patientToken2, body: {
