@@ -165,7 +165,15 @@ router.post('/otp/request', async (req, res) => {
   rec.channel = channel;
   rec.requests.push(Date.now());
   store.data.otps[phone] = rec;
-  store.save();
+  // This handler is async: a synchronous throw here would reject the
+  // promise, which Express 4 does not catch, and crash the whole process.
+  // Persist defensively and fail closed with a 500 instead.
+  try {
+    store.save();
+  } catch (e) {
+    console.error('[error] otp/request save failed:', e && e.message);
+    return res.status(500).json({ error: 'internal', message: 'Could not store OTP request.' });
+  }
   try {
     const provider = pickProvider(channel);
     await provider.send({ phone, channel, code });
