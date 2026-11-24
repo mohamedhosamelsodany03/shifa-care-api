@@ -22,8 +22,10 @@ const config = {
   mockOtp: process.env.MOCK_OTP
     ? process.env.MOCK_OTP === 'true'
     : process.env.NODE_ENV !== 'production',
-  // Admin PIN from env; default 123456 is a DEV placeholder — change it.
-  adminPin: process.env.ADMIN_PIN || '123456',
+  // Admin PIN from env; null when unset — the admin login is then DISABLED
+  // (fail-closed: the seeded hash is random and unguessable) until a PIN is
+  // set and the service restarts. Never fall back to a guessable default.
+  adminPin: process.env.ADMIN_PIN || null,
   adminPinMaxAttempts: 5,
   adminPinLockMinutes: 15,
   otpLength: 6,
@@ -71,13 +73,16 @@ if (!process.env.JWT_SECRET && config.isProd) {
   throw new Error('JWT_SECRET must be set in production');
 }
 if (!process.env.ADMIN_PIN && config.isProd) {
-  throw new Error('ADMIN_PIN must be set in production');
+  // Do NOT throw: the API must be able to boot before the owner picks a PIN.
+  // Admin login stays disabled (seeded with a random hash) until ADMIN_PIN
+  // is set in the host dashboard and the service restarts.
+  console.warn('[WARN] ADMIN_PIN not set in production — admin login is DISABLED until a PIN is set.');
 }
 if (!process.env.JWT_SECRET) {
   console.warn('[WARN] JWT_SECRET not set — using dev default. DO NOT use in production.');
 }
 if (!process.env.ADMIN_PIN) {
-  console.warn('[WARN] ADMIN_PIN not set — using default 123456. Change it before launch.');
+  console.warn('[WARN] ADMIN_PIN not set — admin login disabled. Set ADMIN_PIN in the host dashboard before launch.');
 }
 
 module.exports = config;
