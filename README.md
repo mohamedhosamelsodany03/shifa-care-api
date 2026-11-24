@@ -43,10 +43,15 @@ Health check: `GET /health`.
 - `POST /api/otp/verify {phone, code}` → access JWT (15 min) + refresh
   token (7 days, revocable, stored server-side, rotated on refresh).
 - `POST /api/auth/refresh`, `POST /api/auth/logout`.
-- OTP provider is a swappable interface (`src/otp.js`). Phase 1 ships
-  **MockOtpProvider only**: it logs the code to the console and stores it
-  hashed server-side. The WhatsApp/SMS providers are stubs marked TODO
-  with env vars — they throw instead of faking a real send.
+- OTP provider is a swappable interface (`src/otp.js`). **Meta WhatsApp
+  Cloud API is implemented** (`WhatsAppOtpProvider`, provider `'meta'`):
+  `POST https://graph.facebook.com/v21.0/{phone_number_id}/messages`,
+  Bearer token, approved **authentication** template (`otp_code`, `en_US`,
+  copy-code button), Egyptian numbers normalized to E.164 (`01…` → `20…`).
+  In production with `WHATSAPP_PROVIDER` unset or the token/phone-number-id
+  missing, OTP fails closed (`502 otp_provider_error`) — it never pretends
+  a code was sent. MockOtpProvider is dev-only. Setup:
+  `WHATSAPP-OTP-SETUP.md` in `workspace/shifa-care-rebuild/`.
   **Demo phones** (mock mode only): `01000000001` / `01000000002`,
   mock OTP `123456`, seeded as verified Starter / Pro nurses.
 
@@ -133,10 +138,12 @@ confirmed (accepted) — never in `/bootstrap` and never on a `held` booking.**
 - `MOCK_OTP` defaults ON in dev, OFF in production. Never enable mock OTP
   in production.
 
-## Deploy (Render, free tier)
+## Deploy (Railway, free tier)
 
 ```bash
-# render.yaml is included; set env vars in the Render dashboard:
+# Set env vars in the Railway dashboard (see WHATSAPP-OTP-SETUP.md for the
+# WhatsApp OTP vars — WHATSAPP_PROVIDER=meta, WHATSAPP_ACCESS_TOKEN,
+# WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TEMPLATE_NAME):
 #   NODE_ENV=production, MOCK_OTP=false, JWT_SECRET (generated),
 #   ADMIN_PIN (set manually — the admin must know it),
 #   CORS_ORIGIN=<your frontend origin>
@@ -152,6 +159,7 @@ production, move the store to persistent disk / a database before launch
 - Hurghada (cities/zones, German/Russian tourist paths, card payments).
 - Direct billing with insurers (insurance reports are stamped PDFs/HTML
   for the tourist to submit).
-- Real WhatsApp/SMS OTP provider (TODO stubs in `src/otp.js`).
+- Real WhatsApp OTP provider (Meta Cloud API, `src/otp.js`).
+  SMS fallback is still a TODO stub — WhatsApp is the only live channel.
 - Shifa Bag, Takaful fund, hotel B2B contracts, advanced NPWT.
 - PIN change endpoint (use the env var).
