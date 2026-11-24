@@ -1,5 +1,5 @@
-// All /api routes. Auth rule: ONLY bootstrap, otp/*, auth/refresh and
-// admin/pin/verify are public. Everything else requires a valid JWT, and
+// All /api routes. Auth rule: ONLY bootstrap, otp/*, auth/login-phone,
+// auth/refresh and admin/pin/verify are public. Everything else requires a valid JWT, and
 // ownership / role checks happen server-side on every request.
 const express = require('express');
 const bcrypt = require('bcryptjs');
@@ -217,6 +217,46 @@ router.post('/otp/verify', (req, res) => {
   store.save();
   // `token` is the field the web frontend reads (alias of accessToken).
   res.json({ ...tokens, token: tokens.accessToken, role, providerId: provider ? provider.id : null, phone });
+});
+
+// ---------------------------------------------------------------- phone-only login (fallback)
+// OWNER DECISION 24 Nov 2026: Meta refused the WhatsApp OTP template 7
+// times (template creation not permitted for this account) and the
+// display-name edit is disabled, so OTP login cannot work yet. The owner
+// explicitly authorized login by phone number alone — the v1.3 behaviour —
+// until OTP is unblocked. SECURITY CAVEAT: phone-only login means anyone
+// who knows a phone number can log in as that number's account. The OTP
+// endpoints and the Meta WhatsApp provider in src/otp.js are KEPT intact
+// so OTP can be re-enabled later without rebuilding the auth flow.
+//   POST /api/auth/login-phone { phone, role? }
+//   role=provider: only a phone already registered as a provider works
+//     (unknown provider phone -> 403). role absent/patient: the phone is
+//     a patient; a user record is created on first use (patients only).
+//   Rate limit: same per-phone cap as OTP requests (5/hour) + an IP
+//     limiter in app.js. Every login is audit-logged.
+router.post('/auth/login-phone', (req, res) => {
+  const phone = normalizePhone(req.body?.phone);
+  if (!phone) return bad(res, 400, 'Valid Egyptian phone number required (01xxxxxxxxx).');
+  const provider = store.getProviderByPhone(phone);
+  if (req.body?.role === 'provider' && !provider) {
+    return res.status(403).json({ error: 'forbidden', message: 'This phone is not registered as a provider. Register as a provider first.' });
+  }
+  const logins = store.data.phoneLogins || (store.data.phoneLogins = {});
+  const rec = logins[phone] || { requests: [] };
+  const hourAgo = Date.now() - 60 * 60 * 1000;
+  rec.requests = (rec.requests || []).filter((t) => t > hourAgo);
+  if (rec.requests.length >= config.otpMaxRequestsPerHour) {
+    return res.status(429).json({ error: 'rate_limited', message: 'Too many login attempts for this number. Try again later.' });
+  }
+  rec.requests.push(Date.now());
+  logins[phone] = rec;
+  if (!store.data.users[phone]) store.data.users[phone] = { phone, createdAt: nowIso() };
+  const role = provider ? 'provider' : 'patient';
+  const tokens = issueTokens({ phone, role, providerId: provider ? provider.id : null });
+  store.audit('auth.phone_login', phone, { role, authMethod: 'phone-only-fallback' });
+  store.save();
+  // `token` is the field the web frontend reads (alias of accessToken).
+  res.json({ ...tokens, token: tokens.accessToken, role, providerId: provider ? provider.id : null, phone, authMethod: 'phone-only' });
 });
 
 // ---------------------------------------------------------------- auth
