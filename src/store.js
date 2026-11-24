@@ -51,7 +51,12 @@ function seed() {
     sos: [],
     safetyReports: [],
     adminPin: {
-      hash: bcrypt.hashSync(config.adminPin, 10),
+      // No PIN configured => hash a random value so NO pin can ever match.
+      // Admin login is disabled until ADMIN_PIN is set and the service restarts.
+      hash: bcrypt.hashSync(
+        config.adminPin || crypto.randomBytes(32).toString('hex'),
+        10
+      ),
       failures: 0,
       lockedUntil: null,
     },
