@@ -46,6 +46,7 @@ function seed() {
     bookings: {},
     interviews: {}, // providerId -> { attempts: [...] }
     otps: {}, // phone -> { codeHash, expiresAt, attempts, requests: [ts...] }
+    phoneLogins: {}, // phone -> { requests: [ts...] } (phone-only login fallback rate limit)
     refreshTokens: {}, // id -> { id, phone, hash, expiresAt, revoked }
     audit: [], // capped at 2000
     sos: [],
