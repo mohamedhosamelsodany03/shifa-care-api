@@ -9,7 +9,8 @@ process.env.WHATSAPP_SENDER = '01222771626';
 process.env.WHATSAPP_TEMPLATE_NAME = 'otp_code';
 process.env.WHATSAPP_TEMPLATE_LANG = 'en_US';
 process.env.JWT_SECRET = 'test-secret';
-process.env.ADMIN_PIN = '123456';
+// Test-only admin PIN, generated fresh on every run (never a fixed value).
+process.env.ADMIN_PIN = require('crypto').randomInt(100000, 1000000).toString();
 
 const realFetch = globalThis.fetch;
 let pass = 0;

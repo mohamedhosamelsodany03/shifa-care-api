@@ -1,0 +1,10 @@
+# Docker build context exclusions (Shifa Care API).
+# The runtime state file must NEVER be baked into the image: it is seeded
+# fresh on first boot (random admin hash when no ADMIN_PIN is set) and the
+# host env var is the source of truth for the admin PIN.
+data.json
+data.json.tmp-*
+data-*.json
+.env
+test/
+node_modules/

@@ -84,7 +84,7 @@ Health check: `GET /health`.
 | `GET /bookings/:id/insurance-report?lang=en\|de` | Stamped electronic report, JSON or `?format=html` printable page. Phase 1 only — tourist submits to insurer; **no direct billing**. |
 | `POST /npwt/calculate` | Rental 750/week or 1000/15 d, visit 600, kit 250–350, 5 dressings/14 d; canister separate only when full; written doctor order required. |
 | `POST /postop` | Post-operative care plan booking (1,400 EGP + distance). |
-| `POST /admin/pin/verify` | bcrypt-hashed PIN (env `ADMIN_PIN`, default `123456` — **must be changed**), 5 attempts then 15-min lock, audit-logged, 30-min admin JWT. |
+| `POST /admin/pin/verify` | bcrypt-hashed PIN (env `ADMIN_PIN` — set a strong 6-digit PIN in the host dashboard; no default is seeded), 5 attempts then 15-min lock, audit-logged, 30-min admin JWT. |
 | `GET /admin/providers`, `POST /admin/providers/:id/tier`, `POST /admin/providers/:id/verify` | Tier Starter 8% / Pro 12% / Elite 15%. |
 | `GET /admin/sos`, `GET /admin/audit` | SOS + overdue visits + safety reports; audit log. |
 | `GET /admin/mock-otp` | Dev only, gated by `MOCK_OTP=true` (default OFF in production). |

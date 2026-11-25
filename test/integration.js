@@ -12,8 +12,10 @@ process.env.MOCK_OTP = 'true';
 process.env.PORT = String(PORT);
 // Test-only admin PIN (mirrors smoke.js). Since the fail-closed fix
 // (commit 24a2246), no PIN is seeded by default, so the admin-login
-// checks below need an explicit test PIN.
-process.env.ADMIN_PIN = '123456';
+// checks below need an explicit test PIN. It is generated fresh on every
+// run — never a fixed value.
+const TEST_ADMIN_PIN = require('crypto').randomInt(100000, 1000000).toString();
+process.env.ADMIN_PIN = TEST_ADMIN_PIN;
 process.env.BOOKING_LIMIT_MAX = '500'; // v2.0.8: test run makes many booking calls
 try { fs.unlinkSync(DATA); } catch (e) { /* ignore */ }
 
@@ -78,7 +80,7 @@ const server = app.listen(PORT, async () => {
     check('otp record stored hashed (no plaintext code in data)', !JSON.stringify(data.otps).includes('"code":'));
 
     // 4. admin login via legacy path + dashboard aggregate
-    r = await call('POST', '/api/admin/login', { pin: '123456' });
+    r = await call('POST', '/api/admin/login', { pin: TEST_ADMIN_PIN });
     check('legacy admin/login returns token', r.status === 200 && typeof r.body.token === 'string', JSON.stringify(r.body).slice(0, 150));
     const adminToken = r.body.token;
     r = await call('GET', '/api/admin/dashboard', null, adminToken);

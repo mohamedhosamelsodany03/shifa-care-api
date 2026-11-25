@@ -4,7 +4,13 @@
 // It never touches the real data.json.
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
+
+// Test-only admin PIN: generated fresh on every run (never a fixed value).
+// The server seeds NO default PIN, so the admin-login checks below need
+// an explicit test PIN passed to the spawned server.
+const TEST_ADMIN_PIN = crypto.randomInt(100000, 1000000).toString();
 
 const PORT = 3456;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -34,7 +40,7 @@ async function main() {
   if (fs.existsSync(DATA_FILE)) fs.unlinkSync(DATA_FILE);
   const env = {
     ...process.env, PORT: String(PORT), NODE_ENV: 'test',
-    DATA_FILE, MOCK_OTP: 'true', JWT_SECRET: 'smoke-test-secret', ADMIN_PIN: '123456',
+    DATA_FILE, MOCK_OTP: 'true', JWT_SECRET: 'smoke-test-secret', ADMIN_PIN: TEST_ADMIN_PIN,
     AUTO_RELEASE_MS: '1000', // shorten the 1h auto-release window for the test only
     BOOKING_LIMIT_MAX: '500', // v2.0.8: one run now makes >60 booking-route calls
     CANCEL_WINDOW_MS: '5000', // shorten the 15-min cancel window for the test only
@@ -267,7 +273,7 @@ async function main() {
     // Auto-release window is 1000 ms in this test (AUTO_RELEASE_MS env).
     await sleep(1500);
     // Admin login for sweep.
-    r = await req('POST', '/api/admin/pin/verify', { body: { pin: '123456' } });
+    r = await req('POST', '/api/admin/pin/verify', { body: { pin: TEST_ADMIN_PIN } });
     check('admin PIN verify 200', r.status === 200 && !!r.json?.token, JSON.stringify(r.json));
     const adminToken = r.json?.token;
     r = await req('POST', '/api/jobs/sweep', { token: adminToken });
@@ -330,7 +336,7 @@ async function main() {
       r = await req('POST', '/api/admin/pin/verify', { body: { pin: '000000' } });
     }
     check('5 wrong PINs -> 401 then locked (423 or 401)', r.status === 401 || r.status === 423, `status=${r.status}`);
-    r = await req('POST', '/api/admin/pin/verify', { body: { pin: '123456' } });
+    r = await req('POST', '/api/admin/pin/verify', { body: { pin: TEST_ADMIN_PIN } });
     check('correct PIN while locked -> 423 locked', r.status === 423, JSON.stringify(r.json));
     // Admin endpoints still work with the earlier token.
     r = await req('GET', '/api/admin/audit', { token: adminToken });
