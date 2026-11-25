@@ -36,11 +36,12 @@ function createApp() {
   }));
   app.use(express.json({ limit: '200kb' }));
 
-  // CORS allowlist only — never '*'.
+  // CORS: configured allowlist from CORS_ORIGIN; a configured '*' (the
+  // Railway deployment sets CORS_ORIGIN=* on purpose) means any origin.
   app.use(cors({
     origin(origin, cb) {
       if (!origin) return cb(null, true); // non-browser clients (curl, tests)
-      if (config.corsOrigins.includes(origin)) return cb(null, true);
+      if (config.corsOrigins.includes('*') || config.corsOrigins.includes(origin)) return cb(null, true);
       return cb(new Error('CORS origin not allowed'));
     },
     methods: ['GET', 'POST'],
