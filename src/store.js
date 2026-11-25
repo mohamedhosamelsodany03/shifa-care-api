@@ -88,7 +88,7 @@ class Store {
   // it is set and does not match the stored hash. Without this, changing the
   // PIN in the host dashboard never takes effect, because data.json (seeded
   // once, with a random hash when no PIN was set at seed time) is loaded
-  // as-is on every restart and redeploy.
+  // as-is on every restart and redeploy. (Fix deployed 2026-11-25.)
   syncAdminPinFromEnv() {
     if (!config.adminPin) return;
     if (!this.data.adminPin) this.data.adminPin = { hash: '', failures: 0, lockedUntil: null };
