@@ -14,6 +14,7 @@ process.env.PORT = String(PORT);
 // (commit 24a2246), no PIN is seeded by default, so the admin-login
 // checks below need an explicit test PIN.
 process.env.ADMIN_PIN = '123456';
+process.env.BOOKING_LIMIT_MAX = '500'; // v2.0.8: test run makes many booking calls
 try { fs.unlinkSync(DATA); } catch (e) { /* ignore */ }
 
 const { createApp } = require('../src/app');
@@ -25,6 +26,8 @@ const server = app.listen(PORT, async () => {
     if (ok) { pass++; results.push(`  PASS ${name}`); }
     else { fail++; results.push(`  FAIL ${name}${extra ? ' — ' + extra : ''}`); }
   }
+  // v2.0.8 — Terms acceptance is mandatory for booking creation.
+  const TERMS = { acceptedTerms: true, termsVersion: '1.0' };
   async function call(method, p, body, token) {
     return new Promise((resolve) => {
       const data = body ? JSON.stringify(body) : null;
@@ -103,7 +106,7 @@ const server = app.listen(PORT, async () => {
 
     // 6. booking with FRONTEND-shaped payload (name/service/km/paymentMethod cash/charterAccepted)
     // Need a patient token: create one via OTP verify for a new phone using mock code from data file is not readable (hashed). Use provider token? Bookings require role patient — provider role is 'provider'; booking endpoint only requires auth, not role. Provider can create a booking in this test.
-    r = await call('POST', '/api/bookings', {
+    r = await call('POST', '/api/bookings', { ...TERMS,
       name: 'Test Patient', phone: '01099999999', service: 'standard', date: '2026-11-25', time: '10:00',
       address: 'Test St', km: 8, transportProvided: false, paymentMethod: 'cash', charterAccepted: true,
     }, provToken);
@@ -113,13 +116,13 @@ const server = app.listen(PORT, async () => {
     check('booking has service/total aliases', r.body.service === 'standard' && r.body.total === 350);
 
     // assistant band mapping
-    r = await call('POST', '/api/bookings', {
+    r = await call('POST', '/api/bookings', { ...TERMS,
       name: 'Test Patient', service: 'asst_5_9', km: 2, paymentMethod: 'instapay', charterAccepted: true,
     }, provToken);
     check('assistant band asst_5_9 -> 235 EGP', r.status === 201 && r.body.total === 235, JSON.stringify(r.body).slice(0, 200));
 
     // postop via /bookings with frontend postop payload (no km)
-    r = await call('POST', '/api/bookings', { name: 'Postop', service: 'postop', operation: 'Appendectomy', paymentMethod: 'cash', charterAccepted: true }, provToken);
+    r = await call('POST', '/api/bookings', { ...TERMS, name: 'Postop', service: 'postop', operation: 'Appendectomy', paymentMethod: 'cash', charterAccepted: true }, provToken);
     check('postop via bookings, default distance 0 -> 1400', r.status === 201 && r.body.total === 1400, JSON.stringify(r.body).slice(0, 200));
 
     // 7. legacy confirm paths

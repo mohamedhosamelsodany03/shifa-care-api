@@ -74,6 +74,10 @@ const config = {
   interviewMinutes: 20,
   interviewPassTotal: 12,
   interviewPassEthics: 3,
+  // v2.0.8 — Terms & Conditions version. Registration and booking
+  // creation require acceptedTerms=true AND termsVersion to match this
+  // value; bumping it forces every user to re-accept (see /api/me/terms).
+  termsVersion: '1.0',
 };
 
 if (!process.env.JWT_SECRET && config.isProd) {

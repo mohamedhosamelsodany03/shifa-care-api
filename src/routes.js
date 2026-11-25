@@ -43,6 +43,95 @@ function canSeeBooking(req, b) {
   if (req.user.role === 'provider' && b.providerId && req.user.providerId === b.providerId) return true;
   return false;
 }
+// Viewer-aware booking serializer: pass the request user so the
+// serializer can mask PII for unassigned providers (see store.js).
+function pubBooking(req, b, opts = {}) {
+  const viewer = req.user ? { role: req.user.role, phone: req.user.phone, providerId: req.user.providerId } : null;
+  return store.publicBooking(b, { ...opts, viewer });
+}
+// ---------------------------------------------------------------- v2.0.8 — Terms & Conditions + anti-circumvention
+// Terms acceptance is enforced server-side: registration and booking
+// creation require acceptedTerms=true with the CURRENT termsVersion.
+// The client also gates first use behind the same version (see
+// /api/me/terms), but the server check is what actually binds.
+function termsAccepted(body) {
+  return body && body.acceptedTerms === true && body.termsVersion === config.termsVersion;
+}
+function termsError(res) {
+  return bad(res, 400, `You must read and accept the current Terms & Conditions (version ${config.termsVersion}) before continuing.`, { termsVersion: config.termsVersion });
+}
+function recordTermsAcceptance(phone) {
+  const u = store.data.users[phone] || (store.data.users[phone] = { phone, createdAt: nowIso() });
+  u.termsAcceptedVersion = config.termsVersion;
+  u.termsAcceptedAt = nowIso();
+}
+// A suspended (or permanently banned) provider cannot take new work:
+// radar, accept, vitals, completion and cash collection are all blocked.
+function providerBlocked(p) {
+  if (!p) return null;
+  if (p.permanentBan) return 'This provider account is permanently banned. Contact admin.';
+  if (p.suspended) return 'This provider account is suspended. Contact admin.';
+  return null;
+}
+// Phone numbers are forbidden inside in-app messages: the masked channel
+// must never become a way to exchange personal numbers.
+const PHONE_IN_MESSAGE_RE = /(?:\+?20[\s-]?|0)?1[0-9][\s-]?[0-9]{4}[\s-]?[0-9]{4}|\b\d{10,}\b/;
+function containsPhoneNumber(text) {
+  return PHONE_IN_MESSAGE_RE.test(String(text || ''));
+}
+// In-app messaging is open from acceptance until 24h after completion
+// (patient confirmation / release). Before acceptance, or after the
+// window, or on cancelled/refunded bookings, the thread is closed.
+function messageWindowOpen(b) {
+  if (!b) return false;
+  if (['held', 'cancelled', 'refunded'].includes(b.status)) return false;
+  if (b.status === 'accepted' || b.status === 'provider_confirmed') return true;
+  const doneAt = b.patientConfirmedAt || b.releasedAt || b.providerConfirmedAt;
+  if (!doneAt) return true; // accepted-family statuses without a timestamp yet
+  return Date.now() - new Date(doneAt).getTime() <= 24 * 60 * 60 * 1000;
+}
+// Graduated-pattern heuristics for the admin circumvention report.
+// (a) one-time clients: a patient who booked once with this provider and
+// never booked again — a classic off-platform signal when it repeats.
+// (b) cancellations after acceptance by the same provider.
+// (c) circumvention reports filed against the provider.
+// These are signals for a human admin, not automatic guilt.
+function circumventionFlags() {
+  const bookings = Object.values(store.data.bookings);
+  const byProvider = {};
+  for (const p of Object.values(store.data.providers)) {
+    byProvider[p.id] = { providerId: p.id, name: p.name, phone: p.phone, tier: p.tier, suspended: !!p.suspended, permanentBan: !!p.permanentBan, warningCount: (p.warnings || []).length, oneTimeClients: 0, cancelledAfterAccept: 0, circumventionReports: 0, reasons: [] };
+  }
+  const patientBookings = {};
+  for (const b of bookings) {
+    if (!b.patientPhone) continue;
+    (patientBookings[b.patientPhone] = patientBookings[b.patientPhone] || []).push(b);
+  }
+  for (const b of bookings) {
+    const f = b.providerId && byProvider[b.providerId];
+    if (!f) continue;
+    if (b.status === 'cancelled' && b.acceptedAt) f.cancelledAfterAccept += 1;
+  }
+  for (const [phone, list] of Object.entries(patientBookings)) {
+    if (list.length === 1 && list[0].providerId && byProvider[list[0].providerId]) {
+      byProvider[list[0].providerId].oneTimeClients += 1;
+    }
+  }
+  for (const r of store.data.circumventionReports || []) {
+    const f = r.providerId && byProvider[r.providerId];
+    if (f) f.circumventionReports += 1;
+  }
+  return Object.values(byProvider)
+    .map((f) => {
+      if (f.circumventionReports > 0) f.reasons.push(`${f.circumventionReports} circumvention report(s)`);
+      if (f.oneTimeClients >= 3) f.reasons.push(`${f.oneTimeClients} one-time clients (booked once, never returned)`);
+      if (f.cancelledAfterAccept >= 2) f.reasons.push(`${f.cancelledAfterAccept} cancellations after acceptance`);
+      if (f.warningCount > 0) f.reasons.push(`${f.warningCount} warning(s) on file`);
+      return f;
+    })
+    .filter((f) => f.reasons.length > 0 || f.suspended || f.permanentBan)
+    .sort((a, b) => (b.circumventionReports - a.circumventionReports) || (b.oneTimeClients - a.oneTimeClients));
+}
 // ---------------------------------------------------------------- escrow
 // v2.0.1 — TWO-STAGE ESCROW (settled decision, 24 Nov 2026):
 //   Stage 1 (provisional release): the held amount is released to the
@@ -89,6 +178,8 @@ function sweepAutoRelease() {
   const overdue = [];
   for (const b of Object.values(store.data.bookings)) {
     if (b.status === 'patient_confirmed' && b.patientConfirmedAt && !b.review && !b.complaint) {
+      // v2.0.8: a circumvention hold pauses auto-release just like a complaint.
+      if (b.circumventionHold) continue;
       if (now - new Date(b.patientConfirmedAt).getTime() >= config.autoReleaseAfterMs) {
         releaseBooking(b, 'auto');
         released.push(b.id);
@@ -96,7 +187,7 @@ function sweepAutoRelease() {
     }
     // 'reviewed' only persists when a complaint paused the release; once
     // the complaint is resolved as rejected, release it now.
-    if (b.status === 'reviewed' && !b.complaint) {
+    if (b.status === 'reviewed' && !b.complaint && !b.circumventionHold) {
       releaseBooking(b, 'reviewed');
       released.push(b.id);
     }
@@ -143,8 +234,45 @@ router.get('/bootstrap', (req, res) => {
     fx: { usd: config.usdEgp, eur: config.eurEgp },
     mockMode: config.mockOtp,
     ambulance: '123',
+    termsVersion: config.termsVersion,
     note: 'Prices are fixed and announced in advance. No bargaining inside the app.',
   });
+});
+
+// ---------------------------------------------------------------- Terms & Conditions (v2.0.8)
+// Public: the current version + full text (Arabic binding, English
+// summary). The app shows this screen with a scroll-to-bottom gate and
+// a checkbox before registration or first booking.
+router.get('/terms', (req, res) => {
+  res.json({
+    version: cat.TERMS_VERSION,
+    updatedAt: cat.TERMS_UPDATED_AT,
+    textAr: cat.TERMS_AR,
+    textEn: cat.TERMS_EN,
+    note: 'The Arabic text is the binding version.',
+  });
+});
+
+// Per-user acceptance state. On login the app checks this: if the stored
+// version is older than the current one, the app shows the Terms screen
+// and blocks use until the user accepts.
+router.get('/me/terms', requireAuth, (req, res) => {
+  const u = store.data.users[req.user.phone] || {};
+  const acceptedVersion = u.termsAcceptedVersion || null;
+  res.json({
+    currentVersion: config.termsVersion,
+    acceptedVersion,
+    acceptedAt: u.termsAcceptedAt || null,
+    mustAccept: acceptedVersion !== config.termsVersion,
+  });
+});
+
+router.post('/me/terms', requireAuth, (req, res) => {
+  if (!termsAccepted(req.body)) return termsError(res);
+  recordTermsAcceptance(req.user.phone);
+  store.audit('terms.accepted', req.user.phone, { version: config.termsVersion, role: req.user.role });
+  store.save();
+  res.json({ ok: true, version: config.termsVersion, acceptedAt: nowIso() });
 });
 
 // ---------------------------------------------------------------- OTP
@@ -326,6 +454,8 @@ router.post('/bookings', requireAuth, (req, res) => {
   if (b.respectCharterAccepted !== true) {
     return bad(res, 400, 'Respect charter must be accepted before booking (respectCharterAccepted=true).', { charter: 'Treat the healthcare provider with respect: no insults, harassment or threats; keep the appointment; prepare the place. Violations lead to warning then account suspension.' });
   }
+  // v2.0.8 — Terms & Conditions are mandatory (same version for everyone).
+  if (!termsAccepted(req.body)) return termsError(res);
   if (!b.patientName || typeof b.patientName !== 'string') return bad(res, 400, 'patientName required.');
   if (!b.serviceCode || !cat.SERVICES[b.serviceCode]) return bad(res, 400, 'Valid serviceCode required.');
   if (!['cash_receipt', 'instapay'].includes(b.paymentMethod)) return bad(res, 400, 'paymentMethod must be cash_receipt or instapay.');
@@ -355,11 +485,13 @@ router.post('/bookings', requireAuth, (req, res) => {
     transport: b.transport || 'none', hotelId: b.hotelId || null,
     currency: 'EGP', amountForeign: null, fxRate: null,
     paymentMethod: b.paymentMethod, respectCharterAccepted: true,
+    termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
     triage: { dangerSigns: danger, notes: triage.notes || null },
     address: b.address || null, scheduledAt: b.scheduledAt || null, notes: b.notes || null,
     alternateContact: b.alternateContact || null, // admin-only if needed
     providerId: null, commissionPct: null, providerShareEgp: null, appShareEgp: null,
     vitals: null, review: null, providerReview: null, complaint: false,
+    circumventionHold: false, circumventionReportId: null,
     complaintStatus: null, complaintDeadline: null, complaintAt: null, complaintResolvedAt: null,
     settleableAt: null, cancelledAt: null, refundedAt: null, refundEgp: null,
     cashCollectedByProvider: false, overdue: false,
@@ -368,10 +500,11 @@ router.post('/bookings', requireAuth, (req, res) => {
   };
   store.data.bookings[id] = booking;
   store.audit('booking.created', req.user.phone, { bookingId: id, serviceCode: b.serviceCode, totalEgp: booking.amountEgp });
+  recordTermsAcceptance(req.user.phone);
   store.save();
   // Payment number is shown only AFTER the booking is confirmed (accepted),
   // so it is NOT included here.
-  res.status(201).json(store.publicBooking(booking));
+  res.status(201).json(pubBooking(req, booking));
 });
 
 router.get('/bookings/mine', requireAuth, (req, res) => {
@@ -380,14 +513,14 @@ router.get('/bookings/mine', requireAuth, (req, res) => {
     ? all.filter((b) => b.providerId === req.user.providerId)
     : all.filter((b) => b.patientPhone === req.user.phone);
   mine.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  res.json(mine.map((b) => store.publicBooking(b, { includePaymentNumber: b.status !== 'held' && b.status !== 'cancelled' })));
+  res.json(mine.map((b) => pubBooking(req, b, { includePaymentNumber: b.status !== 'held' && b.status !== 'cancelled' })));
 });
 
 router.get('/bookings/:id', requireAuth, (req, res) => {
   const b = loadBooking(req, res);
   if (!b) return;
   if (!canSeeBooking(req, b)) return res.status(403).json({ error: 'forbidden', message: 'This booking does not belong to you.' });
-  res.json(store.publicBooking(b, { includePaymentNumber: b.status !== 'held' && b.status !== 'cancelled' }));
+  res.json(pubBooking(req, b, { includePaymentNumber: b.status !== 'held' && b.status !== 'cancelled' }));
 });
 
 // v2.0.1 — cancellation: the client may cancel ONLY within 15 minutes
@@ -412,7 +545,7 @@ router.post('/bookings/:id/cancel', requireAuth, requireRole('patient'), (req, r
   b.refundedAt = nowIso();
   store.audit('booking.cancelled', req.user.phone, { bookingId: b.id, refundEgp: b.refundEgp, wasAccepted: !!b.providerId });
   store.save();
-  res.json({ ...store.publicBooking(b, { includePaymentNumber: false }), note: 'Cancelled within the 15-minute window — the full held amount is refunded.' });
+  res.json({ ...pubBooking(req, b, { includePaymentNumber: false }), note: 'Cancelled within the 15-minute window — the full held amount is refunded.' });
 });
 
 router.post('/bookings/:id/confirm-patient', requireAuth, requireRole('patient'), (req, res) => {
@@ -427,7 +560,7 @@ router.post('/bookings/:id/confirm-patient', requireAuth, requireRole('patient')
   b.settleableAt = b.complaintDeadline;
   store.audit('booking.patient_confirmed', req.user.phone, { bookingId: b.id, complaintDeadline: b.complaintDeadline });
   store.save();
-  res.json({ ...store.publicBooking(b, { includePaymentNumber: true }), note: 'If no review is submitted within 1 hour and there is no complaint, the held amount is released automatically (provisional). It becomes finally settleable only after the 24-hour complaint window ends with no open complaint.' });
+  res.json({ ...pubBooking(req, b, { includePaymentNumber: true }), note: 'If no review is submitted within 1 hour and there is no complaint, the held amount is released automatically (provisional). It becomes finally settleable only after the 24-hour complaint window ends with no open complaint.' });
 });
 
 router.post('/bookings/:id/review', requireAuth, requireRole('patient'), (req, res) => {
@@ -437,24 +570,39 @@ router.post('/bookings/:id/review', requireAuth, requireRole('patient'), (req, r
   if (b.status !== 'patient_confirmed') return bad(res, 409, `Cannot review while status is ${b.status}. Confirm receipt of the service first.`);
   const rating = Number(req.body?.rating);
   if (!Number.isInteger(rating) || rating < 1 || rating > 5) return bad(res, 400, 'rating must be an integer 1–5.');
-  b.review = { rating, comment: String(req.body?.comment || '').slice(0, 1000), at: nowIso() };
+  // v2.0.8 — anti-circumvention question (required in the review form):
+  // "Did the provider ask you to deal outside the app?" A "yes" creates
+  // an admin circumvention report and HOLDS this booking's release for
+  // manual review — exactly like an open complaint.
+  const circumventionReported = req.body?.circumventionReported;
+  if (circumventionReported !== undefined && typeof circumventionReported !== 'boolean') {
+    return bad(res, 400, 'circumventionReported must be true or false.');
+  }
+  b.review = { rating, comment: String(req.body?.comment || '').slice(0, 1000), at: nowIso(), circumventionReported: circumventionReported === true };
   b.status = 'reviewed';
   b.reviewedAt = nowIso();
+  if (circumventionReported === true) {
+    const report = { id: newId('circ'), bookingId: b.id, providerId: b.providerId || null, patientPhone: b.patientPhone, type: 'circumvention', description: 'Patient reported in the review: the provider asked to deal outside the app.', at: nowIso(), status: 'open' };
+    store.data.circumventionReports.push(report);
+    b.circumventionHold = true;
+    b.circumventionReportId = report.id;
+    store.audit('circumvention.reported', req.user.phone, { bookingId: b.id, providerId: b.providerId, reportId: report.id });
+  }
   const p = b.providerId ? store.data.providers[b.providerId] : null;
   if (p) {
     const n = p.completedVisits || 0;
     p.ratingAvg = n > 0 ? Math.round(((p.ratingAvg || 5) * n + rating) / (n + 1) * 10) / 10 : rating;
   }
-  store.audit('booking.reviewed', req.user.phone, { bookingId: b.id, rating });
-  if (b.complaint) {
-    // v2.0.1: an open complaint pauses the release — status stays
-    // 'reviewed' until admin resolves the complaint (sweep releases it
-    // if the complaint is rejected; a refund if it is accepted).
+  store.audit('booking.reviewed', req.user.phone, { bookingId: b.id, rating, circumventionReported: circumventionReported === true });
+  if (b.complaint || b.circumventionHold) {
+    // v2.0.8: an open complaint OR a circumvention hold pauses the
+    // release — status stays 'reviewed' until admin resolves it (the
+    // sweep releases it once the hold is cleared).
     store.save();
-    return res.json({ ...store.publicBooking(b, { includePaymentNumber: true }), note: 'Review recorded. Release is paused while your complaint is under review.' });
+    return res.json({ ...pubBooking(req, b, { includePaymentNumber: true }), note: b.circumventionHold ? 'Review recorded. The payout is held for admin review because you reported a request to deal outside the app.' : 'Review recorded. Release is paused while your complaint is under review.' });
   }
   releaseBooking(b, 'reviewed'); // review releases the held amount at once (provisional; final settlement after the 24h complaint window)
-  res.json(store.publicBooking(b, { includePaymentNumber: true }));
+  res.json(pubBooking(req, b, { includePaymentNumber: true }));
 });
 
 router.post('/bookings/:id/rate-patient', requireAuth, requireRole('provider'), (req, res) => {
@@ -469,7 +617,7 @@ router.post('/bookings/:id/rate-patient', requireAuth, requireRole('provider'), 
   b.providerReview = { rating, comment: String(req.body?.comment || '').slice(0, 1000), at: nowIso() };
   store.audit('booking.patient_rated', req.user.phone, { bookingId: b.id, rating });
   store.save();
-  res.json(store.publicBooking(b, { includePaymentNumber: true }));
+  res.json(pubBooking(req, b, { includePaymentNumber: true }));
 });
 
 router.post('/bookings/:id/safety-report', requireAuth, (req, res) => {
@@ -526,17 +674,56 @@ router.post('/bookings/:id/sos', requireAuth, (req, res) => {
   res.status(201).json({ ok: true, sosId: alert.id, message: 'SOS alert sent to admin immediately.' });
 });
 
+// ---------------------------------------------------------------- v2.0.8 — masked in-app messaging
+// The ONLY contact channel between patient and provider. Numbers are
+// never shown on either side; the thread opens at acceptance and closes
+// 24h after completion. Any message containing a phone-number pattern
+// is rejected — the channel must never become a way to exchange numbers.
+router.get('/bookings/:id/messages', requireAuth, (req, res) => {
+  const b = loadBooking(req, res);
+  if (!b) return;
+  if (!canSeeBooking(req, b)) return res.status(403).json({ error: 'forbidden', message: 'This booking does not belong to you.' });
+  if (!messageWindowOpen(b)) {
+    return res.json({ bookingId: b.id, open: false, messages: (store.data.messages[b.id] || []).map((m) => ({ id: m.id, senderRole: m.senderRole, text: m.text, at: m.at })), note: 'This conversation is closed. Contact admin from the booking screen if you need help.' });
+  }
+  const list = (store.data.messages[b.id] || []).map((m) => ({ id: m.id, senderRole: m.senderRole, text: m.text, at: m.at }));
+  res.json({ bookingId: b.id, open: true, messages: list });
+});
+
+router.post('/bookings/:id/messages', requireAuth, (req, res) => {
+  const b = loadBooking(req, res);
+  if (!b) return;
+  if (!canSeeBooking(req, b)) return res.status(403).json({ error: 'forbidden', message: 'This booking does not belong to you.' });
+  if (!messageWindowOpen(b)) {
+    return res.status(409).json({ error: 'closed', message: 'This conversation is closed. Contact admin from the booking screen if you need help.' });
+  }
+  const text = String(req.body?.text || '').trim();
+  if (!text) return bad(res, 400, 'Message text required.');
+  if (text.length > 1000) return bad(res, 400, 'Message is too long (max 1000 characters).');
+  if (containsPhoneNumber(text)) {
+    store.audit('messages.phone_blocked', req.user.phone, { bookingId: b.id });
+    return res.status(400).json({ error: 'phone_number_not_allowed', message: 'Phone numbers cannot be shared here — contact stays inside the app only, to protect both sides.' });
+  }
+  const msg = { id: newId('msg'), bookingId: b.id, senderRole: req.user.role, senderPhone: req.user.phone, text, at: nowIso() };
+  (store.data.messages[b.id] = store.data.messages[b.id] || []).push(msg);
+  store.audit('messages.sent', req.user.phone, { bookingId: b.id, role: req.user.role });
+  store.save();
+  res.status(201).json({ id: msg.id, senderRole: msg.senderRole, text: msg.text, at: msg.at });
+});
+
 router.post('/bookings/:id/cash-collected', requireAuth, requireRole('provider'), (req, res) => {
   const b = loadBooking(req, res);
   if (!b) return;
   if (b.providerId !== req.user.providerId) return res.status(403).json({ error: 'forbidden', message: 'Not your booking.' });
+  const blockedCash = providerBlocked(store.data.providers[req.user.providerId]);
+  if (blockedCash) return res.status(403).json({ error: 'forbidden', message: blockedCash });
   if (!['released', 'auto_released'].includes(b.status)) {
     return bad(res, 409, 'Cash can only be marked collected after the booking is released.');
   }
   b.cashCollectedByProvider = true;
   store.audit('booking.cash_collected', req.user.phone, { bookingId: b.id, appShareEgp: b.appShareEgp, note: 'Provider holds the cash — app share is now owed by the provider.' });
   store.save();
-  res.json(store.publicBooking(b, { includePaymentNumber: true }));
+  res.json(pubBooking(req, b, { includePaymentNumber: true }));
 });
 
 // Manual + scheduled escrow sweep (admin only via HTTP; interval calls it directly).
@@ -554,6 +741,9 @@ router.post('/providers/register', requireAuth, (req, res) => {
   if (store.getProviderByPhone(req.user.phone)) {
     return res.status(409).json({ error: 'conflict', message: 'This phone is already registered as a provider.' });
   }
+  // v2.0.8 — Terms & Conditions (incl. the non-circumvention clause)
+  // must be accepted with the current version before registration.
+  if (!termsAccepted(req.body)) return termsError(res);
   if (!b.name || typeof b.name !== 'string') return bad(res, 400, 'name required.');
   if (!['assistant', 'nurse', 'doctor'].includes(b.role)) return bad(res, 400, 'role must be assistant, nurse or doctor.');
   const nationalId = String(b.nationalId || '');
@@ -568,6 +758,9 @@ router.post('/providers/register', requireAuth, (req, res) => {
   const p = {
     id, demo: false, phone: req.user.phone, name: b.name.trim().slice(0, 120), role: b.role,
     tier: 'Starter', status: 'pending',
+    // v2.0.8 — Terms acceptance + graduated-discipline state.
+    termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
+    warnings: [], suspended: false, suspendedUntil: null, suspendedReason: null, permanentBan: false,
     // Stored hashed; only last4 ever leaves the server.
     nationalIdHash: sha256(nationalId), nationalIdLast4: nationalId.slice(-4),
     licenseHash: sha256(licenseNo), licenseLast4: licenseNo.slice(-4),
@@ -578,15 +771,16 @@ router.post('/providers/register', requireAuth, (req, res) => {
   };
   store.data.providers[id] = p;
   store.data.providersByPhone[req.user.phone] = id;
+  recordTermsAcceptance(req.user.phone);
   store.audit('provider.registered', req.user.phone, { providerId: id, role: b.role });
   store.save();
-  res.status(201).json({ ...store.publicProvider(p), next: 'Take the 20-question interview: POST /api/providers/interview/start' });
+  res.status(201).json({ ...store.publicProvider(p, { self: true }), next: 'Take the 20-question interview: POST /api/providers/interview/start' });
 });
 
 router.get('/providers/me', requireAuth, requireRole('provider'), (req, res) => {
   const p = store.data.providers[req.user.providerId];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
-  res.json(store.publicProvider(p));
+  res.json(store.publicProvider(p, { self: true }));
 });
 
 router.get('/providers/radar', requireAuth, requireRole('provider'), (req, res) => {
@@ -595,11 +789,17 @@ router.get('/providers/radar', requireAuth, requireRole('provider'), (req, res) 
   if (p.interviewStatus !== 'passed') {
     return res.status(403).json({ error: 'forbidden', message: 'Pass the interview first — radar is locked until interviewStatus=passed.' });
   }
-  const maxKm = Number(req.query.maxKm) || 35;
+  // v2.0.8 — a suspended / banned provider sees no radar at all.
+  const blocked = providerBlocked(p);
+  if (blocked) return res.status(403).json({ error: 'forbidden', message: blocked });
+  // v2.0.8 — maxKm is capped at 35 (the auto-pricing limit); the radar
+  // returns MINIMAL items only (store.radarBooking): no patient phone,
+  // name, address, contact, notes, triage or insurer data.
+  const maxKm = Math.min(35, Number(req.query.maxKm) || 35);
   const held = Object.values(store.data.bookings)
     .filter((b) => b.status === 'held' && !b.providerId && (b.distanceKm ?? 99) <= maxKm)
     .sort((a, b) => (a.distanceKm ?? 99) - (b.distanceKm ?? 99))
-    .map((b) => store.publicBooking(b));
+    .map((b) => store.radarBooking(b));
   res.json({ providerId: p.id, tier: p.tier, pending: held });
 });
 
@@ -610,6 +810,9 @@ router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, 
   if (!p || p.interviewStatus !== 'passed') {
     return res.status(403).json({ error: 'forbidden', message: 'Pass the interview first.' });
   }
+  // v2.0.8 — a suspended / banned provider cannot accept work.
+  const blocked = providerBlocked(p);
+  if (blocked) return res.status(403).json({ error: 'forbidden', message: blocked });
   if (b.status !== 'held' || b.providerId) return bad(res, 409, `Booking cannot be accepted while status is ${b.status}.`);
   b.providerId = p.id;
   b.commissionPct = cat.TIERS[p.tier].commission_pct; // locked at accept time
@@ -617,13 +820,15 @@ router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, 
   b.acceptedAt = nowIso();
   store.audit('booking.accepted', req.user.phone, { bookingId: b.id, providerId: p.id, commissionPct: b.commissionPct });
   store.save();
-  res.json(store.publicBooking(b, { includePaymentNumber: true }));
+  res.json(pubBooking(req, b, { includePaymentNumber: true }));
 });
 
 router.post('/bookings/:id/vitals', requireAuth, requireRole('provider'), (req, res) => {
   const b = loadBooking(req, res);
   if (!b) return;
   if (b.providerId !== req.user.providerId) return res.status(403).json({ error: 'forbidden', message: 'Not your booking.' });
+  const blockedVitals = providerBlocked(store.data.providers[req.user.providerId]);
+  if (blockedVitals) return res.status(403).json({ error: 'forbidden', message: blockedVitals });
   if (b.status !== 'accepted') return bad(res, 409, `Vitals are recorded during an accepted visit (status is ${b.status}).`);
   const v = req.body || {};
   const num = (k, min, max) => {
@@ -640,20 +845,22 @@ router.post('/bookings/:id/vitals', requireAuth, requireRole('provider'), (req, 
   b.vitals = { ...vitals, at: nowIso(), notes: String(v.notes || '').slice(0, 500) };
   store.audit('booking.vitals', req.user.phone, { bookingId: b.id });
   store.save();
-  res.json(store.publicBooking(b, { includePaymentNumber: true }));
+  res.json(pubBooking(req, b, { includePaymentNumber: true }));
 });
 
 router.post('/bookings/:id/complete-provider', requireAuth, requireRole('provider'), (req, res) => {
   const b = loadBooking(req, res);
   if (!b) return;
   if (b.providerId !== req.user.providerId) return res.status(403).json({ error: 'forbidden', message: 'Not your booking.' });
+  const blockedComplete = providerBlocked(store.data.providers[req.user.providerId]);
+  if (blockedComplete) return res.status(403).json({ error: 'forbidden', message: blockedComplete });
   if (b.status !== 'accepted') return bad(res, 409, `Cannot confirm completion while status is ${b.status}.`);
   if (!b.vitals) return bad(res, 409, 'Mandatory vitals must be recorded before completing the visit.');
   b.status = 'provider_confirmed';
   b.providerConfirmedAt = nowIso();
   store.audit('booking.provider_confirmed', req.user.phone, { bookingId: b.id, note: 'Provider confirmed completion before leaving; patient confirmation is separate.' });
   store.save();
-  res.json(store.publicBooking(b, { includePaymentNumber: true }));
+  res.json(pubBooking(req, b, { includePaymentNumber: true }));
 });
 
 router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res) => {
@@ -672,7 +879,7 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
     if (b.status === 'cancelled' || b.status === 'refunded') {
       direction = b.status; amountEgp = 0; // full refund — nothing to settle
     } else if (released) {
-      const holdOpen = b.complaintStatus === 'open';
+      const holdOpen = b.complaintStatus === 'open' || b.circumventionHold;
       // The window holds the money only while no complaint was resolved:
       // a REJECTED complaint makes the amount settleable at once, even
       // though the 24h deadline itself is still in the future.
@@ -683,7 +890,16 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
         amountEgp = b.cashCollectedByProvider ? (b.appShareEgp || 0) : (b.providerShareEgp || 0);
       } else if (b.cashCollectedByProvider) { direction = 'provider_owes_app'; amountEgp = b.appShareEgp || 0; }
       else { direction = 'app_owes_provider'; amountEgp = b.providerShareEgp || 0; }
-    } else if (pending) { direction = 'pending'; amountEgp = b.providerShareEgp || 0; }
+    } else if (pending) {
+      // v2.0.8 — a circumvention hold keeps the money in the hold bucket.
+      direction = b.circumventionHold ? 'complaint_hold' : 'pending';
+      amountEgp = b.providerShareEgp || 0;
+    }
+    if (p.permanentBan && ['app_owes_provider', 'complaint_hold', 'pending'].includes(direction)) {
+      // v2.0.8 — a permanent ban forfeits pending settlement. Money the
+      // provider already owes the app (cash collected) is NOT forgiven.
+      direction = 'forfeited'; amountEgp = 0;
+    }
     return {
       bookingId: b.id, service: b.serviceName, status: b.status,
       totalEgp: b.amountEgp, appShareEgp: b.appShareEgp, providerShareEgp: b.providerShareEgp,
@@ -698,10 +914,15 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
     providerOwesAppEgp: ledger.filter((l) => l.direction === 'provider_owes_app').reduce((s, l) => s + l.amountEgp, 0),
     pendingEgp: ledger.filter((l) => l.direction === 'pending').reduce((s, l) => s + l.amountEgp, 0),
     complaintHoldEgp: ledger.filter((l) => l.direction === 'complaint_hold').reduce((s, l) => s + l.amountEgp, 0),
+    forfeitedEgp: ledger.filter((l) => l.direction === 'forfeited').reduce((s, l) => s + (l.providerShareEgp || 0), 0),
   };
   res.json({
     providerId: p.id, tier: p.tier, commissionPct: cat.TIERS[p.tier].commission_pct,
     nextSettlementThursday: nextThursday(),
+    // v2.0.8 — discipline state, so the provider sees warnings/suspension
+    // in their own wallet screen (and why their radar is closed).
+    suspended: !!p.suspended, permanentBan: !!p.permanentBan,
+    warnings: p.warnings || [],
     note: 'Weekly settlement every Thursday (Uber-style ledger). If you collected cash by hand, the app share shows as "you owe the app" and is due on Thursday.',
     ledger, totals,
   });
@@ -862,6 +1083,8 @@ router.get('/hotels/:id', requireAuth, (req, res) => {
 router.post('/tourist-bookings', requireAuth, (req, res) => {
   const b = normalizeBookingBody(req.body);
   if (b.respectCharterAccepted !== true) return bad(res, 400, 'Respect charter must be accepted (respectCharterAccepted=true).');
+  // v2.0.8 — Terms & Conditions are mandatory for every booking type.
+  if (!termsAccepted(req.body)) return termsError(res);
   const svc = cat.TOURIST_SERVICES[b.serviceCode];
   if (!svc) return bad(res, 400, 'Valid tourist serviceCode required (tourist_doctor, tourist_iv, tourist_dressing, tourist_nurse).');
   const currency = (b.currency || 'usd').toLowerCase();
@@ -906,12 +1129,14 @@ router.post('/tourist-bookings', requireAuth, (req, res) => {
       ? { amount: cat.EXTRA_LANGUAGE_BONUS[currency], currency: currency.toUpperCase(), appliesIf: 'Assigned provider holds a certificate for this language (non-English only). Added at release, not at booking.' }
       : null,
     paymentMethod: b.paymentMethod, respectCharterAccepted: true,
+    termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
     triage: { dangerSigns: danger, notes: triage.notes || null },
     insurer: b.insurer || null, policyNo: b.policyNo || null, passportNo: b.passportNo ? `****${String(b.passportNo).slice(-4)}` : null,
     nationality: b.nationality || null, diagnosis: b.diagnosis || null,
     address: b.address || null, scheduledAt: b.scheduledAt || null, notes: b.notes || null,
     providerId: null, commissionPct: null, providerShareEgp: null, appShareEgp: null,
     vitals: null, review: null, providerReview: null, complaint: false,
+    circumventionHold: false, circumventionReportId: null,
     complaintStatus: null, complaintDeadline: null, complaintAt: null, complaintResolvedAt: null,
     settleableAt: null, cancelledAt: null, refundedAt: null, refundEgp: null,
     cashCollectedByProvider: false, overdue: false,
@@ -920,8 +1145,9 @@ router.post('/tourist-bookings', requireAuth, (req, res) => {
   };
   store.data.bookings[id] = booking;
   store.audit('tourist_booking.created', req.user.phone, { bookingId: id, serviceCode: b.serviceCode, amountForeign, currency });
+  recordTermsAcceptance(req.user.phone);
   store.save();
-  res.status(201).json(store.publicBooking(booking));
+  res.status(201).json(pubBooking(req, booking));
 });
 
 // Insurance report — Phase 1: stamped ELECTRONIC report only (EN/DE).
@@ -1006,6 +1232,8 @@ router.post('/npwt/calculate', requireAuth, (req, res) => {
 router.post('/postop', requireAuth, (req, res) => {
   const b = normalizeBookingBody(req.body);
   if (b.respectCharterAccepted !== true) return bad(res, 400, 'Respect charter must be accepted (respectCharterAccepted=true).');
+  // v2.0.8 — Terms & Conditions are mandatory for every booking type.
+  if (!termsAccepted(req.body)) return termsError(res);
   if (!b.patientName) return bad(res, 400, 'patientName required.');
   if (!b.surgeryType) return bad(res, 400, 'surgeryType required.');
   if (!['cash_receipt', 'instapay'].includes(b.paymentMethod)) return bad(res, 400, 'paymentMethod must be cash_receipt or instapay.');
@@ -1021,12 +1249,14 @@ router.post('/postop', requireAuth, (req, res) => {
     transport: b.transport || 'none', hotelId: b.hotelId || null,
     currency: 'EGP', amountForeign: null, fxRate: null,
     paymentMethod: b.paymentMethod, respectCharterAccepted: true,
+    termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
     triage: { dangerSigns: [], notes: null },
     surgeryType: b.surgeryType, surgeonInstructions: b.surgeonInstructions || null,
     dressingSchedule: b.dressingSchedule || null, drainNotes: b.drainNotes || null,
     address: b.address || null, scheduledAt: b.scheduledAt || null, notes: b.notes || null,
     providerId: null, commissionPct: null, providerShareEgp: null, appShareEgp: null,
     vitals: null, review: null, providerReview: null, complaint: false,
+    circumventionHold: false, circumventionReportId: null,
     complaintStatus: null, complaintDeadline: null, complaintAt: null, complaintResolvedAt: null,
     settleableAt: null, cancelledAt: null, refundedAt: null, refundEgp: null,
     cashCollectedByProvider: false, overdue: false,
@@ -1035,8 +1265,9 @@ router.post('/postop', requireAuth, (req, res) => {
   };
   store.data.bookings[id] = booking;
   store.audit('postop.created', req.user.phone, { bookingId: id, surgeryType: b.surgeryType, totalEgp: booking.amountEgp });
+  recordTermsAcceptance(req.user.phone);
   store.save();
-  res.status(201).json(store.publicBooking(booking));
+  res.status(201).json(pubBooking(req, booking));
 });
 
 // ---------------------------------------------------------------- admin
@@ -1068,7 +1299,7 @@ router.post('/admin/pin/verify', (req, res) => {
 router.get('/admin/dashboard', requireAuth, requireRole('admin'), (req, res) => {
   // Aggregate view the web frontend expects, with its field names.
   const providers = Object.values(store.data.providers).map((p) => {
-    const pub = store.publicProvider(p);
+    const pub = store.publicProvider(p, { admin: true });
     return { ...pub, licenceLast4: pub.licenseLast4, rating: pub.ratingAvg, visits: pub.completedVisits };
   });
   const sosAlerts = store.data.sos.slice().reverse().map((s) => ({ ...s, createdAt: s.at }));
@@ -1081,11 +1312,14 @@ router.get('/admin/dashboard', requireAuth, requireRole('admin'), (req, res) => 
   const auditLog = store.data.audit.slice(-100).reverse().map((a) => ({
     createdAt: a.ts, action: a.action, actor: a.actor, detail: JSON.stringify(a.details || {}),
   }));
-  res.json({ providers, sosAlerts, lateVisits: overdue, bookings, auditLog });
+  // v2.0.8 — circumvention reports ("تقرير التفاف") + pattern flags,
+  // shown in the admin dashboard next to SOS / complaints.
+  const circumventionReports = (store.data.circumventionReports || []).slice().reverse().map((r) => ({ ...r, createdAt: r.at }));
+  res.json({ providers, sosAlerts, lateVisits: overdue, bookings, auditLog, circumventionReports, circumventionFlags: circumventionFlags() });
 });
 
 router.get('/admin/providers', requireAuth, requireRole('admin'), (req, res) => {
-  res.json(Object.values(store.data.providers).map((p) => store.publicProvider(p)));
+  res.json(Object.values(store.data.providers).map((p) => store.publicProvider(p, { admin: true })));
 });
 
 router.post('/admin/providers/:id/tier', requireAuth, requireRole('admin'), (req, res) => {
@@ -1097,7 +1331,7 @@ router.post('/admin/providers/:id/tier', requireAuth, requireRole('admin'), (req
   p.tier = tier;
   store.audit('admin.tier_changed', 'admin', { providerId: p.id, from: old, to: tier });
   store.save();
-  res.json(store.publicProvider(p));
+  res.json(store.publicProvider(p, { admin: true }));
 });
 
 router.post('/admin/providers/:id/verify', requireAuth, requireRole('admin'), (req, res) => {
@@ -1110,7 +1344,94 @@ router.post('/admin/providers/:id/verify', requireAuth, requireRole('admin'), (r
   p.status = 'verified';
   store.audit('admin.provider_verified', 'admin', { providerId: p.id, verifiedCertificates: p.verifiedCertificates });
   store.save();
-  res.json(store.publicProvider(p));
+  res.json(store.publicProvider(p, { admin: true }));
+});
+
+// ---------------------------------------------------------------- v2.0.8 — graduated discipline (warn / suspend / unsuspend)
+// Warning → temporary suspension (radar + accept + wallet actions
+// blocked) → permanent ban + forfeiture of pending settlement.
+// Warnings are visible to the provider in their own wallet screen.
+router.post('/admin/providers/:id/warn', requireAuth, requireRole('admin'), (req, res) => {
+  const p = store.data.providers[req.params.id];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
+  const reason = String(req.body?.reason || 'Violation of the Terms & Conditions (non-circumvention / respect charter).').slice(0, 500);
+  p.warnings = p.warnings || [];
+  p.warnings.push({ at: nowIso(), reason, by: 'admin' });
+  store.audit('admin.provider_warned', 'admin', { providerId: p.id, reason, warningCount: p.warnings.length });
+  store.save();
+  res.json(store.publicProvider(p, { admin: true }));
+});
+
+router.post('/admin/providers/:id/suspend', requireAuth, requireRole('admin'), (req, res) => {
+  const p = store.data.providers[req.params.id];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
+  const permanent = req.body?.permanent === true;
+  const reason = String(req.body?.reason || (permanent ? 'Permanent ban: repeated or grave violation of the Terms & Conditions.' : 'Temporary suspension by admin.')).slice(0, 500);
+  p.suspended = true;
+  p.suspendedReason = reason;
+  p.suspendedUntil = permanent ? null : (req.body?.until || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString());
+  p.permanentBan = permanent;
+  store.audit(permanent ? 'admin.provider_banned' : 'admin.provider_suspended', 'admin', { providerId: p.id, reason, until: p.suspendedUntil });
+  store.save();
+  res.json(store.publicProvider(p, { admin: true }));
+});
+
+router.post('/admin/providers/:id/unsuspend', requireAuth, requireRole('admin'), (req, res) => {
+  const p = store.data.providers[req.params.id];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
+  p.suspended = false;
+  p.suspendedUntil = null;
+  p.suspendedReason = null;
+  p.permanentBan = false;
+  store.audit('admin.provider_unsuspended', 'admin', { providerId: p.id });
+  store.save();
+  res.json(store.publicProvider(p, { admin: true }));
+});
+
+// Circumvention reports (from patient reviews) + computed pattern flags.
+router.get('/admin/circumvention', requireAuth, requireRole('admin'), (req, res) => {
+  const openOnly = req.query.open !== 'false';
+  const list = (store.data.circumventionReports || []).slice().reverse();
+  res.json({
+    reports: openOnly ? list.filter((r) => r.status === 'open') : list,
+    flags: circumventionFlags(),
+  });
+});
+
+// Resolve a circumvention report. Confirmed => the patient is refunded
+// in full (the visit was taken off-platform) and the provider's pending
+// settlement for it is forfeited. Rejected => the held release proceeds.
+router.post('/admin/circumvention/:reportId/resolve', requireAuth, requireRole('admin'), (req, res) => {
+  const report = (store.data.circumventionReports || []).find((r) => r.id === req.params.reportId);
+  if (!report) return res.status(404).json({ error: 'not_found', message: 'Circumvention report not found.' });
+  if (report.status !== 'open') return bad(res, 409, `Circumvention report already ${report.status}.`);
+  const decision = req.body?.decision;
+  if (!['confirmed', 'rejected'].includes(decision)) {
+    return bad(res, 400, 'decision must be confirmed or rejected.');
+  }
+  const b = store.data.bookings[report.bookingId];
+  report.status = decision === 'confirmed' ? 'resolved_confirmed' : 'resolved_rejected';
+  report.resolvedAt = nowIso();
+  report.resolution = decision;
+  if (b && b.circumventionReportId === report.id) {
+    b.circumventionHold = false;
+    if (decision === 'confirmed') {
+      b.refundEgp = b.amountEgp;
+      b.refundedAt = nowIso();
+      b.refundedShares = { appShareEgp: b.appShareEgp || 0, providerShareEgp: b.providerShareEgp || 0 };
+      b.appShareEgp = 0;
+      b.providerShareEgp = 0;
+      b.status = 'refunded';
+      store.audit('circumvention.resolved_confirmed', 'admin', { bookingId: b.id, reportId: report.id, refundEgp: b.refundEgp });
+    } else {
+      store.audit('circumvention.resolved_rejected', 'admin', { bookingId: b.id, reportId: report.id });
+      if (b.status === 'reviewed') releaseBooking(b, 'reviewed');
+    }
+  } else {
+    store.audit(decision === 'confirmed' ? 'circumvention.resolved_confirmed' : 'circumvention.resolved_rejected', 'admin', { reportId: report.id, bookingId: report.bookingId });
+  }
+  store.save();
+  res.json({ ok: true, report, booking: b ? pubBooking(req, b, { includePaymentNumber: false }) : null });
 });
 
 // v2.0.1 — admin resolves a complaint. Accepted => full refund to the
@@ -1149,15 +1470,16 @@ router.post('/admin/complaints/:reportId/resolve', requireAuth, requireRole('adm
     b.complaint = false;
     b.settleableAt = nowIso(); // finally settleable at once
     store.audit('complaint.resolved_rejected', 'admin', { bookingId: b.id, reportId: report.id });
-    // If the release was paused in 'reviewed' by this complaint, release now.
-    if (b.status === 'reviewed') releaseBooking(b, 'reviewed');
-    else if (b.status === 'patient_confirmed' && b.patientConfirmedAt
+    // If the release was paused in 'reviewed' by this complaint, release now —
+    // unless a circumvention hold is still open on the same booking (v2.0.8).
+    if (b.status === 'reviewed' && !b.circumventionHold) releaseBooking(b, 'reviewed');
+    else if (b.status === 'patient_confirmed' && !b.circumventionHold && b.patientConfirmedAt
       && Date.now() - new Date(b.patientConfirmedAt).getTime() >= config.autoReleaseAfterMs) {
       releaseBooking(b, 'auto');
     }
   }
   store.save();
-  res.json({ ok: true, report, booking: store.publicBooking(b, { includePaymentNumber: false }) });
+  res.json({ ok: true, report, booking: pubBooking(req, b, { includePaymentNumber: false }) });
 });
 
 router.get('/admin/sos', requireAuth, requireRole('admin'), (req, res) => {

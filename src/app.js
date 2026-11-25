@@ -52,7 +52,9 @@ function createApp() {
   const otpLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many OTP requests from this IP.' } });
   const phoneLoginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many login attempts from this IP.' } });
   const pinLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many PIN attempts from this IP.' } });
-  const bookingLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 60, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many booking requests from this IP.' } });
+  // BOOKING_LIMIT_MAX is test-only (smoke/integration raise it so one
+  // run's many booking calls don't trip the limiter); production default 60.
+  const bookingLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: Number(process.env.BOOKING_LIMIT_MAX) || 60, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many booking requests from this IP.' } });
   app.use('/api/otp/request', otpLimiter);
   app.use('/api/auth/login-phone', phoneLoginLimiter);
   app.use('/api/admin/pin/verify', pinLimiter);

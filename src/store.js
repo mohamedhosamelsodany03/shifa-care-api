@@ -51,6 +51,11 @@ function seed() {
     audit: [], // capped at 2000
     sos: [],
     safetyReports: [],
+    // v2.0.8 — anti-circumvention: per-booking in-app message threads
+    // (bookingId -> [{id, senderRole, text, at}]; no phone numbers stored)
+    // and circumvention reports from patient reviews / admin flags.
+    messages: {},
+    circumventionReports: [],
     adminPin: {
       // No PIN configured => hash a random value so NO pin can ever match.
       // Admin login is disabled until ADMIN_PIN is set and the service restarts.
@@ -75,6 +80,10 @@ class Store {
     try {
       if (fs.existsSync(this.file)) {
         this.data = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+        // v2.0.8: collections added after the first seed — default them
+        // on load so an older data.json never breaks the new routes.
+        if (!this.data.messages) this.data.messages = {};
+        if (!this.data.circumventionReports) this.data.circumventionReports = [];
         this.syncAdminPinFromEnv();
         return;
       }
@@ -119,17 +128,42 @@ class Store {
     const id = this.data.providersByPhone[phone];
     return id ? this.data.providers[id] || null : null;
   }
-  // Public-safe provider view: never expose hashes or full IDs.
-  publicProvider(p) {
+  // Public-safe provider view.
+  // v2.0.8 — anti-circumvention: the provider's PHONE is never exposed
+  // patient-side. It is included only for admin views (opts.admin) and
+  // for the provider themself (opts.self). All contact goes through the
+  // in-app message thread; there is no other channel in the product.
+  // Also surfaces suspension state + warning count (needed by the
+  // provider wallet and the admin dashboard).
+  publicProvider(p, opts = {}) {
     if (!p) return null;
-    return {
-      id: p.id, demo: !!p.demo, phone: p.phone, name: p.name, role: p.role,
+    const out = {
+      id: p.id, demo: !!p.demo, name: p.name, role: p.role,
       tier: p.tier, status: p.status, nationalIdLast4: p.nationalIdLast4,
       licenseLast4: p.licenseLast4, certificates: p.certificates || [],
       extraLanguages: p.extraLanguages || [], verifiedCertificates: p.verifiedCertificates || 0,
       interviewStatus: p.interviewStatus, interviewScore: p.interviewScore,
       ratingAvg: p.ratingAvg ?? null, completedVisits: p.completedVisits || 0,
+      suspended: !!p.suspended, permanentBan: !!p.permanentBan,
+      warningCount: (p.warnings || []).length,
       createdAt: p.createdAt,
+    };
+    if (opts.admin || opts.self) out.phone = p.phone;
+    if (opts.admin) out.warnings = p.warnings || [];
+    return out;
+  }
+  // v2.0.8 — minimal radar item. The radar shows ONLY what a provider
+  // needs to decide whether to accept: service, area band, scheduled
+  // window and amount. NO patient identity, phone, address, contact,
+  // notes, triage, insurer, passport or diagnosis — those are revealed
+  // to the ASSIGNED provider only (see publicBooking below).
+  radarBooking(b) {
+    if (!b) return null;
+    return {
+      id: b.id, kind: b.kind, serviceCode: b.serviceCode, serviceName: b.serviceName,
+      status: b.status, amountEgp: b.amountEgp, distanceKm: b.distanceKm,
+      distanceBand: b.distanceBand, scheduledAt: b.scheduledAt,
+      createdAt: b.createdAt,
     };
   }
   // Public-safe booking view. Payment number is added ONLY after confirmation.
@@ -142,9 +176,26 @@ class Store {
   //   canCancel / cancelDeadline: 15-minute cancellation window from creation.
   //   complaintDeadline / complaintStatus / settleableAt: 24-hour complaint
   //     window (see routes.js — two-stage escrow, documented there).
-  publicBooking(b, { includePaymentNumber = false } = {}) {
+  publicBooking(b, { includePaymentNumber = false, viewer = null } = {}) {
     if (!b) return null;
+    // v2.0.8 — viewer-aware masking (anti-circumvention).
+    // A provider who is NOT assigned to this booking sees only the
+    // minimal radar view (defense in depth — canSeeBooking already
+    // blocks them, but the serializer must never leak PII by itself).
+    // Exception: the booking's own patient (who may hold a provider
+    // role) always sees their own full booking.
+    // The ASSIGNED provider sees the patient phone + address (needed
+    // for the visit) but NEVER the alternate contact, insurer or policy
+    // number — those are admin-only. Patients see their own booking.
+    if (viewer && viewer.role === 'provider' && b.providerId !== viewer.providerId && b.patientPhone !== viewer.phone) {
+      return this.radarBooking(b);
+    }
     const out = { ...b, service: b.serviceCode, total: b.amountEgp };
+    if (viewer && viewer.role === 'provider' && b.patientPhone !== viewer.phone) {
+      delete out.alternateContact;
+      delete out.insurer;
+      delete out.policyNo;
+    }
     if (includePaymentNumber) out.paymentNumber = config.paymentNumber;
     const now = Date.now();
     out.cancelDeadline = b.createdAt

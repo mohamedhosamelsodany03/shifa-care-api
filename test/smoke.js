@@ -26,6 +26,9 @@ async function req(method, p, { token, body, admin } = {}) {
   return { status: r.status, json, text: typeof json === 'string' ? json : '' };
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// v2.0.8 — registration + every booking creation must accept the current
+// Terms & Conditions (acceptedTerms=true, termsVersion='1.0').
+const TERMS = { acceptedTerms: true, termsVersion: '1.0' };
 
 async function main() {
   if (fs.existsSync(DATA_FILE)) fs.unlinkSync(DATA_FILE);
@@ -33,6 +36,7 @@ async function main() {
     ...process.env, PORT: String(PORT), NODE_ENV: 'test',
     DATA_FILE, MOCK_OTP: 'true', JWT_SECRET: 'smoke-test-secret', ADMIN_PIN: '123456',
     AUTO_RELEASE_MS: '1000', // shorten the 1h auto-release window for the test only
+    BOOKING_LIMIT_MAX: '500', // v2.0.8: one run now makes >60 booking-route calls
     CANCEL_WINDOW_MS: '5000', // shorten the 15-min cancel window for the test only
   };
   const child = spawn('node', [path.join(__dirname, '..', 'server.js')], { env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -115,12 +119,12 @@ async function main() {
 
     // --- 4. triage + charter -------------------------------------------
     console.log('\n[triage + charter]');
-    r = await req('POST', '/api/bookings', { token: patientToken2, body: {
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Test Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
       distanceKm: 3, respectCharterAccepted: true, triage: { dangerSigns: ['chest_pain'] },
     } });
     check('danger sign -> 422 + ambulance 123', r.status === 422 && r.json?.ambulance === '123', JSON.stringify(r.json));
-    r = await req('POST', '/api/bookings', { token: patientToken2, body: {
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Test Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt', distanceKm: 3,
     } });
     check('missing respect charter -> 400', r.status === 400, JSON.stringify(r.json));
@@ -128,7 +132,7 @@ async function main() {
     // --- 5. distance fee table (via booking totals) ---------------------
     console.log('\n[distance fees]');
     async function bookAt(km, extra = {}) {
-      const rr = await req('POST', '/api/bookings', { token: patientToken2, body: {
+      const rr = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
         patientName: 'Test Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
         distanceKm: km, respectCharterAccepted: true, triage: { dangerSigns: [] }, ...extra,
       } });
@@ -200,7 +204,7 @@ async function main() {
 
     // --- 7. full escrow flow -------------------------------------------
     console.log('\n[escrow end-to-end]');
-    r = await req('POST', '/api/bookings', { token: patientToken2, body: {
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Test Patient', serviceCode: 'dressing', paymentMethod: 'instapay',
       distanceKm: 8, respectCharterAccepted: true, triage: { dangerSigns: [] },
     } });
@@ -251,7 +255,7 @@ async function main() {
 
     // --- 8. auto-release sweep ------------------------------------------
     console.log('\n[auto-release]');
-    r = await req('POST', '/api/bookings', { token: patientToken2, body: {
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Test Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
       distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
     } });
@@ -285,7 +289,7 @@ async function main() {
 
     // --- 10. tourist booking + insurance report -------------------------
     console.log('\n[tourist]');
-    r = await req('POST', '/api/tourist-bookings', { token: patientToken2, body: {
+    r = await req('POST', '/api/tourist-bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Tourist Test', serviceCode: 'tourist_doctor', currency: 'usd', hotelId: 'h10',
       urgent: false, paymentMethod: 'cash_receipt', respectCharterAccepted: true, triage: { dangerSigns: [] },
     } });
@@ -300,7 +304,7 @@ async function main() {
     r = await req('POST', '/api/npwt/calculate', { token: patientToken2, body: { days: 14, kitPrice: 300 } });
     check('NPWT 14d: 5 dressings, total 5500', r.status === 200 && r.json?.dressings === 5 && r.json?.totalEgp === 5500, JSON.stringify(r.json));
     check('NPWT requires doctor order', r.json?.requiresDoctorOrder === true && !!r.json?.warning);
-    r = await req('POST', '/api/postop', { token: patientToken2, body: {
+    r = await req('POST', '/api/postop', { token: patientToken2, body: { ...TERMS,
       patientName: 'Test Patient', surgeryType: 'Appendectomy', paymentMethod: 'instapay',
       distanceKm: 3, respectCharterAccepted: true,
     } });
@@ -313,7 +317,7 @@ async function main() {
     const nm = out.match(/\[MOCK OTP\] channel=whatsapp phone=01055555555 code=(\d{6})/);
     const nl = await req('POST', '/api/otp/verify', { body: { phone: newPhone, code: nm ? nm[1] : '000000' } });
     const newToken = nl.json?.accessToken;
-    r = await req('POST', '/api/providers/register', { token: newToken, body: {
+    r = await req('POST', '/api/providers/register', { token: newToken, body: { ...TERMS,
       name: 'New Nurse', role: 'nurse', nationalId: '12345678901234', licenseNo: 'LIC-98765',
       certificates: ['BLS'], extraLanguages: [{ language: 'de', certified: true }],
     } });
@@ -336,7 +340,7 @@ async function main() {
 
     // --- 15. v2.0.1: 15-min cancellation + 24h complaint window ---------
     console.log('\n[cancel + complaint]');
-    r = await req('POST', '/api/bookings', { token: patientToken2, body: {
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Test Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
       distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
     } });
@@ -352,7 +356,7 @@ async function main() {
     const cancelEntry = r.json?.ledger?.find((l) => l.bookingId === bkC);
     check('cancelled booking excluded from settlement', cancelEntry?.direction === 'cancelled' && cancelEntry?.amountEgp === 0, JSON.stringify(cancelEntry));
     // Too late: create, wait out the 5s test window, cancel must be refused.
-    r = await req('POST', '/api/bookings', { token: patientToken2, body: {
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Test Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
       distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
     } });
@@ -383,6 +387,123 @@ async function main() {
     r = await req('GET', `/api/providers/wallet`, { token: provToken });
     const refundEntry = r.json?.ledger?.find((l) => l.bookingId === bk2);
     check('refunded booking excluded from settlement', refundEntry?.direction === 'refunded' && refundEntry?.amountEgp === 0, JSON.stringify(refundEntry));
+
+    // --- 16. v2.0.8: Terms & Conditions + anti-circumvention -----------
+    console.log('\n[terms + anti-circumvention]');
+    // Terms text is public; Arabic is the binding version.
+    r = await req('GET', '/api/terms');
+    check('GET /api/terms -> v1.0 with Arabic text', r.status === 200 && r.json?.version === '1.0' && typeof r.json?.textAr === 'string' && r.json.textAr.includes('منع الالتفاف'), JSON.stringify(r.json)?.slice(0, 200));
+    // A fresh user has not accepted -> mustAccept true; accept -> false.
+    const freshLogin = await req('POST', '/api/auth/login-phone', { body: { phone: '01077777777' } });
+    const freshToken = freshLogin.json?.accessToken;
+    r = await req('GET', '/api/me/terms', { token: freshToken });
+    check('fresh user /me/terms -> mustAccept true', r.status === 200 && r.json?.mustAccept === true && r.json?.currentVersion === '1.0', JSON.stringify(r.json));
+    r = await req('POST', '/api/me/terms', { token: freshToken, body: { acceptedTerms: true, termsVersion: '1.0' } });
+    check('POST /me/terms accepts v1.0', r.status === 200 && r.json?.version === '1.0', JSON.stringify(r.json));
+    r = await req('GET', '/api/me/terms', { token: freshToken });
+    check('after accept /me/terms -> mustAccept false', r.status === 200 && r.json?.mustAccept === false, JSON.stringify(r.json));
+    // Booking without terms -> 400; with a stale version -> 400.
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: {
+      patientName: 'Test Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    check('booking without acceptedTerms -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { acceptedTerms: true, termsVersion: '0.9',
+      patientName: 'Test Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    check('booking with stale termsVersion -> 400', r.status === 400, JSON.stringify(r.json));
+    // Registration without terms -> 400.
+    const regPhone = '01066666666';
+    await req('POST', '/api/otp/request', { body: { phone: regPhone, channel: 'whatsapp' } });
+    const rm = out.match(/\[MOCK OTP\] channel=whatsapp phone=01066666666 code=(\d{6})/);
+    const rl2 = await req('POST', '/api/otp/verify', { body: { phone: regPhone, code: rm ? rm[1] : '000000' } });
+    const regToken = rl2.json?.accessToken;
+    r = await req('POST', '/api/providers/register', { token: regToken, body: {
+      name: 'No Terms Nurse', role: 'nurse', nationalId: '12345678901234', licenseNo: 'LIC-11111',
+    } });
+    check('register without acceptedTerms -> 400', r.status === 400, JSON.stringify(r.json));
+
+    // Radar is minimal: no patient PII at all.
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Radar Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 3, respectCharterAccepted: true, triage: { dangerSigns: [] },
+      address: '123 Secret Street', notes: 'secret note', alternateContact: '01099999999',
+    } });
+    check('v2.0.8 booking created', r.status === 201, JSON.stringify(r.json));
+    const bk8 = r.json?.id;
+    r = await req('GET', '/api/providers/radar', { token: provToken });
+    const radarItem = (r.json?.pending || []).find((x) => x.id === bk8);
+    check('radar returns minimal view, no patient PII', r.status === 200 && !!radarItem && !('patientPhone' in radarItem) && !('patientName' in radarItem) && !('address' in radarItem) && !('alternateContact' in radarItem) && !('notes' in radarItem) && !('triage' in radarItem) && radarItem.serviceCode === 'standard' && radarItem.amountEgp === 250, JSON.stringify(radarItem));
+    // Radar maxKm is capped at 35.
+    r = await req('GET', '/api/providers/radar?maxKm=500', { token: provToken });
+    check('radar maxKm capped at 35', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
+    // Unassigned provider cannot see the booking at all.
+    r = await req('GET', `/api/bookings/${bk8}`, { token: prov2Token });
+    check('unassigned provider cannot view booking -> 403', r.status === 403, JSON.stringify(r.json));
+    // Assigned provider sees phone + address, never the alternate contact.
+    r = await req('POST', `/api/bookings/${bk8}/accept`, { token: provToken });
+    check('provider accepts v2.0.8 booking', r.status === 200 && r.json?.status === 'accepted', JSON.stringify(r.json));
+    r = await req('GET', `/api/bookings/${bk8}`, { token: provToken });
+    check('assigned provider sees patient phone + address, no alternate contact', r.status === 200 && r.json?.patientPhone === '01012345678' && !!r.json?.address && !('alternateContact' in r.json) && !('insurer' in r.json), JSON.stringify(r.json)?.slice(0, 300));
+    // Patient view never contains the provider phone.
+    r = await req('GET', `/api/bookings/${bk8}`, { token: patientToken2 });
+    check('patient view has no provider phone', r.status === 200 && !JSON.stringify(r.json).includes('01000000001'), JSON.stringify(r.json)?.slice(0, 300));
+
+    // In-app messaging: phone numbers are rejected, clean text works.
+    r = await req('POST', `/api/bookings/${bk8}/messages`, { token: patientToken2, body: { text: 'Call me on 01099999999 please' } });
+    check('message with a phone number -> 400', r.status === 400 && r.json?.error === 'phone_number_not_allowed', JSON.stringify(r.json));
+    r = await req('POST', `/api/bookings/${bk8}/messages`, { token: patientToken2, body: { text: 'Hello, I am at the gate.' } });
+    check('clean message -> 201', r.status === 201 && r.json?.text === 'Hello, I am at the gate.', JSON.stringify(r.json));
+    r = await req('GET', `/api/bookings/${bk8}/messages`, { token: provToken });
+    check('assigned provider reads the thread', r.status === 200 && r.json?.open === true && r.json?.messages?.length === 1, JSON.stringify(r.json));
+    r = await req('GET', `/api/bookings/${bk8}/messages`, { token: prov2Token });
+    check('unassigned provider cannot read messages -> 403', r.status === 403, JSON.stringify(r.json));
+
+    // Review with circumvention=yes -> admin flag + release held.
+    await req('POST', `/api/bookings/${bk8}/vitals`, { token: provToken, body: { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 } });
+    await req('POST', `/api/bookings/${bk8}/complete-provider`, { token: provToken });
+    await req('POST', `/api/bookings/${bk8}/confirm-patient`, { token: patientToken2 });
+    r = await req('POST', `/api/bookings/${bk8}/review`, { token: patientToken2, body: { rating: 2, comment: 'Asked to deal outside the app.', circumventionReported: true } });
+    check('review with circumvention=yes -> held, not released', r.status === 200 && r.json?.status === 'reviewed' && r.json?.circumventionHold === true && r.json?.releasedAt == null, JSON.stringify(r.json));
+    r = await req('GET', '/api/admin/circumvention', { token: adminToken });
+    const circReport = (r.json?.reports || []).find((x) => x.bookingId === bk8);
+    check('admin circumvention list shows the report', r.status === 200 && !!circReport && circReport.status === 'open' && Array.isArray(r.json?.flags), JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('GET', '/api/admin/dashboard', { token: adminToken });
+    check('admin dashboard carries circumvention reports + flags', r.status === 200 && Array.isArray(r.json?.circumventionReports) && r.json.circumventionReports.some((x) => x.bookingId === bk8) && Array.isArray(r.json?.circumventionFlags), JSON.stringify(r.json)?.slice(0, 300));
+    // Sweep must NOT auto-release a circumvention-held booking.
+    await req('POST', '/api/jobs/sweep', { token: adminToken });
+    r = await req('GET', `/api/bookings/${bk8}`, { token: patientToken2 });
+    check('sweep leaves circumvention-held booking unreleased', r.json?.status === 'reviewed' && r.json?.circumventionHold === true, JSON.stringify(r.json)?.slice(0, 200));
+    // Admin confirms -> patient refunded in full.
+    r = await req('POST', `/api/admin/circumvention/${circReport.id}/resolve`, { token: adminToken, body: { decision: 'confirmed' } });
+    check('admin confirms circumvention -> booking refunded', r.status === 200 && r.json?.booking?.status === 'refunded' && r.json?.booking?.refundEgp === 250, JSON.stringify(r.json));
+
+    // Graduated discipline: warn -> suspend blocks radar + accept -> unsuspend.
+    r = await req('POST', '/api/admin/providers/prov_demo_starter/warn', { token: adminToken, body: { reason: 'Test warning: asked a patient to deal outside the app.' } });
+    check('admin warn -> 200, warningCount 1', r.status === 200 && r.json?.warningCount === 1, JSON.stringify(r.json));
+    r = await req('GET', '/api/providers/wallet', { token: provToken });
+    check('provider wallet shows the warning + tier/commission/next Thursday', r.status === 200 && Array.isArray(r.json?.warnings) && r.json.warnings.length === 1 && r.json?.commissionPct === 8 && !!r.json?.nextSettlementThursday, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', '/api/admin/providers/prov_demo_starter/suspend', { token: adminToken, body: { reason: 'Test suspension.' } });
+    check('admin suspend -> 200, suspended true', r.status === 200 && r.json?.suspended === true, JSON.stringify(r.json));
+    r = await req('GET', '/api/providers/radar', { token: provToken });
+    check('suspended provider radar -> 403', r.status === 403, JSON.stringify(r.json));
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Suspend Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    const bkSusp = r.json?.id;
+    r = await req('POST', `/api/bookings/${bkSusp}/accept`, { token: provToken });
+    check('suspended provider accept -> 403', r.status === 403, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/providers/prov_demo_starter/unsuspend', { token: adminToken });
+    check('admin unsuspend -> 200, suspended false', r.status === 200 && r.json?.suspended === false, JSON.stringify(r.json));
+    r = await req('GET', '/api/providers/radar', { token: provToken });
+    check('radar works again after unsuspend', r.status === 200 && Array.isArray(r.json?.pending), JSON.stringify(r.json)?.slice(0, 200));
+    // Permanent ban on the second demo provider (unused after section 7).
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/suspend', { token: adminToken, body: { permanent: true, reason: 'Test permanent ban.' } });
+    check('admin permanent ban -> 200, permanentBan true', r.status === 200 && r.json?.permanentBan === true, JSON.stringify(r.json));
+    r = await req('GET', '/api/providers/me', { token: prov2Token });
+    check('banned provider sees permanentBan in /providers/me', r.status === 200 && r.json?.permanentBan === true, JSON.stringify(r.json));
 
     // --- 14. logout / refresh revocation ---------------------------------
     console.log('\n[logout]');
