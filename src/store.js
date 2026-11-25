@@ -75,6 +75,7 @@ class Store {
     try {
       if (fs.existsSync(this.file)) {
         this.data = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+        this.syncAdminPinFromEnv();
         return;
       }
     } catch (e) {
@@ -82,6 +83,24 @@ class Store {
     }
     this.data = seed();
     this.save();
+  }
+  // ADMIN_PIN env var is the source of truth: re-hash it on every boot when
+  // it is set and does not match the stored hash. Without this, changing the
+  // PIN in the host dashboard never takes effect, because data.json (seeded
+  // once, with a random hash when no PIN was set at seed time) is loaded
+  // as-is on every restart and redeploy.
+  syncAdminPinFromEnv() {
+    if (!config.adminPin) return;
+    if (!this.data.adminPin) this.data.adminPin = { hash: '', failures: 0, lockedUntil: null };
+    let matches = false;
+    try { matches = bcrypt.compareSync(config.adminPin, this.data.adminPin.hash); } catch (e) { matches = false; }
+    if (!matches) {
+      this.data.adminPin.hash = bcrypt.hashSync(config.adminPin, 10);
+      this.data.adminPin.failures = 0;
+      this.data.adminPin.lockedUntil = null;
+      this.save();
+      console.log('[store] admin PIN synced from ADMIN_PIN env var.');
+    }
   }
   // Atomic: write to temp file in same dir, then rename over the real file.
   save() {
