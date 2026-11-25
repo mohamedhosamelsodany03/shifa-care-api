@@ -73,8 +73,8 @@
   "sos": [],
   "safetyReports": [],
   "adminPin": {
-    "hash": "$2a$10$3noBM5EoIqgDtsHl0sSPruNFP3BZr1qdkm4paC.A/UiYZDBWTwda2",
-    "failures": 1,
+    "hash": "$2a$10$6BFDJpBBqGAA0a8YGZIpIOMxJStnyeti/gRlZmwtRq/0ojqTFxiES",
+    "failures": 0,
     "lockedUntil": null
   },
   "hotels": [
