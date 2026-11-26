@@ -147,6 +147,12 @@ const config = {
     }
     return v;
   })(),
+  // v2.1.3 — monthly packages: waive the +25% overtime premium on the 4
+  // extra days during the launch offer month (owner decision 26 Nov 2026).
+  // Default OFF. The admin can also toggle it from the admin panel
+  // (POST /api/admin/package-offer); the admin setting wins while it is
+  // set and unexpired. Env is the fallback / initial value.
+  packageOvertimePremiumWaived: process.env.PACKAGE_OVERTIME_WAIVED === 'true',
   // v2.0.8 — Terms & Conditions version. Registration and booking
   // creation require acceptedTerms=true AND termsVersion to match this
   // value; bumping it forces every user to re-accept (see /api/me/terms).

@@ -14,8 +14,12 @@ const SERVICES = {
   // only, safety checklist before completion. (Plain cannula stays
   // standard risk.)
   cannula_iv: { code: 'cannula_iv', category: 'nursing', name_en: 'Cannula + IV fluids', name_ar: 'كانيولا + محاليل', price_egp: 350, riskLevel: 'high' },
-  shift12: { code: 'shift12', category: 'nursing', name_en: '12-hour shift', name_ar: 'شيفت 12 ساعة', price_egp: 500 },
-  shift24: { code: 'shift24', category: 'nursing', name_en: '24-hour shift', name_ar: 'شيفت 24 ساعة', price_egp: 850 },
+  // v2.1.3 (26 Nov 2026, owner-approved): shift prices reviewed against
+  // Cairo (see CAIRO-SERVICES-INVENTORY-2026-11-26.md) — 12h 500 → 700,
+  // 24h 850 → 1,200. These are the normal prices the monthly packages
+  // are priced off (26 × 700 = 18,200; 26 × 1,200 = 31,200).
+  shift12: { code: 'shift12', category: 'nursing', name_en: '12-hour shift', name_ar: 'شيفت 12 ساعة', price_egp: 700 },
+  shift24: { code: 'shift24', category: 'nursing', name_en: '24-hour shift', name_ar: 'شيفت 24 ساعة', price_egp: 1200 },
   postop: { code: 'postop', category: 'nursing', name_en: 'Post-operative care', name_ar: 'رعاية ما بعد العمليات', price_egp: 1400 },
   gp: { code: 'gp', category: 'nursing', name_en: 'GP home visit', name_ar: 'طبيب عام منزلي', price_egp: 500 },
   specialist: { code: 'specialist', category: 'nursing', name_en: 'Specialist home visit', name_ar: 'أخصائي منزلي', price_egp: 900 },
@@ -58,12 +62,12 @@ const SERVICES = {
   // CVP central-line dressing: HIGH risk, same gates as the rest of the
   // tier (doctor's order, verified nurse only, safety checklist).
   cvp_dressing: { code: 'cvp_dressing', category: 'nursing', name_en: 'CVP central-line dressing', name_ar: 'غيار قسطرة CVP (قسطرة وريدية مركزية)', price_egp: 300, riskLevel: 'high', requiresDoctorOrder: true },
-  // Elderly care, 12-hour shift — its OWN service (the generic 12h shift
-  // at 500 stays as-is). TWO condition-based prices, both owner-set
-  // MINIMUMS ("لا يقل عن"): mobile patient 400, bedridden patient 500.
-  // The patient picks the condition at booking (two catalog entries).
-  elderly_shift_mobile: { code: 'elderly_shift_mobile', category: 'nursing', name_en: 'Elderly care — 12h shift (mobile patient)', name_ar: 'رعاية مسنين — شيفت 12 ساعة (حالة متحركة)', price_egp: 400, riskLevel: 'standard' },
-  elderly_shift_bedridden: { code: 'elderly_shift_bedridden', category: 'nursing', name_en: 'Elderly care — 12h shift (bedridden patient)', name_ar: 'رعاية مسنين — شيفت 12 ساعة (حالة قعيدة / طريحة فراش)', price_egp: 500, riskLevel: 'standard' },
+  // Elderly care, 12-hour shift — its OWN service. TWO condition-based
+  // prices, both owner-set MINIMUMS ("لا يقل عن"): mobile patient 600,
+  // bedridden patient 700 (raised in v2.1.3 from 400 / 500, owner-approved
+  // 26 Nov 2026). The patient picks the condition at booking.
+  elderly_shift_mobile: { code: 'elderly_shift_mobile', category: 'nursing', name_en: 'Elderly care — 12h shift (mobile patient)', name_ar: 'رعاية مسنين — شيفت 12 ساعة (حالة متحركة)', price_egp: 600, riskLevel: 'standard' },
+  elderly_shift_bedridden: { code: 'elderly_shift_bedridden', category: 'nursing', name_en: 'Elderly care — 12h shift (bedridden patient)', name_ar: 'رعاية مسنين — شيفت 12 ساعة (حالة قعيدة / طريحة فراش)', price_egp: 700, riskLevel: 'standard' },
   // --- v2.1.1 — new nursing services (owner-approved 26 Nov 2026) -----
   enema: { code: 'enema', category: 'nursing', name_en: 'Enema', name_ar: 'حقنة شرجية', price_egp: 500, riskLevel: 'standard' },
   allergy_test: { code: 'allergy_test', category: 'nursing', name_en: 'Allergy test', name_ar: 'اختبار حساسية', price_egp: 250, riskLevel: 'standard' },
@@ -87,6 +91,149 @@ const SERVICES = {
   // NOTE (superseded v2.1.1): physiotherapy services were proposed 26 Nov
   // 2026 and APPROVED the same day — they are live above (physio_*).
 };
+
+// --- v2.1.3 — monthly packages (owner-approved 26 Nov 2026) -------------
+// A package = 26 days of care + 4 nurse days off (the Egyptian working
+// month: 26 days + 4 days off). PRICES ARE INDICATIVE ("يبدأ من") — the
+// final price is a written admin quote after assessing the case (the
+// patient submits a package request; admin sets the final price; the
+// patient accepts or declines). The offer price is shown as "بدل" the
+// normal price: 26 × daily rate. Care-level ladder (v2.1.3 refinement,
+// owner-set prices 26 Nov 2026 — affordable for Quseir, ~12% package
+// discount): assistant 12h 350 → 8,000 (بدل 9,100) / 24h 600 → 13,700
+// (بدل 15,600); technician 12h 550 → 12,600 (بدل 14,300) / 24h 950 →
+// 21,700 (بدل 24,700); specialist 12h 750 → 17,200 (بدل 19,500) / 24h
+// 1,250 → 28,600 (بدل 32,500); elderly mobile 350 → 8,000 (بدل 9,100),
+// bedridden 550 → 12,600 (بدل 14,300). Single-day (non-package) shifts
+// stay 12h 700 / 24h 1,200. Tourist residence (USD/EUR per day, 26-day
+// package "starting from"): assistant $25/$45 → $575/$1,030 (€530/€950);
+// technician $35/$60 → $800/$1,375 (€735/€1,265); specialist $45/$75 →
+// $1,030/$1,720 (€950/€1,580).
+// The distance fee is INCLUDED inside El Quseir. The normal tier
+// commission (Starter 15% / Pro 12% / Elite 8%) applies to the final
+// quoted package price. The full month is paid upfront into escrow and
+// the nurse is paid WEEKLY at Thursday settlement for completed days.
+// The 4 extra days are NOT included by default: (a) a substitute nurse
+// covers them at the normal daily rate, or (b) the main nurse works them
+// as overtime at +25% premium — the premium is waived during the launch
+// offer month (flag below / admin setting).
+// Cancellation: before the start date = full refund; after the start =
+// refund of the remaining days at the package daily rate (final price ÷ 26).
+const PACKAGE_DAYS = 26;
+const PACKAGE_OFF_DAYS = 4;
+const PACKAGE_OVERTIME_PREMIUM_PCT = 25;
+// Care-level ladder (owner refinement 26 Nov 2026 — v2.1.3): the package
+// request / assessment determines which level the case actually needs,
+// and the admin confirms or RAISES the level in the written quote.
+// Nobody works above their qualification (enforced in routes.js):
+// assistant = basic care (bathing, feeding, movement, companionship,
+// vitals); technician = standard nursing (dressings, injections,
+// cannula, catheters); specialist = advanced / complex (NPWT, high-risk
+// procedures). Owner-set ladder prices (26 Nov 2026 — supersedes the
+// earlier ladder): affordable for Quseir — the lowest 12h residence
+// shift (assistant) is 350, rising gradually by level; package ≈ 12%
+// below 26 × daily. Single-day (non-package) shifts stay 12h 700 /
+// 24h 1,200. The "200 EGP below Cairo" rule was superseded in practice
+// by this cheaper ladder (the whole ladder sits below the Cairo average:
+// 12h 700–1,100, 24h 1,200–1,800).
+// Elderly packages are REALIGNED to the ladder (never more than the
+// matching level): mobile = assistant 12h (8,000 بدل 9,100), bedridden
+// = technician 12h (12,600 بدل 14,300); level 'assistant' by default —
+// the admin quotes a technician/specialist package instead when the
+// case needs more.
+const PACKAGE_LEVELS = ['assistant', 'technician', 'specialist'];
+const MONTHLY_PACKAGES = {
+  package_assistant_12: { code: 'package_assistant_12', level: 'assistant', shiftType: '12h', shiftHours: 12, dailyRateEgp: 350, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Monthly package — nursing assistant, 12-hour shifts (26 days)', name_ar: 'باقة شهرية — مساعد تمريض، شيفت 12 ساعة (26 يومًا)', priceEgp: 8000, originalEgp: 9100 },
+  package_assistant_24: { code: 'package_assistant_24', level: 'assistant', shiftType: '24h', shiftHours: 24, dailyRateEgp: 600, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Monthly package — nursing assistant, 24-hour resident care (26 days)', name_ar: 'باقة شهرية — مساعد تمريض، شيفت 24 ساعة / مقيم (26 يومًا)', priceEgp: 13700, originalEgp: 15600 },
+  package_technician_12: { code: 'package_technician_12', level: 'technician', shiftType: '12h', shiftHours: 12, dailyRateEgp: 550, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Monthly package — nursing technician, 12-hour shifts (26 days)', name_ar: 'باقة شهرية — فني تمريض، شيفت 12 ساعة (26 يومًا)', priceEgp: 12600, originalEgp: 14300 },
+  package_technician_24: { code: 'package_technician_24', level: 'technician', shiftType: '24h', shiftHours: 24, dailyRateEgp: 950, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Monthly package — nursing technician, 24-hour resident care (26 days)', name_ar: 'باقة شهرية — فني تمريض، شيفت 24 ساعة / مقيم (26 يومًا)', priceEgp: 21700, originalEgp: 24700 },
+  package_specialist_12: { code: 'package_specialist_12', level: 'specialist', shiftType: '12h', shiftHours: 12, dailyRateEgp: 750, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Monthly package — nursing specialist, 12-hour shifts (26 days)', name_ar: 'باقة شهرية — أخصائي تمريض، شيفت 12 ساعة (26 يومًا)', priceEgp: 17200, originalEgp: 19500 },
+  package_specialist_24: { code: 'package_specialist_24', level: 'specialist', shiftType: '24h', shiftHours: 24, dailyRateEgp: 1250, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Monthly package — nursing specialist, 24-hour resident care (26 days)', name_ar: 'باقة شهرية — أخصائي تمريض، شيفت 24 ساعة / مقيم (26 يومًا)', priceEgp: 28600, originalEgp: 32500 },
+  package_elderly_mobile: { code: 'package_elderly_mobile', level: 'assistant', shiftType: 'elderly_shift_mobile', shiftHours: 12, dailyRateEgp: 350, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Monthly package — elderly care 12h, mobile patient (26 days)', name_ar: 'باقة شهرية — رعاية مسنين 12 ساعة، حالة متحركة (26 يومًا)', priceEgp: 8000, originalEgp: 9100 },
+  package_elderly_bedridden: { code: 'package_elderly_bedridden', level: 'technician', shiftType: 'elderly_shift_bedridden', shiftHours: 12, dailyRateEgp: 550, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Monthly package — elderly care 12h, bedridden patient (26 days)', name_ar: 'باقة شهرية — رعاية مسنين 12 ساعة، حالة قعيدة (26 يومًا)', priceEgp: 12600, originalEgp: 14300 },
+};
+// Tourist residence packages (owner refinement 26 Nov 2026 — v2.1.3;
+// USD/EUR per day, 26-day package "starting from"). USD figures are the
+// owner's exact numbers; EUR package prices are his exact figures too
+// (EUR ≈ USD × 48/52 rounded to the nearest 5 gives 740 / 1,270 / 1,590
+// for three of them — the owner's explicit 735 / 1,265 / 1,580 are used
+// as given). Daily EUR rates are daily USD × 48/52 rounded to the
+// nearest whole euro. Originals = 26 × daily rate, as for local
+// packages. Same quote flow, same escrow, same extra-days logic.
+const TOURIST_PACKAGES = {
+  package_tourist_assistant_12: { code: 'package_tourist_assistant_12', kind: 'tourist', level: 'assistant', shiftType: '12h', shiftHours: 12, dailyRateUsd: 25, dailyRateEur: 23, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Tourist package — nursing assistant, 12-hour shifts (26 days)', name_ar: 'باقة سياحية — مساعد تمريض، شيفت 12 ساعة (26 يومًا)', priceUsd: 575, originalUsd: 650, priceEur: 530, originalEur: 598 },
+  package_tourist_assistant_24: { code: 'package_tourist_assistant_24', kind: 'tourist', level: 'assistant', shiftType: '24h', shiftHours: 24, dailyRateUsd: 45, dailyRateEur: 42, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Tourist package — nursing assistant, 24-hour resident care (26 days)', name_ar: 'باقة سياحية — مساعد تمريض، شيفت 24 ساعة / مقيم (26 يومًا)', priceUsd: 1030, originalUsd: 1170, priceEur: 950, originalEur: 1092 },
+  package_tourist_technician_12: { code: 'package_tourist_technician_12', kind: 'tourist', level: 'technician', shiftType: '12h', shiftHours: 12, dailyRateUsd: 35, dailyRateEur: 32, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Tourist package — nursing technician, 12-hour shifts (26 days)', name_ar: 'باقة سياحية — فني تمريض، شيفت 12 ساعة (26 يومًا)', priceUsd: 800, originalUsd: 910, priceEur: 735, originalEur: 832 },
+  package_tourist_technician_24: { code: 'package_tourist_technician_24', kind: 'tourist', level: 'technician', shiftType: '24h', shiftHours: 24, dailyRateUsd: 60, dailyRateEur: 55, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Tourist package — nursing technician, 24-hour resident care (26 days)', name_ar: 'باقة سياحية — فني تمريض، شيفت 24 ساعة / مقيم (26 يومًا)', priceUsd: 1375, originalUsd: 1560, priceEur: 1265, originalEur: 1430 },
+  package_tourist_specialist_12: { code: 'package_tourist_specialist_12', kind: 'tourist', level: 'specialist', shiftType: '12h', shiftHours: 12, dailyRateUsd: 45, dailyRateEur: 42, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Tourist package — nursing specialist, 12-hour shifts (26 days)', name_ar: 'باقة سياحية — أخصائي تمريض، شيفت 12 ساعة (26 يومًا)', priceUsd: 1030, originalUsd: 1170, priceEur: 950, originalEur: 1092 },
+  package_tourist_specialist_24: { code: 'package_tourist_specialist_24', kind: 'tourist', level: 'specialist', shiftType: '24h', shiftHours: 24, dailyRateUsd: 75, dailyRateEur: 69, days: PACKAGE_DAYS, category: 'nursing', name_en: 'Tourist package — nursing specialist, 24-hour resident care (26 days)', name_ar: 'باقة سياحية — أخصائي تمريض، شيفت 24 ساعة / مقيم (26 يومًا)', priceUsd: 1720, originalUsd: 1950, priceEur: 1580, originalEur: 1794 },
+};
+// Daily rate of a package in the requested currency ('EGP' local;
+// 'USD'/'EUR' tourist). Returns null for an unknown currency.
+function packageDailyRateIn(pkg, currency) {
+  if (!pkg) return null;
+  if (currency === 'EGP') return pkg.dailyRateEgp ?? null;
+  if (currency === 'USD') return pkg.dailyRateUsd ?? null;
+  if (currency === 'EUR') return pkg.dailyRateEur ?? null;
+  return null;
+}
+// Indicative package price in the requested currency:
+// { price, original } or null.
+function packagePriceIn(pkg, currency) {
+  if (!pkg) return null;
+  if (currency === 'EGP') return pkg.priceEgp != null ? { price: pkg.priceEgp, original: pkg.originalEgp } : null;
+  if (currency === 'USD') return pkg.priceUsd != null ? { price: pkg.priceUsd, original: pkg.originalUsd } : null;
+  if (currency === 'EUR') return pkg.priceEur != null ? { price: pkg.priceEur, original: pkg.originalEur } : null;
+  return null;
+}
+// Per-day rate for the 4 extra days in the requested currency:
+// 'substitute' = normal daily rate; 'overtime' = +25% (waived while the
+// launch offer is on); 'none' = 0. The overtime rate is rounded to the
+// NEAREST 5 (owner-set figures: assistant 440/750, technician 690/1,190,
+// specialist 940/1,565 — 350×1.25 = 437.5 → 440, 550×1.25 = 687.5 → 690,
+// 750×1.25 = 937.5 → 940, 950×1.25 = 1,187.5 → 1,190,
+// 1,250×1.25 = 1,562.5 → 1,565).
+function packageExtraDailyRate(pkg, option, premiumWaived, currency) {
+  if (!pkg || option === 'none' || !option) return 0;
+  const daily = packageDailyRateIn(pkg, currency || 'EGP');
+  if (daily == null) return 0;
+  if (option === 'substitute') return daily;
+  if (option === 'overtime') return premiumWaived ? daily : Math.round(daily * (1 + PACKAGE_OVERTIME_PREMIUM_PCT / 100) / 5) * 5;
+  return 0;
+}
+// Extra-days price for the 4 days off, in the requested currency.
+// 'substitute' = normal daily rate × 4; 'overtime' = main nurse at +25%
+// (waived while the launch offer is on) × 4; 'none' = 0. Currency
+// defaults to EGP (local packages); pass 'USD'/'EUR' for tourist ones.
+function packageExtraDaysPrice(pkg, option, premiumWaived, currency) {
+  return packageExtraDailyRate(pkg, option, premiumWaived, currency || 'EGP') * PACKAGE_OFF_DAYS;
+}
+// Case-assessment checklists for the package request form (server-side
+// enum — the client sends codes only; free text rides alongside).
+const PACKAGE_CONDITIONS = [
+  { code: 'diabetes', name_ar: 'سكري' },
+  { code: 'pressure_ulcer', name_ar: 'قرحة فراش' },
+  { code: 'post_stroke', name_ar: 'بعد جلطة' },
+  { code: 'post_surgery', name_ar: 'بعد عملية جراحية' },
+  { code: 'fracture', name_ar: 'كسر / إصابة' },
+  { code: 'chronic', name_ar: 'مرض مزمن' },
+  { code: 'elderly', name_ar: 'كبير سن' },
+  { code: 'wound', name_ar: 'جرح / غيار' },
+  { code: 'other', name_ar: 'أخرى' },
+];
+const PACKAGE_NEEDS = [
+  { code: 'mobility', name_ar: 'مساعدة في الحركة' },
+  { code: 'feeding', name_ar: 'تغذية / إطعام' },
+  { code: 'wound_care', name_ar: 'غيار جرح' },
+  { code: 'catheter', name_ar: 'قسطرة بولية' },
+  { code: 'iv', name_ar: 'محاليل / علاج وريدي' },
+  { code: 'physio', name_ar: 'علاج طبيعي' },
+  { code: 'elderly_care', name_ar: 'رعاية مسنين' },
+  { code: 'postop', name_ar: 'رعاية ما بعد العملية' },
+  { code: 'diabetes', name_ar: 'متابعة سكري / ضغط' },
+  { code: 'bedridden', name_ar: 'رعاية طريح فراش' },
+  { code: 'other', name_ar: 'أخرى' },
+];
 
 // High-risk services (owner refinement + correction 26 Nov 2026;
 // PRICES APPROVED 26 Nov 2026 — FINAL): ALL catheter handling
@@ -358,6 +505,17 @@ const TERMS_AR = `الشروط والأحكام — شفاء كير (الإصد�
 11) تغيير الشروط
 - يجوز لشفاء كير تعديل هذه الشروط مع إشعار داخل التطبيق. استمرار استخدام التطبيق بعد التعديل يعني الموافقة عليه، ويُطلب منك تأكيد النسخة الجديدة قبل أي حجز أو تسجيل جديد.
 
+12) الباقات الشهرية
+- الباقة الشهرية = 26 يوم رعاية + 4 أيام إجازة للممرض (شهر العمل المصري: 26 يومًا + 4 أيام).
+- الأسعار المعروضة للباقات «تبدأ من» وليست ثابتة: السعر النهائي بعرض سعر مكتوب من الإدارة بعد تقييم الحالة (ما يعاني منه المريض، التشخيص، العلاج، والاحتياجات). يقدّم العميل طلب باقة بتفاصيل الحالة، وتحدد الإدارة السعر النهائي، ويراه العميل ويقبل أو يرفض.
+- سلم مستويات الرعاية: **مساعد تمريض** (رعاية أساسية: استحمام/إطعام/حركة/مرافقة/علامات حيوية) 12 ساعة 350 جنيه/يوم ← باقة 8,000 (بدل 9,100)، و24 ساعة 600 ← 13,700 (بدل 15,600)؛ **فني تمريض** (تمريض عادي: غيارات/حقن/كانيولا/قساطر) 12 ساعة 550 ← 12,600 (بدل 14,300)، و24 ساعة 950 ← 21,700 (بدل 24,700)؛ **أخصائي تمريض** (متقدم/معقد: NPWT وإجراءات عالية الخطورة) 12 ساعة 750 ← 17,200 (بدل 19,500)، و24 ساعة 1,250 ← 28,600 (بدل 32,500)؛ باقات المسنين 12 ساعة: متحرك 8,000 (بدل 9,100) و قعيد 12,600 (بدل 14,300) — وهذه الأسعار «تبدأ من» فقط: سعر باقة المسنين النهائي يعتمد على **علاج المسن وأدويته وحالته الصحية** إضافة إلى حركته والمستوى الذي يحتاجه، وتحدده الإدارة في عرض السعر المكتوب بعد تقييم الحالة. لذلك يلتقط نموذج طلب باقة المسنين العلاج/الأدوية والحالة الصحية صراحةً (إلزامي) إلى جانب الحركة والاحتياجات. تحدد الإدارة في عرض السعر المستوى الذي تستدعيه الحالة فعلًا، ولا يعمل أي مستوى فوق مؤهله أبدًا. شيفت اليوم الواحد (خارج الباقة) يبقى 12 ساعة 700 و24 ساعة 1,200 — اليوم المنفرد أغلى من اليوم داخل شهر مضمون.
+- باقات إقامة السياح (بالدولار/يورو في اليوم، وباقة 26 يومًا «تبدأ من»): مساعد $25/$45 ← $575/$1,030 (€530/€950)؛ فني $35/$60 ← $800/$1,375 (€735/€1,265)؛ أخصائي $45/$75 ← $1,030/$1,720 (€950/€1,580) — (12 ساعة/24 ساعة).
+- الأيام الأربعة الإضافية غير مشمولة افتراضيًا، ويضيفها العميل باختياره: ممرض بديل بالسعر اليومي العادي للمستوى، أو الممرض الأساسي إضافي بعلاوة 25% (تُعفى العلاوة في شهر عرض الإطلاق).
+- رسم المسافة مضمّن في سعر الباقة داخل مدينة القصير.
+- الدفع: الشهر كامل مقدمًا في الإسكرو، ويُصرف للممرض أسبوعيًا كل يوم خميس عن الأيام المكتملة فقط. الأيام المكتملة والمصروفة أسبوعيًا لا تُسترد بعد صرفها.
+- الإلغاء: قبل بدء الباقة = استرداد كامل للمبلغ المدفوع؛ وبعد البدء = استرداد الأيام المتبقية بسعر اليوم في الباقة (سعر الباقة ÷ 26). والأيام الإضافية غير المنفَّذة تُسترد أيضًا.
+- عمولة التطبيق على الباقات هي نفس النسب المعتادة (Starter 15%، Pro 12%، Elite 8%) من السعر النهائي للباقة.
+
 باستخدامك التطبيق فأنت تقر بأنك قرأت هذه الشروط والأحكام وفهمتها ووافقت عليها بالكامل.`;
 
 const TERMS_EN = `Terms & Conditions — Shifa Care (Version 1.0, 25 November 2026) — summary. The Arabic text is the binding version.
@@ -373,6 +531,7 @@ const TERMS_EN = `Terms & Conditions — Shifa Care (Version 1.0, 25 November 20
 9) Shifa Care is a technical intermediary only: the medical service contract is between the patient and the provider directly, and the app does not itself provide the medical service; the treating provider holds final clinical responsibility.
 10) Graduated penalties: recorded warning, temporary suspension (radar, acceptance and wallet closed), permanent ban with forfeiture of pending settlement for repeated or grave violations. You may appeal to admin within 7 days.
 11) Terms may change with in-app notice; continued use means acceptance, and you will be asked to confirm a new version before any new booking or registration.
+12) Monthly packages: a package = 26 days of care + 4 nurse days off (the Egyptian working month). Displayed package prices are indicative ("starting from") — the final price is a written admin quote after assessing the case (condition, diagnosis, treatment, needs); the patient submits a package request, admin sets the final price, and the patient accepts or declines. Care-level ladder: **nursing assistant** (basic care: bathing, feeding, movement, companionship, vitals) 12h 350 EGP/day → package 8,000 (instead of 9,100), 24h 600 → 13,700 (instead of 15,600); **nursing technician** (standard nursing: dressings, injections, cannula, catheters) 12h 550 → 12,600 (instead of 14,300), 24h 950 → 21,700 (instead of 24,700); **nursing specialist** (advanced/complex: NPWT and high-risk procedures) 12h 750 → 17,200 (instead of 19,500), 24h 1,250 → 28,600 (instead of 32,500); elderly 12h packages: mobile 8,000 (instead of 9,100), bedridden 12,600 (instead of 14,300) — these are "starting from" only: the final elderly package price depends on the **elderly person's treatment/medications and condition** in addition to mobility and the level needed, and the admin sets it in the written quote after assessing the case. The elderly package request form therefore captures treatment/medications and condition explicitly (required) alongside mobility and needs. The admin confirms the level the case actually needs in the quote, and no level ever works above its qualification. A single-day (non-package) shift stays 12h 700 / 24h 1,200 — a single day costs more than a day inside a guaranteed month. Tourist residence packages (per day in USD/EUR, 26-day package "starting from"): assistant $25/$45 → $575/$1,030 (€530/€950); technician $35/$60 → $800/$1,375 (€735/€1,265); specialist $45/$75 → $1,030/$1,720 (€950/€1,580) — (12h/24h). The 4 extra days are not included by default: a substitute nurse at the level's normal daily rate, or the main nurse as overtime at a +25% premium (premium waived in the launch-offer month). The distance fee is included inside El Quseir. Payment: the full month is paid upfront into escrow; the provider is paid weekly every Thursday for completed days only; completed days already settled are not refundable. Cancellation: before the package starts = full refund; after the start = refund of the remaining days at the package daily rate (package price ÷ 26); unworked extra days are refunded as well. The app commission on packages is the usual tier rate (Starter 15%, Pro 12%, Elite 8%) on the final package price.
 
 By using the app you confirm you have read, understood and fully accepted these Terms & Conditions.`;
 
@@ -1784,5 +1943,7 @@ module.exports = {
   TERMS_VERSION, TERMS_UPDATED_AT, TERMS_AR, TERMS_EN,
   DEFAULT_LANGUAGES, LANGUAGE_TESTS, LANGUAGE_TEST_QUESTIONS, LANGUAGE_TEST_PASS_MIN,
   LANGUAGE_TEST_MINUTES, LANGUAGE_TEST_RETAKE_DAYS, LANGUAGE_TEST_TOPICS,
+  MONTHLY_PACKAGES, TOURIST_PACKAGES, PACKAGE_LEVELS, PACKAGE_DAYS, PACKAGE_OFF_DAYS, PACKAGE_OVERTIME_PREMIUM_PCT,
+  packageExtraDaysPrice, packageExtraDailyRate, packageDailyRateIn, packagePriceIn, PACKAGE_CONDITIONS, PACKAGE_NEEDS,
   distanceFee, servicePriceEgp,
 };

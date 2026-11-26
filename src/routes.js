@@ -63,6 +63,9 @@ function canSeeBooking(req, b) {
   if (req.user.role === 'admin') return true;
   if (req.user.role === 'patient' && b.patientPhone === req.user.phone) return true;
   if (req.user.role === 'provider' && b.providerId && req.user.providerId === b.providerId) return true;
+  // v2.1.3 — a package's SUBSTITUTE provider also sees that package
+  // (their 4 extra days live on it), but nothing else of it.
+  if (req.user.role === 'provider' && b.kind === 'package' && b.substituteProviderId && req.user.providerId === b.substituteProviderId) return true;
   return false;
 }
 // Viewer-aware booking serializer: pass the request user so the
@@ -221,19 +224,39 @@ function generateSettlements() {
   const made = [];
   for (const p of Object.values(store.data.providers)) {
     if (p.demo) continue;
+    // v2.1.3 — package bookings are EXCLUDED from the lump-sum below:
+    // their providerShareEgp is the aggregate of ALL day releases (which
+    // may span several weeks), so adding it here would double-count the
+    // weekly releases. Day releases are summed per week instead.
     const weekBookings = Object.values(store.data.bookings).filter((b) =>
-      b.providerId === p.id && b.releasedAt && isoWeekKey(new Date(b.releasedAt)) === weekKey);
+      b.kind !== 'package' && b.providerId === p.id && b.releasedAt && isoWeekKey(new Date(b.releasedAt)) === weekKey);
+    // v2.1.3 — completed package days released this week, per provider
+    // (main provider AND substitute: each release entry carries its own
+    // providerId). Cash package bookings: the provider holds the cash, so
+    // the app share of released days is owed BY the provider.
+    let packageDays = 0, packageProviderShare = 0, packageAppShare = 0, packageCashAppShare = 0;
+    for (const b of Object.values(store.data.bookings)) {
+      if (b.kind !== 'package') continue;
+      for (const rel of (b.packageDayReleases || [])) {
+        if (rel.providerId !== p.id || rel.weekKey !== weekKey) continue;
+        packageDays += rel.days;
+        packageProviderShare += rel.providerShareEgp || 0;
+        packageAppShare += rel.appShareEgp || 0;
+        if (b.cashCollectedByProvider) packageCashAppShare += rel.appShareEgp || 0;
+      }
+    }
     const stay = stayBonusState(p);
     const vb = volumeBonusFor(p.id, monthKey());
     const stayDue = stay.earned && !stay.paid ? cat.STAY_BONUS_EGP : 0;
-    if (!weekBookings.length && !stayDue && !(vb.bonusEgp > 0)) continue;
+    if (!weekBookings.length && !stayDue && !(vb.bonusEgp > 0) && !packageDays) continue;
     const exists = (store.data.settlements || []).some((x) => x.providerId === p.id && x.weekKey === weekKey);
     if (exists) continue;
     const totals = {
-      appOwesProviderEgp: weekBookings.reduce((sum, b) => sum + (b.providerShareEgp || 0), 0) + vb.bonusEgp + stayDue,
-      providerOwesAppEgp: weekBookings.filter((b) => b.cashCollectedByProvider).reduce((sum, b) => sum + (b.appShareEgp || 0), 0),
+      appOwesProviderEgp: weekBookings.reduce((sum, b) => sum + (b.providerShareEgp || 0), 0) + vb.bonusEgp + stayDue + packageProviderShare,
+      providerOwesAppEgp: weekBookings.filter((b) => b.cashCollectedByProvider).reduce((sum, b) => sum + (b.appShareEgp || 0), 0) + packageCashAppShare,
       volumeBonusEgp: vb.bonusEgp, stayBonusEgp: stayDue,
       releasedCases: weekBookings.length,
+      packageDays, packageProviderShareEgp: packageProviderShare, packageAppShareEgp: packageAppShare,
     };
     const rec = { id: newId('stl'), providerId: p.id, weekKey, generatedAt: nowIso(), totals };
     store.data.settlements.push(rec);
@@ -418,6 +441,171 @@ function maybeIssueVouchers(patientPhone) {
   store.audit('voucher.issued', patientPhone, { count: made.length, completedPaidVisits: completed, voucherIds: made.map((v) => v.id) });
   return made;
 }
+
+// ------------------------------------------------------------------ v2.1.3
+// Monthly packages (see src/catalog.js MONTHLY_PACKAGES). Money rule:
+// the full month is paid upfront into escrow; the nurse is paid WEEKLY at
+// Thursday settlement for COMPLETED days only. A completed day's share is
+// released by settlePackageDays() (called from the sweep, before
+// generateSettlements so the week's settlement records include it).
+// The final release (releasePackageBooking) only releases the days that
+// are still unreleased; earlier weekly releases are never re-counted.
+// Commission is LOCKED at quote-accept time from the main provider's tier
+// (promo override included) — the same lock applies to substitute days.
+// Weekly-released days are NOT refundable after settlement (terms §12);
+// only the UNRELEASED remainder is refunded on complaint/cancel.
+function packageTypeOf(code) { return cat.MONTHLY_PACKAGES[code] || cat.TOURIST_PACKAGES[code] || null; }
+function packageFamily(pkg) { return pkg && pkg.kind === 'tourist' ? 'tourist' : 'local'; }
+// EGP per 1 unit of the booking currency (tourist packages settle in EGP;
+// the ledger, wallet and refunds are all EGP — the foreign amount is
+// carried alongside for display, exactly like tourist bookings).
+function packageFxRate(currency) {
+  if (currency === 'USD') return config.usdEgp;
+  if (currency === 'EUR') return config.eurEgp;
+  return 1;
+}
+// Level gate (owner rule 26 Nov 2026 — v2.1.3): nobody works above their
+// qualification. Assistant packages: assistant / nurse / doctor (basic
+// care — anyone qualified may do it). Technician: nurse / doctor only
+// (an assistant NEVER takes medical work). Specialist: nurse at Pro+
+// (the points system proves the experience) or any doctor. Physio
+// specialists never take nursing packages (and vice versa).
+function providerMeetsPackageLevel(p, level) {
+  const type = p.providerType || p.role;
+  if (type === 'physio') return false;
+  if (level === 'assistant') return ['assistant', 'nurse', 'doctor'].includes(type);
+  if (level === 'technician') return ['nurse', 'doctor'].includes(type);
+  if (level === 'specialist') {
+    if (type === 'doctor') return true;
+    if (type !== 'nurse') return false;
+    return ['Pro', 'Elite'].includes(p.tier);
+  }
+  return false;
+}
+function packageLevelName(level) {
+  return { assistant: 'nursing assistant', technician: 'nursing technician', specialist: 'nursing specialist' }[level] || level;
+}
+// The +25% overtime premium is waived while the launch offer is on:
+// admin setting (POST /api/admin/package-offer, unexpired) wins; env
+// PACKAGE_OVERTIME_WAIVED is the fallback.
+function packageOvertimePremiumWaived() {
+  const off = store.data.packageOffer;
+  if (off && off.overtimePremiumWaived === true) {
+    if (!off.until || new Date(off.until).getTime() > Date.now()) return true;
+  }
+  return config.packageOvertimePremiumWaived === true;
+}
+// Package daily rate: final quoted BASE price ÷ 26 days (terms §12).
+// The base price (not the total incl. extra days) prices the 26 regular
+// days; extra days have their own daily rate on the booking.
+function packageDailyRate(booking) {
+  return Math.max(1, Math.round(((booking.basePackageEgp || booking.amountEgp || 0)) / cat.PACKAGE_DAYS));
+}
+function packageDayTotals(booking) {
+  const rel = booking.packageDayReleases || [];
+  return {
+    providerShareEgp: rel.reduce((s, x) => s + (x.providerShareEgp || 0), 0),
+    appShareEgp: rel.reduce((s, x) => s + (x.appShareEgp || 0), 0),
+    days: rel.reduce((s, x) => s + (x.days || 0), 0),
+  };
+}
+function packageUnreleasedDays(booking) {
+  return (booking.daysLog || []).filter((d) => !d.released);
+}
+// Release ONE list of completed days for a provider at the booking's locked
+// commission. Appends one packageDayReleases entry and marks the days
+// released. Returns the entry or null.
+function releasePackageDays(booking, days, providerId) {
+  if (!days.length) return null;
+  const pct = booking.commissionPct ?? cat.TIERS[store.data.providers[booking.providerId]?.tier || 'Starter'].commission_pct;
+  let providerShareEgp = 0, appShareEgp = 0;
+  for (const d of days) {
+    const gross = d.rateEgp;
+    const app = Math.round(gross * (pct / 100));
+    providerShareEgp += gross - app;
+    appShareEgp += app;
+    d.released = true; d.releasedAt = nowIso(); d.weekKey = currentWeekKey();
+  }
+  const entry = { weekKey: currentWeekKey(), providerId, days: days.length, providerShareEgp, appShareEgp, releasedAt: nowIso(), final: false };
+  booking.packageDayReleases = booking.packageDayReleases || [];
+  booking.packageDayReleases.push(entry);
+  booking.daysReleased = (booking.daysReleased || 0) + days.length;
+  store.audit('package.days_released', providerId, { bookingId: booking.id, weekKey: entry.weekKey, days: days.length, providerShareEgp, appShareEgp });
+  return entry;
+}
+// Weekly pass (called from the sweep before generateSettlements): for every
+// running package booking, release any completed-but-unreleased days.
+// Suspended / permanently-banned providers hold their own days (the
+// substitute's days still release).
+function settlePackageDays() {
+  const released = [];
+  for (const b of Object.values(store.data.bookings)) {
+    if (b.kind !== 'package' || b.status !== 'accepted') continue;
+    const byProvider = {};
+    for (const d of packageUnreleasedDays(b)) {
+      byProvider[d.providerId] = byProvider[d.providerId] || [];
+      byProvider[d.providerId].push(d);
+    }
+    for (const [providerId, days] of Object.entries(byProvider)) {
+      if (providerBlocked(store.data.providers[providerId])) continue;
+      const entry = releasePackageDays(b, days, providerId);
+      if (entry) released.push({ bookingId: b.id, providerId, days: entry.days, providerShareEgp: entry.providerShareEgp });
+    }
+  }
+  if (released.length) store.save();
+  return released;
+}
+// Final release of a package booking (after patient confirmation + review,
+// or auto after 1h, or on complaint rejection). Releases any remaining
+// unreleased days, then totals the booking's shares from the day releases.
+// A package counts as ONE completed case for the main provider (points +
+// volume bonus) — the same as a standard visit.
+function releasePackageBooking(b, mode) {
+  const byProvider = {};
+  for (const d of packageUnreleasedDays(b)) {
+    if (providerBlocked(store.data.providers[d.providerId])) continue; // hold: banned provider's days stay unreleased
+    byProvider[d.providerId] = byProvider[d.providerId] || [];
+    byProvider[d.providerId].push(d);
+  }
+  for (const [providerId, days] of Object.entries(byProvider)) {
+    const entry = releasePackageDays(b, days, providerId);
+    if (entry) entry.final = true;
+  }
+  const totals = packageDayTotals(b);
+  b.providerShareEgp = totals.providerShareEgp;
+  b.appShareEgp = totals.appShareEgp;
+  const key = monthKey();
+  const p = b.providerId ? store.data.providers[b.providerId] : null;
+  const prevCases = p ? monthlyCases(p.id, key) : 0;
+  b.status = mode === 'auto' ? 'auto_released' : 'released';
+  b.releasedAt = nowIso();
+  b.releaseMode = mode;
+  b.settleableAt = b.complaintDeadline || null;
+  if (p) {
+    p.completedVisits = (p.completedVisits || 0) + 1;
+    const wk = isoWeekKey(new Date(b.releasedAt || nowIso()));
+    p.casesByWeek = p.casesByWeek || {};
+    p.casesByWeek[wk] = (p.casesByWeek[wk] || 0) + 1;
+    recomputeProviderPoints(p);
+    const vb = volumeBonusFor(p.id, key);
+    p.volumeBonus = { month: key, cases: vb.cases, bonusEgp: vb.bonusEgp, title: vb.title, paused: vb.paused };
+    const prevTier = cat.VOLUME_BONUS_TIERS.filter((t) => prevCases >= t.minCases).sort((a, b) => b.minCases - a.minCases)[0] || null;
+    const newTier = cat.VOLUME_BONUS_TIERS.filter((t) => vb.cases >= t.minCases).sort((a, b) => b.minCases - a.minCases)[0] || null;
+    if (newTier && (!prevTier || newTier.minCases !== prevTier.minCases)) {
+      store.audit('bonus.earned', p.id, { bookingId: b.id, month: key, cases: vb.cases, bonusEgp: vb.bonusEgp, title: vb.title, paused: vb.paused });
+    }
+  }
+  store.audit('escrow.released', b.providerId || 'system', { bookingId: b.id, kind: 'package', mode, providerShareEgp: b.providerShareEgp, appShareEgp: b.appShareEgp });
+  if (b.patientPhone) maybeIssueVouchers(b.patientPhone);
+  store.save();
+}
+// Refundable remainder of a package (terms §12): what the patient actually
+// paid minus the value of ALL days already released (weekly + final).
+// Unworked extra days are included (they are never released).
+function packageRefundRemaining(b) {
+  const releasedGross = (b.packageDayReleases || []).reduce((s, x) => s + x.providerShareEgp + x.appShareEgp, 0);
+  return Math.max(0, refundAmount(b) - releasedGross);
+}
 // Find one usable voucher for this patient/amount (does NOT mark it used —
 // the caller marks it used only after the booking is created).
 function findVoucher(patientPhone, amountEgp) {
@@ -553,14 +741,14 @@ async function sweepAutoRelease() {
       // v2.0.8: a circumvention hold pauses auto-release just like a complaint.
       if (b.circumventionHold) continue;
       if (now - new Date(b.patientConfirmedAt).getTime() >= config.autoReleaseAfterMs) {
-        releaseBooking(b, 'auto');
+        if (b.kind === 'package') releasePackageBooking(b, 'auto'); else releaseBooking(b, 'auto');
         released.push(b.id);
       }
     }
     // 'reviewed' only persists when a complaint paused the release; once
     // the complaint is resolved as rejected, release it now.
     if (b.status === 'reviewed' && !b.complaint && !b.circumventionHold) {
-      releaseBooking(b, 'reviewed');
+      if (b.kind === 'package') releasePackageBooking(b, 'reviewed'); else releaseBooking(b, 'reviewed');
       released.push(b.id);
     }
     // v2.1.1 (audit #28): the 120-minute late-visit clock starts at the
@@ -639,10 +827,15 @@ async function sweepAutoRelease() {
     console.error('[sweep] sms fallback pass failed:', e.message);
   }
   // v2.1.1 (audit #5): weekly settlement records (records only).
+  // v2.1.3 — release completed package days FIRST, so the week's
+  // settlement records include them (settlePackageDays is idempotent:
+  // released days are marked and never re-released).
+  const packageDaysReleased = settlePackageDays();
+  if (packageDaysReleased.length) changed = true;
   const settlementsMade = generateSettlements();
   if (settlementsMade.length) changed = true;
   if (released.length || overdue.length || changed) store.save();
-  return { released, overdue, notificationsSent, smsSent: fb.sent, smsFallbackAttempted: fb.attempted, settlementsGenerated: settlementsMade.length };
+  return { released, overdue, notificationsSent, smsSent: fb.sent, smsFallbackAttempted: fb.attempted, settlementsGenerated: settlementsMade.length, packageDaysReleased: packageDaysReleased.length };
 }
 
 // ---------------------------------------------------------------- bootstrap
@@ -699,6 +892,32 @@ router.get('/bootstrap', (req, res) => {
     // 2026): 7 seeded languages, testable only with a question bank.
     languages: languageList(),
     languageTest: { questionsPerTest: cat.LANGUAGE_TEST_QUESTIONS, passMin: cat.LANGUAGE_TEST_PASS_MIN, minutes: cat.LANGUAGE_TEST_MINUTES, retakeDays: cat.LANGUAGE_TEST_RETAKE_DAYS },
+    // v2.1.3 — monthly packages (owner-approved 26 Nov 2026). Prices are
+    // INDICATIVE ("starting from") — the final price is a written admin
+    // quote after a case assessment (see /api/package-requests). Local
+    // ladder: assistant / technician / specialist (elderly unchanged).
+    // Tourist residence packages carry USD/EUR prices.
+    packages: Object.values(cat.MONTHLY_PACKAGES).map((p) => ({
+      code: p.code, level: p.level, shiftType: p.shiftType, shiftHours: p.shiftHours, dailyRateEgp: p.dailyRateEgp, days: p.days,
+      name_en: p.name_en, name_ar: p.name_ar,
+      priceEgp: p.priceEgp, originalEgp: p.originalEgp,
+      price: p.priceEgp, original: p.originalEgp,
+    })),
+    touristPackages: Object.values(cat.TOURIST_PACKAGES).map((p) => ({
+      code: p.code, level: p.level, shiftType: p.shiftType, shiftHours: p.shiftHours,
+      dailyRateUsd: p.dailyRateUsd, dailyRateEur: p.dailyRateEur, days: p.days,
+      name_en: p.name_en, name_ar: p.name_ar,
+      priceUsd: p.priceUsd, originalUsd: p.originalUsd,
+      priceEur: p.priceEur, originalEur: p.originalEur,
+    })),
+    packageConfig: {
+      days: cat.PACKAGE_DAYS, offDays: cat.PACKAGE_OFF_DAYS,
+      overtimePremiumPct: cat.PACKAGE_OVERTIME_PREMIUM_PCT,
+      overtimePremiumWaived: packageOvertimePremiumWaived(),
+      levels: cat.PACKAGE_LEVELS,
+      conditions: cat.PACKAGE_CONDITIONS,
+      needs: cat.PACKAGE_NEEDS,
+    },
     // v2.0.9 — active promo-month override (commission %, no secrets).
     promo: (() => { const pr = activePromo(); return pr ? { active: true, commissionPct: pr.commissionPct, until: pr.until || null } : { active: false, commissionPct: null, until: null }; })(),
     note: 'Prices are fixed and announced in advance. No bargaining inside the app.',
@@ -1152,6 +1371,9 @@ router.post('/admin/bookings/:id/receipt/approve', requireAdmin, (req, res) => {
   b.receipt.status = 'approved';
   b.receipt.reviewedAt = nowIso();
   b.receipt.note = String(req.body?.note || '').slice(0, 500) || null;
+  // v2.1.3 — a package booking held for receipt review starts once the
+  // receipt is approved (the month's escrow is then real).
+  if (b.kind === 'package' && b.status === 'held') b.status = 'accepted';
   store.audit('admin.receipt_approved', 'admin', { bookingId: b.id });
   store.save();
   res.json({ ok: true, bookingId: b.id, receipt: b.receipt });
@@ -1207,7 +1429,14 @@ router.get('/monitor/summary', (req, res) => {
     else appOwes += b.providerShareEgp || 0;
   }
   for (const b of bookings) {
-    if (['provider_confirmed', 'patient_confirmed', 'reviewed'].includes(b.status)) pending += b.estimatedProviderShareEgp ?? b.providerShareEgp ?? 0;
+    if (['provider_confirmed', 'patient_confirmed', 'reviewed'].includes(b.status)) {
+      if (b.kind === 'package') {
+        // v2.1.3 — pending is only the UNRELEASED remainder (days already
+        // released weekly are not pending anymore).
+        const releasedProv = (b.packageDayReleases || []).reduce((s, x) => s + (x.providerShareEgp || 0), 0);
+        pending += Math.max(0, (b.estimatedProviderShareEgp || 0) - releasedProv);
+      } else pending += b.estimatedProviderShareEgp ?? b.providerShareEgp ?? 0;
+    }
   }
   // v2.1.1 — repeat-booking rate (owner's launch metric, 26 Nov 2026):
   // share of patients with 2+ COMPLETED bookings, overall and last 30 days.
@@ -1249,6 +1478,15 @@ router.get('/monitor/summary', (req, res) => {
   const pendingReceipts = bookings
     .filter((b) => b.receipt && b.receipt.status === 'pending')
     .map((b) => ({ id: b.id }));
+  // v2.1.3 — pending package requests + active packages (no PII: request
+  // id + package type + status only, so the admin partner can read them
+  // and send Mohamed a recommendation in chat).
+  const pendingPackageRequests = (store.data.packageRequests || [])
+    .filter((r) => r.status === 'submitted')
+    .map((r) => ({ id: r.id, packageType: r.packageType, level: r.level || null, status: r.status }));
+  const activePackages = bookings
+    .filter((b) => b.kind === 'package' && ['accepted', 'provider_confirmed', 'patient_confirmed'].includes(b.status))
+    .map((b) => ({ id: b.id, level: b.level || null, daysCompleted: b.daysCompleted || 0, extraDaysCompleted: b.extraDaysCompleted || 0 }));
   store.audit('monitor.access', 'monitor', { ip: req.ip });
   store.save();
   res.json({
@@ -1262,6 +1500,8 @@ router.get('/monitor/summary', (req, res) => {
     repeatBookingRate,
     pendingApplications: { count: pendingApplications.length, items: pendingApplications },
     pendingReceipts: { count: pendingReceipts.length, items: pendingReceipts },
+    pendingPackageRequests: { count: pendingPackageRequests.length, items: pendingPackageRequests },
+    activePackages: { count: activePackages.length, items: activePackages },
     medicalFileInterestCount: (store.data.medicalFileInterest || {}).count || 0,
   });
 });
@@ -1635,6 +1875,30 @@ router.post('/bookings/:id/cancel', requireAuth, requireRole('patient'), (req, r
   if (!['held', 'accepted'].includes(b.status)) {
     return bad(res, 409, `Cannot cancel while status is ${b.status}.`, { status: b.status });
   }
+  // v2.1.3 — packages do NOT use the 15-minute window (terms §12):
+  // cancel any time before the package completes. Before the start date
+  // = full refund; after the start = refund of the remaining days at the
+  // package daily rate (final price ÷ 26) + unworked extra days.
+  if (b.kind === 'package') {
+    const startMs = new Date(b.startDate + 'T00:00:00Z').getTime();
+    const beforeStart = Date.now() < startMs;
+    b.status = 'cancelled';
+    b.cancelledAt = nowIso();
+    if (beforeStart) {
+      b.refundEgp = refundAmount(b);
+    } else {
+      // v2.1.3 — refund exactly what was NOT worked: what the patient
+      // paid minus the logged days at their logged rates (the 26th day
+      // absorbs the rounding remainder, so this is exact to the pound).
+      const workedGross = (b.daysLog || []).reduce((s, d) => s + (d.rateEgp || 0), 0);
+      b.refundEgp = Math.max(0, refundAmount(b) - workedGross);
+    }
+    b.refundedAt = nowIso();
+    store.audit('booking.cancelled', req.user.phone, { bookingId: b.id, kind: 'package', refundEgp: b.refundEgp, beforeStart });
+    store.save();
+    res.json({ ...pubBooking(req, b, { includePaymentNumber: false }), note: beforeStart ? 'Cancelled before the package start date — the full held amount is refunded.' : 'Cancelled after the start — the remaining days are refunded at the package daily rate.' });
+    return;
+  }
   const deadline = new Date(b.createdAt).getTime() + config.cancelWindowMs;
   if (Date.now() > deadline) {
     return res.status(409).json({ error: 'cancel_window_closed', message: 'Cancellation is only allowed within 15 minutes of booking. The 15-minute window has passed.', cancelDeadline: new Date(deadline).toISOString() });
@@ -1703,7 +1967,8 @@ router.post('/bookings/:id/review', requireAuth, requireRole('patient'), (req, r
     store.save();
     return res.json({ ...pubBooking(req, b, { includePaymentNumber: true }), note: b.circumventionHold ? 'Review recorded. The payout is held for admin review because you reported a request to deal outside the app.' : 'Review recorded. Release is paused while your complaint is under review.' });
   }
-  releaseBooking(b, 'reviewed'); // review releases the held amount at once (provisional; final settlement after the 24h complaint window)
+  if (b.kind === 'package') releasePackageBooking(b, 'reviewed'); // v2.1.3 — package final release is per-day, never a lump sum
+  else releaseBooking(b, 'reviewed'); // review releases the held amount at once (provisional; final settlement after the 24h complaint window)
   res.json(pubBooking(req, b, { includePaymentNumber: true }));
 });
 
@@ -1850,6 +2115,368 @@ router.post('/jobs/sweep', requireAdmin, async (req, res) => {
   const result = await sweepAutoRelease();
   store.audit('jobs.sweep', req.user.phone, result);
   res.json({ ok: true, ...result });
+});
+
+// ------------------------------------------------------------------ v2.1.3
+// Monthly packages — quote-based pricing (owner-approved 26 Nov 2026).
+// Flow: patient submits a package request (case assessment) → admin
+// reviews and sets the final price (written quote) + assigns the provider
+// → patient accepts (full month paid upfront into escrow) or declines.
+// Catalog prices are INDICATIVE ("starting from") — never the final
+// price. No loyalty vouchers on packages (the "بدل" offer price is
+// already the discount). The booking records the 4-extra-days option
+// (none / substitute / overtime) and its price. The optional "first
+// assessment visit" was deliberately NOT built: the patient can already
+// book a standard visit themselves and mention the package in the notes;
+// there is no admin-creates-booking path to build it on.
+function normalizePackageRequest(raw) {
+  const b = raw || {};
+  return {
+    packageType: String(b.packageType || '').trim(),
+    // v2.1.3 refinement — the requested care level (assistant /
+    // technician / specialist). Optional in the body: when omitted the
+    // server derives it from the package; when given it must match the
+    // package's level (the package IS the level choice in the form).
+    level: String(b.level || '').trim() || null,
+    // Currency of the quote: EGP for local packages; USD/EUR for
+    // tourist residence packages (default USD).
+    currency: String(b.currency || '').trim().toUpperCase() || null,
+    patientName: String(b.patientName || '').trim(),
+    condition: String(b.condition || '').trim(),
+    conditionItems: Array.isArray(b.conditionItems) ? b.conditionItems.map((x) => String(x).trim()).filter(Boolean) : [],
+    diagnosis: String(b.diagnosis || '').trim(),
+    treatment: String(b.treatment || '').trim(),
+    needs: Array.isArray(b.needs) ? b.needs.map((x) => String(x).trim()).filter(Boolean) : [],
+    needsNote: String(b.needsNote || '').trim(),
+    startDate: String(b.startDate || '').trim(),
+    address: String(b.address || '').trim(),
+    distanceKm: b.distanceKm != null ? Number(b.distanceKm) : null,
+    notes: String(b.notes || '').trim(),
+  };
+}
+function publicPackageRequest(r) { return r ? { ...r } : null; }
+
+// Patient submits a package request (case assessment). Terms acceptance
+// is required, like every booking.
+router.post('/package-requests', requireAuth, requireRole('patient'), (req, res) => {
+  if (!termsAccepted(req.body)) return termsError(res);
+  const f = normalizePackageRequest(req.body);
+  const pkg = packageTypeOf(f.packageType);
+  if (!pkg) return bad(res, 400, 'packageType must be one of: ' + [...Object.keys(cat.MONTHLY_PACKAGES), ...Object.keys(cat.TOURIST_PACKAGES)].join(', '));
+  const family = packageFamily(pkg);
+  // Currency: local packages are EGP only; tourist packages are USD or
+  // EUR (default USD when the client does not say).
+  let currency = f.currency;
+  if (family === 'local') {
+    if (currency && currency !== 'EGP') return bad(res, 400, 'Local packages are priced in EGP only.');
+    currency = 'EGP';
+  } else {
+    if (!currency) currency = 'USD';
+    if (!['USD', 'EUR'].includes(currency)) return bad(res, 400, 'Tourist packages are priced in USD or EUR only.');
+  }
+  // Requested level: when the client sends one it must be a real level
+  // AND match the package's level (the package select in the form is
+  // the level choice — a mismatch is a client bug, not a quote).
+  if (f.level && !cat.PACKAGE_LEVELS.includes(f.level)) return bad(res, 400, 'level must be assistant, technician or specialist.');
+  if (f.level && f.level !== pkg.level) return bad(res, 400, `level ${f.level} does not match package ${f.packageType} (level ${pkg.level}).`);
+  f.level = pkg.level;
+  f.currency = currency;
+  // Elderly packages (owner refinement 26 Nov 2026): the price is NOT
+  // fixed by mobile/bedridden alone — it also depends on the elderly
+  // person's TREATMENT and CONDITION. The request form must capture
+  // treatment/medications explicitly (condition is already required
+  // for every package); the admin sets the final price from treatment
+  // + condition + mobility + level needed.
+  if (f.packageType.startsWith('package_elderly_') && !f.treatment) return bad(res, 400, 'treatment (medications) is required for elderly packages — the final price depends on it.');
+  if (!f.patientName || f.patientName.length > 120) return bad(res, 400, 'patientName required (max 120 characters).');
+  if (!f.condition || f.condition.length > 500) return bad(res, 400, 'condition required (what the patient suffers from, max 500 characters).');
+  const badCond = f.conditionItems.filter((c) => !cat.PACKAGE_CONDITIONS.some((x) => x.code === c));
+  if (badCond.length) return bad(res, 400, 'Unknown condition item: ' + badCond.join(', '));
+  if (f.diagnosis.length > 500) return bad(res, 400, 'diagnosis is too long (max 500 characters).');
+  if (f.treatment.length > 500) return bad(res, 400, 'treatment is too long (max 500 characters).');
+  const badNeed = f.needs.filter((n) => !cat.PACKAGE_NEEDS.some((x) => x.code === n));
+  if (badNeed.length) return bad(res, 400, 'Unknown care need: ' + badNeed.join(', '));
+  if (f.needsNote.length > 500) return bad(res, 400, 'needsNote is too long (max 500 characters).');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(f.startDate) || Number.isNaN(new Date(f.startDate + 'T00:00:00Z').getTime())) return bad(res, 400, 'startDate must be a valid YYYY-MM-DD date.');
+  const startMs = new Date(f.startDate + 'T00:00:00Z').getTime();
+  const todayMs = new Date(new Date().toISOString().slice(0, 10) + 'T00:00:00Z').getTime();
+  if (startMs < todayMs) return bad(res, 400, 'startDate cannot be in the past.');
+  if (!f.address || f.address.length > 300) return bad(res, 400, 'address required (max 300 characters).');
+  if (f.distanceKm != null && (!Number.isFinite(f.distanceKm) || f.distanceKm < 0 || f.distanceKm > 100)) return bad(res, 400, 'distanceKm must be 0–100.');
+  if (f.notes.length > 1000) return bad(res, 400, 'notes are too long (max 1000 characters).');
+  const r = {
+    id: newId('pkr'), patientPhone: req.user.phone, ...f,
+    status: 'submitted', quote: null, bookingId: null,
+    createdAt: nowIso(), quotedAt: null, decidedAt: null,
+  };
+  store.data.packageRequests.push(r);
+  store.audit('package.request_created', req.user.phone, { requestId: r.id, packageType: r.packageType, startDate: r.startDate });
+  store.save();
+  res.status(201).json(publicPackageRequest(r));
+});
+
+router.get('/package-requests/mine', requireAuth, requireRole('patient'), (req, res) => {
+  const list = (store.data.packageRequests || []).filter((r) => r.patientPhone === req.user.phone).slice().reverse();
+  res.json({ requests: list.map(publicPackageRequest) });
+});
+
+router.get('/admin/package-requests', requireAdmin, (req, res) => {
+  const list = (store.data.packageRequests || []).slice().reverse();
+  res.json({ requests: list.map(publicPackageRequest) });
+});
+
+// Admin sets the written quote: final price + provider (+ substitute for
+// the 4 extra days) + which extra-days option. The provider must be
+// verified AND interview-passed; a physio specialist cannot take a
+// nursing package (and vice versa). v2.1.3 refinement: the admin may
+// CONFIRM OR RAISE the care level in the quote (optional `packageType`
+// override — same shift, same local/tourist family), and the provider
+// must meet the FINAL package's level gate (assistant never takes
+// medical work; specialist needs a Pro+ nurse or a doctor). Tourist
+// packages additionally require a tourist-compatible provider.
+router.post('/admin/package-requests/:id/quote', requireAdmin, (req, res) => {
+  if (rejectReservedId(req, res)) return;
+  const r = (store.data.packageRequests || []).find((x) => x.id === req.params.id);
+  if (!r) return res.status(404).json({ error: 'not_found', message: 'Package request not found.' });
+  if (r.status !== 'submitted') return bad(res, 409, `Cannot quote a request in status ${r.status}.`);
+  const requestedPkg = packageTypeOf(r.packageType);
+  if (!requestedPkg) return bad(res, 400, 'The requested package no longer exists.');
+  const finalCode = String(req.body?.packageType || r.packageType);
+  const pkg = packageTypeOf(finalCode);
+  if (!pkg) return bad(res, 400, 'packageType must be a valid package code.');
+  if (pkg.shiftHours !== requestedPkg.shiftHours) return bad(res, 400, 'The quoted package must have the same shift length as the requested package (12h or 24h).');
+  if (packageFamily(pkg) !== packageFamily(requestedPkg)) return bad(res, 400, 'Cannot switch between local and tourist packages in a quote.');
+  const currency = r.currency || 'EGP';
+  const fx = packageFxRate(currency);
+  // Final price in the booking currency. `finalPrice` is the field;
+  // `finalPriceEgp` is accepted as a legacy alias (identical for EGP).
+  const finalPrice = Number(req.body?.finalPrice ?? req.body?.finalPriceEgp);
+  if (!Number.isInteger(finalPrice) || finalPrice <= 0) return bad(res, 400, 'finalPrice must be a positive integer in the package currency.');
+  const finalPriceEgp = currency === 'EGP' ? finalPrice : Math.round(finalPrice * fx);
+  const providerId = String(req.body?.providerId || '');
+  const p = store.data.providers[providerId];
+  if (!p) return bad(res, 400, 'providerId must be an existing provider.');
+  const blocked = providerBlocked(p);
+  if (blocked) return bad(res, 409, blocked);
+  if (p.status !== 'verified') return bad(res, 409, 'The assigned provider must be verified first.');
+  if (p.interviewStatus !== 'passed') return bad(res, 409, 'The assigned provider must have passed the acceptance interview.');
+  const providerCategory = p.providerType === 'physio' ? 'physio' : 'nursing';
+  if (pkg.category !== providerCategory) return bad(res, 409, 'The assigned provider type does not match this package type.');
+  if (!providerMeetsPackageLevel(p, pkg.level)) return bad(res, 409, `The assigned provider does not meet the ${packageLevelName(pkg.level)} level for this package.`);
+  if (packageFamily(pkg) === 'tourist' && !touristCompatible(p)) return bad(res, 409, 'The assigned provider is not tourist-compatible (interview + in-app English test).');
+  const extraDaysOption = String(req.body?.extraDaysOption || 'none');
+  if (!['none', 'substitute', 'overtime'].includes(extraDaysOption)) return bad(res, 400, 'extraDaysOption must be none, substitute or overtime.');
+  let substituteProviderId = null;
+  if (extraDaysOption === 'substitute') {
+    substituteProviderId = String(req.body?.substituteProviderId || '');
+    const sub = store.data.providers[substituteProviderId];
+    if (!sub) return bad(res, 400, 'substituteProviderId is required when extraDaysOption is substitute.');
+    const subBlocked = providerBlocked(sub);
+    if (subBlocked) return bad(res, 409, subBlocked);
+    if (sub.status !== 'verified' || sub.interviewStatus !== 'passed') return bad(res, 409, 'The substitute provider must be verified and have passed the interview.');
+    if (substituteProviderId === providerId) return bad(res, 400, 'The substitute provider must be different from the main provider.');
+    if (!providerMeetsPackageLevel(sub, pkg.level)) return bad(res, 409, `The substitute provider does not meet the ${packageLevelName(pkg.level)} level for this package.`);
+    if (packageFamily(pkg) === 'tourist' && !touristCompatible(sub)) return bad(res, 409, 'The substitute provider is not tourist-compatible (interview + in-app English test).');
+  }
+  const waived = packageOvertimePremiumWaived();
+  const extraDailyRate = cat.packageExtraDailyRate(pkg, extraDaysOption, waived, currency);
+  const extraDaysPrice = extraDaysOption === 'none' ? 0 : extraDailyRate * cat.PACKAGE_OFF_DAYS;
+  const extraDaysPriceEgp = Math.round(extraDaysPrice * fx);
+  const total = finalPrice + extraDaysPrice;
+  const totalEgp = finalPriceEgp + extraDaysPriceEgp;
+  r.quote = {
+    packageType: pkg.code, level: pkg.level, currency,
+    finalPrice, finalPriceEgp,
+    extraDays: { option: extraDaysOption, days: extraDaysOption === 'none' ? 0 : cat.PACKAGE_OFF_DAYS, dailyRate: extraDaysOption === 'none' ? 0 : extraDailyRate, dailyRateEgp: extraDaysOption === 'none' ? 0 : Math.round(extraDailyRate * fx), price: extraDaysPrice, priceEgp: extraDaysPriceEgp, premiumWaived: extraDaysOption === 'overtime' ? waived : false },
+    total, totalEgp, providerId, substituteProviderId,
+    note: String(req.body?.quoteNote || '').slice(0, 500), quotedAt: nowIso(),
+  };
+  r.status = 'quoted';
+  r.quotedAt = nowIso();
+  store.audit('package.quoted', 'admin', { requestId: r.id, packageType: pkg.code, level: pkg.level, currency, finalPrice, totalEgp, providerId, extraDaysOption });
+  store.save();
+  res.json(publicPackageRequest(r));
+});
+
+// Patient accepts the quote: a package booking is created and the full
+// month is paid upfront into escrow. Cash = the provider collects the
+// month's cash at the first visit (cashCollectedByProvider set now, so
+// weekly day releases make the app share owed by the provider).
+// InstaPay + receipt photo = held until the admin approves the receipt.
+router.post('/package-requests/:id/accept', requireAuth, requireRole('patient'), (req, res) => {
+  if (rejectReservedId(req, res)) return;
+  const r = (store.data.packageRequests || []).find((x) => x.id === req.params.id);
+  if (!r) return res.status(404).json({ error: 'not_found', message: 'Package request not found.' });
+  if (r.patientPhone !== req.user.phone) return res.status(403).json({ error: 'forbidden', message: 'Not your package request.' });
+  if (r.status !== 'quoted' || !r.quote) return bad(res, 409, `Cannot accept a request in status ${r.status}.`);
+  if (!termsAccepted(req.body)) return termsError(res);
+  const paymentMethod = String(req.body?.paymentMethod || '');
+  if (!['cash_receipt', 'instapay'].includes(paymentMethod)) return bad(res, 400, 'paymentMethod must be cash_receipt or instapay.');
+  const parsed = receiptFromBody(req.body, paymentMethod);
+  if (parsed.error) return bad(res, 400, parsed.error);
+  const p = store.data.providers[r.quote.providerId];
+  if (!p) return bad(res, 409, 'The assigned provider no longer exists.');
+  const blocked = providerBlocked(p);
+  if (blocked) return bad(res, 409, blocked);
+  // The quote's final package (the admin may have raised the level) and
+  // its level gate are re-checked at accept — a tier change between
+  // quote and accept must not let an unqualified provider through.
+  const pkg = packageTypeOf(r.quote.packageType || r.packageType);
+  if (!pkg) return bad(res, 409, 'The quoted package no longer exists.');
+  if (!providerMeetsPackageLevel(p, pkg.level)) return bad(res, 409, `The assigned provider does not meet the ${packageLevelName(pkg.level)} level for this package.`);
+  if (packageFamily(pkg) === 'tourist' && !touristCompatible(p)) return bad(res, 409, 'The assigned provider is not tourist-compatible (interview + in-app English test).');
+  const pct = effectiveCommissionPct(p.tier);
+  const currency = r.quote.currency || r.currency || 'EGP';
+  const fx = packageFxRate(currency);
+  const total = r.quote.total;
+  const totalEgp = r.quote.totalEgp;
+  const startDate = r.startDate;
+  const endDate = new Date(new Date(startDate + 'T00:00:00Z').getTime() + (cat.PACKAGE_DAYS + cat.PACKAGE_OFF_DAYS - 1) * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const b = {
+    id: newId('bk'), kind: 'package', serviceCode: pkg.code, serviceName: pkg.name_en,
+    category: pkg.category, riskLevel: 'standard',
+    patientPhone: req.user.phone, patientName: r.patientName,
+    providerId: r.quote.providerId, substituteProviderId: r.quote.substituteProviderId || null,
+    packageRequestId: r.id, packageType: pkg.code, level: pkg.level,
+    currency, fxRate: currency === 'EGP' ? null : fx,
+    amountForeign: currency === 'EGP' ? null : total,
+    amountEgp: totalEgp, amountPayableEgp: totalEgp,
+    basePackageEgp: r.quote.finalPriceEgp, basePackage: r.quote.finalPrice,
+    extraDays: r.quote.extraDays,
+    dailyRateEgp: Math.max(1, Math.round(r.quote.finalPriceEgp / cat.PACKAGE_DAYS)),
+    dailyRate: Math.max(1, Math.round(r.quote.finalPrice / cat.PACKAGE_DAYS)),
+    startDate, endDate,
+    daysLog: [], daysCompleted: 0, extraDaysCompleted: 0, daysReleased: 0, packageDayReleases: [],
+    distanceKm: r.distanceKm, address: r.address,
+    paymentMethod, status: parsed.receipt ? 'held' : 'accepted',
+    commissionPct: pct, estimatedProviderShareEgp: Math.round(totalEgp * (1 - pct / 100)),
+    cashCollectedByProvider: paymentMethod === 'cash_receipt',
+    createdAt: nowIso(),
+    vitals: null, review: null, providerReview: null, complaint: false,
+    appShareEgp: null, providerShareEgp: null,
+  };
+  attachReceipt(b, parsed);
+  store.data.bookings[b.id] = b;
+  r.status = 'accepted';
+  r.bookingId = b.id;
+  r.decidedAt = nowIso();
+  store.audit('package.accepted', req.user.phone, { requestId: r.id, bookingId: b.id, packageType: pkg.code, level: pkg.level, currency, totalEgp, paymentMethod, receiptPending: !!parsed.receipt });
+  store.save();
+  res.status(201).json(pubBooking(req, b, { includePaymentNumber: true }));
+});
+
+router.post('/package-requests/:id/decline', requireAuth, requireRole('patient'), (req, res) => {
+  if (rejectReservedId(req, res)) return;
+  const r = (store.data.packageRequests || []).find((x) => x.id === req.params.id);
+  if (!r) return res.status(404).json({ error: 'not_found', message: 'Package request not found.' });
+  if (r.patientPhone !== req.user.phone) return res.status(403).json({ error: 'forbidden', message: 'Not your package request.' });
+  if (r.status !== 'quoted') return bad(res, 409, `Cannot decline a request in status ${r.status}.`);
+  r.status = 'declined';
+  r.decidedAt = nowIso();
+  store.audit('package.declined', req.user.phone, { requestId: r.id });
+  store.save();
+  res.json(publicPackageRequest(r));
+});
+
+// Admin toggles the launch offer: waive the +25% overtime premium on the
+// 4 extra days (owner decision 26 Nov 2026). Default OFF (env fallback).
+// `until` is optional; an expired setting stops applying on its own.
+router.post('/admin/package-offer', requireAdmin, (req, res) => {
+  const waived = req.body?.overtimePremiumWaived;
+  if (typeof waived !== 'boolean') return bad(res, 400, 'overtimePremiumWaived must be true or false.');
+  const until = req.body?.until ? String(req.body.until) : null;
+  if (until && Number.isNaN(new Date(until).getTime())) return bad(res, 400, 'until must be a valid date.');
+  store.data.packageOffer = { overtimePremiumWaived: waived, until: until || null, setAt: nowIso() };
+  store.audit('package.offer_set', 'admin', { overtimePremiumWaived: waived, until: until || null });
+  store.save();
+  res.json({ packageOffer: store.data.packageOffer });
+});
+
+// Provider logs one completed day of a package. Regular days: main
+// provider only, max 26, inside [startDate, endDate], never a future day,
+// one entry per date. Extra days: only when the quote chose an option —
+// 'substitute' days by the substitute provider, 'overtime' days by the
+// main provider, max 4. The day's share is released by the weekly sweep.
+router.post('/bookings/:id/package-day', requireAuth, requireRole('provider'), (req, res) => {
+  const b = loadBooking(req, res);
+  if (!b) return;
+  if (b.kind !== 'package') return bad(res, 400, 'This endpoint is for monthly package bookings only.');
+  if (!canSeeBooking(req, b)) return res.status(403).json({ error: 'forbidden', message: 'Not your package booking.' });
+  const blocked = providerBlocked(store.data.providers[req.user.providerId]);
+  if (blocked) return res.status(403).json({ error: 'forbidden', message: blocked });
+  if (b.status !== 'accepted') return bad(res, 409, `Cannot log days while status is ${b.status}.`);
+  const date = String(req.body?.date || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(new Date(date + 'T00:00:00Z').getTime())) return bad(res, 400, 'date must be a valid YYYY-MM-DD date.');
+  const type = String(req.body?.type || 'regular');
+  if (!['regular', 'extra'].includes(type)) return bad(res, 400, 'type must be regular or extra.');
+  const startMs = new Date(b.startDate + 'T00:00:00Z').getTime();
+  const endMs = new Date(b.endDate + 'T00:00:00Z').getTime();
+  const dayMs = new Date(date + 'T00:00:00Z').getTime();
+  if (dayMs < startMs || dayMs > endMs) return bad(res, 409, 'date is outside the package period.');
+  const todayMs = new Date(new Date().toISOString().slice(0, 10) + 'T00:00:00Z').getTime();
+  if (dayMs > todayMs) return bad(res, 409, 'Cannot log a future day.');
+  if ((b.daysLog || []).some((d) => d.date === date)) return bad(res, 409, 'This day is already logged.');
+  const isSubstitute = b.substituteProviderId && req.user.providerId === b.substituteProviderId;
+  if (type === 'regular') {
+    if (isSubstitute) return bad(res, 403, 'The substitute provider logs extra days only.');
+    if ((b.daysCompleted || 0) >= cat.PACKAGE_DAYS) return bad(res, 409, 'All 26 regular days are already logged.');
+  } else {
+    if (!b.extraDays || b.extraDays.option === 'none') return bad(res, 409, 'This package has no extra days.');
+    if ((b.extraDaysCompleted || 0) >= cat.PACKAGE_OFF_DAYS) return bad(res, 409, 'All 4 extra days are already logged.');
+    if (b.extraDays.option === 'substitute' && !isSubstitute) return bad(res, 403, 'Extra days on this package are covered by the substitute provider.');
+    if (b.extraDays.option === 'overtime' && isSubstitute) return bad(res, 403, 'Overtime extra days are worked by the main provider.');
+  }
+  const rateEgp = type === 'regular'
+    // v2.1.3 — the 26th regular day absorbs the rounding remainder so the
+    // 26 days sum EXACTLY to the quoted base price (26 × round(12600/26)
+    // = 12610, not 12600 — the last day is 475, not 485).
+    ? ((b.daysCompleted || 0) + 1 >= cat.PACKAGE_DAYS ? (b.basePackageEgp || 0) - (cat.PACKAGE_DAYS - 1) * packageDailyRate(b) : packageDailyRate(b))
+    : b.extraDays.dailyRateEgp;
+  // v2.1.3 refinement — the same rate in the booking currency (for
+  // display; the ledger always uses rateEgp). The 26th regular day
+  // absorbs the foreign remainder too (base − 25 × daily rate).
+  const rate = type === 'regular'
+    ? ((b.daysCompleted || 0) + 1 >= cat.PACKAGE_DAYS ? (b.basePackage ?? b.basePackageEgp ?? 0) - (cat.PACKAGE_DAYS - 1) * (b.dailyRate ?? packageDailyRate(b)) : (b.dailyRate ?? packageDailyRate(b)))
+    : (b.extraDays.dailyRate ?? b.extraDays.dailyRateEgp);
+  const entry = { date, type, providerId: req.user.providerId, rateEgp, rate, currency: b.currency || 'EGP', loggedAt: nowIso(), released: false, releasedAt: null, weekKey: null };
+  b.daysLog.push(entry);
+  if (type === 'regular') b.daysCompleted = (b.daysCompleted || 0) + 1;
+  else b.extraDaysCompleted = (b.extraDaysCompleted || 0) + 1;
+  store.audit('package.day_logged', req.user.phone, { bookingId: b.id, date, type, rateEgp });
+  store.save();
+  res.json(pubBooking(req, b, { includePaymentNumber: true }));
+});
+
+// Main provider completes the package: all 26 regular days logged, OR
+// the 30-day period has ended. Unworked days (regular or extra) are
+// refunded to the patient — recorded as partialRefundEgp for the admin
+// to settle; they are never released to any provider.
+router.post('/bookings/:id/package-complete', requireAuth, requireRole('provider'), (req, res) => {
+  const b = loadBooking(req, res);
+  if (!b) return;
+  if (b.kind !== 'package') return bad(res, 400, 'This endpoint is for monthly package bookings only.');
+  if (b.providerId !== req.user.providerId) return res.status(403).json({ error: 'forbidden', message: 'Only the main provider completes the package.' });
+  const blocked = providerBlocked(store.data.providers[req.user.providerId]);
+  if (blocked) return res.status(403).json({ error: 'forbidden', message: blocked });
+  if (b.status !== 'accepted') return bad(res, 409, `Cannot complete while status is ${b.status}.`);
+  const endMs = new Date(b.endDate + 'T00:00:00Z').getTime() + 24 * 60 * 60 * 1000 - 1;
+  const allRegularDone = (b.daysCompleted || 0) >= cat.PACKAGE_DAYS;
+  if (!allRegularDone && Date.now() <= endMs) {
+    return bad(res, 409, `All ${cat.PACKAGE_DAYS} regular days must be logged before completing (logged: ${b.daysCompleted || 0}).`);
+  }
+  let partialRefundEgp = 0;
+  const unworkedRegular = cat.PACKAGE_DAYS - (b.daysCompleted || 0);
+  if (unworkedRegular > 0) partialRefundEgp += unworkedRegular * packageDailyRate(b);
+  if (b.extraDays && b.extraDays.option !== 'none') {
+    const unworkedExtra = cat.PACKAGE_OFF_DAYS - (b.extraDaysCompleted || 0);
+    if (unworkedExtra > 0) partialRefundEgp += unworkedExtra * b.extraDays.dailyRateEgp;
+  }
+  if (partialRefundEgp > 0) b.partialRefundEgp = (b.partialRefundEgp || 0) + partialRefundEgp;
+  b.status = 'provider_confirmed';
+  b.providerConfirmedAt = nowIso();
+  store.audit('package.completed', req.user.phone, { bookingId: b.id, daysCompleted: b.daysCompleted || 0, extraDaysCompleted: b.extraDaysCompleted || 0, partialRefundEgp });
+  store.save();
+  res.json({ ...pubBooking(req, b, { includePaymentNumber: true }), partialRefundEgp });
 });
 
 module.exports = { router, sweepAutoRelease };
@@ -2163,9 +2790,60 @@ router.post('/bookings/:id/complete-provider', requireAuth, requireRole('provide
 router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res) => {
   const p = store.data.providers[req.user.providerId];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
-  const mine = Object.values(store.data.bookings).filter((b) => b.providerId === p.id);
+  // v2.1.3 — a package's SUBSTITUTE provider also sees the package's
+  // money (their 4 extra days live on it).
+  const mine = Object.values(store.data.bookings).filter((b) => b.providerId === p.id || (b.kind === 'package' && b.substituteProviderId === p.id));
   const nowMs = Date.now();
-  const ledger = mine.map((b) => {
+  const ledger = [];
+  // v2.1.3 — package bookings: the money moves per completed day, not as
+  // one lump at release (a package's providerShareEgp is the aggregate of
+  // ALL day releases, which may span several weeks). So a package gets
+  // one ledger line per day-release (for THIS provider — the substitute's
+  // days belong to the substitute's wallet) plus one "remaining" line for
+  // the unreleased estimate (main provider only). Only the FINAL release's
+  // line is held by an open complaint, like a normal booking; weekly
+  // releases already settled are never held back (terms §12).
+  for (const b of mine) {
+    if (b.kind !== 'package') continue;
+    for (const rel of (b.packageDayReleases || [])) {
+      if (rel.providerId !== p.id) continue;
+      const holdOpen = b.complaintStatus === 'open' && rel.final;
+      const windowOpen = rel.final && b.complaintDeadline && nowMs < new Date(b.complaintDeadline).getTime() && b.complaintStatus !== 'rejected';
+      let direction, amountEgp;
+      if (holdOpen || windowOpen) {
+        direction = 'complaint_hold';
+        amountEgp = b.cashCollectedByProvider ? (rel.appShareEgp || 0) : (rel.providerShareEgp || 0);
+      } else if (b.cashCollectedByProvider) { direction = 'provider_owes_app'; amountEgp = rel.appShareEgp || 0; }
+      else { direction = 'app_owes_provider'; amountEgp = rel.providerShareEgp || 0; }
+      if (p.permanentBan && ['app_owes_provider', 'complaint_hold'].includes(direction)) { direction = 'forfeited'; amountEgp = 0; }
+      ledger.push({
+        bookingId: b.id, service: b.serviceName, status: b.status, kind: 'package-day',
+        days: rel.days, weekKey: rel.weekKey, finalRelease: !!rel.final,
+        totalEgp: b.amountEgp, appShareEgp: rel.appShareEgp, providerShareEgp: rel.providerShareEgp,
+        commissionPct: b.commissionPct, cashCollectedByProvider: b.cashCollectedByProvider,
+        direction, amountEgp, releasedAt: rel.releasedAt || null,
+        complaintStatus: b.complaintStatus || null, complaintDeadline: b.complaintDeadline || null,
+        settleableAt: rel.final ? (b.settleableAt || b.complaintDeadline || null) : null, refundEgp: b.refundEgp || null,
+      });
+    }
+    if (b.providerId === p.id && ['held', 'accepted', 'provider_confirmed', 'patient_confirmed', 'reviewed'].includes(b.status)) {
+      const releasedProv = (b.packageDayReleases || []).reduce((s, x) => s + (x.providerShareEgp || 0), 0);
+      const remaining = Math.max(0, (b.estimatedProviderShareEgp || 0) - releasedProv);
+      let direction = b.circumventionHold ? 'complaint_hold' : 'pending';
+      let amountEgp = remaining;
+      if (p.permanentBan && ['pending', 'complaint_hold'].includes(direction)) { direction = 'forfeited'; amountEgp = 0; }
+      ledger.push({
+        bookingId: b.id, service: b.serviceName, status: b.status, kind: 'package-remaining',
+        totalEgp: b.amountEgp, appShareEgp: b.appShareEgp, providerShareEgp: b.providerShareEgp,
+        estimatedProviderShareEgp: b.estimatedProviderShareEgp ?? null,
+        commissionPct: b.commissionPct, cashCollectedByProvider: b.cashCollectedByProvider,
+        direction, amountEgp, releasedAt: b.releasedAt || null,
+        complaintStatus: b.complaintStatus || null, complaintDeadline: b.complaintDeadline || null,
+        settleableAt: b.settleableAt || b.complaintDeadline || null, refundEgp: b.refundEgp || null,
+      });
+    }
+  }
+  ledger.push(...mine.filter((b) => b.kind !== 'package').map((b) => {
     // v2.0.1 two-stage settlement: a released booking is only finally
     // settleable after the 24h complaint window ends with no open
     // complaint, or after an open complaint is rejected by admin.
@@ -2209,7 +2887,7 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
       complaintStatus: b.complaintStatus || null, complaintDeadline: b.complaintDeadline || null,
       settleableAt: b.settleableAt || b.complaintDeadline || null, refundEgp: b.refundEgp || null,
     };
-  });
+  }));
   const totals = {
     appOwesProviderEgp: ledger.filter((l) => l.direction === 'app_owes_provider').reduce((s, l) => s + l.amountEgp, 0),
     providerOwesAppEgp: ledger.filter((l) => l.direction === 'provider_owes_app').reduce((s, l) => s + l.amountEgp, 0),
@@ -3060,6 +3738,19 @@ router.get('/admin/dashboard', requireAdmin, (req, res) => {
     // v2.1.2 — review queue + receipts awaiting review.
     pendingApplicationsCount: Object.values(store.data.providers).filter((p) => p.status === 'pending').length,
     pendingReceipts: Object.values(store.data.bookings).filter((b) => b.receipt && b.receipt.status === 'pending').map((b) => ({ id: b.id, status: b.status, serviceName: b.serviceName, amountEgp: b.amountEgp, createdAt: b.createdAt })),
+    // v2.1.3 — monthly package requests (admin queue) + package bookings
+    // + the launch-offer flag state. Requests carry the patient phone
+    // (admin-only endpoint — the admin needs it to contact the patient).
+    packageRequests: (store.data.packageRequests || []).slice().reverse(),
+    packageBookings: Object.values(store.data.bookings).filter((b) => b.kind === 'package').slice().reverse().map((b) => ({
+      id: b.id, packageType: b.packageType, level: b.level || null, currency: b.currency || 'EGP', status: b.status, total: b.amountEgp,
+      amountForeign: b.amountForeign || null, totalEgp: b.amountEgp,
+      startDate: b.startDate, endDate: b.endDate, daysCompleted: b.daysCompleted || 0,
+      extraDaysCompleted: b.extraDaysCompleted || 0, providerId: b.providerId,
+      substituteProviderId: b.substituteProviderId || null, createdAt: b.createdAt,
+    })),
+    packageOffer: store.data.packageOffer || null,
+    packageOvertimePremiumWaived: packageOvertimePremiumWaived(),
   });
 });
 
@@ -3401,11 +4092,21 @@ router.post('/admin/complaints/:reportId/resolve', requireAdmin, (req, res) => {
     b.complaintStatus = 'accepted_refund';
     b.complaintResolvedAt = nowIso();
     b.complaint = false;
-    b.refundEgp = refundAmount(b); // full refund of what the patient actually paid (after any voucher discount)
+    if (b.kind === 'package') {
+      // v2.1.3 — only the UNRELEASED remainder is refunded (terms §12):
+      // days already released weekly stay with the provider/app.
+      const releasedTotals = packageDayTotals(b);
+      b.refundEgp = packageRefundRemaining(b);
+      b.refundedShares = { appShareEgp: releasedTotals.appShareEgp, providerShareEgp: releasedTotals.providerShareEgp };
+      b.appShareEgp = releasedTotals.appShareEgp;
+      b.providerShareEgp = releasedTotals.providerShareEgp;
+    } else {
+      b.refundEgp = refundAmount(b); // full refund of what the patient actually paid (after any voucher discount)
+      b.refundedShares = { appShareEgp: b.appShareEgp || 0, providerShareEgp: b.providerShareEgp || 0 };
+      b.appShareEgp = 0;
+      b.providerShareEgp = 0;
+    }
     b.refundedAt = nowIso();
-    b.refundedShares = { appShareEgp: b.appShareEgp || 0, providerShareEgp: b.providerShareEgp || 0 };
-    b.appShareEgp = 0;
-    b.providerShareEgp = 0;
     b.status = 'refunded';
     store.audit('complaint.resolved_refund', 'admin', { bookingId: b.id, reportId: report.id, refundEgp: b.refundEgp });
   } else {
@@ -3416,10 +4117,11 @@ router.post('/admin/complaints/:reportId/resolve', requireAdmin, (req, res) => {
     store.audit('complaint.resolved_rejected', 'admin', { bookingId: b.id, reportId: report.id });
     // If the release was paused in 'reviewed' by this complaint, release now —
     // unless a circumvention hold is still open on the same booking (v2.0.8).
-    if (b.status === 'reviewed' && !b.circumventionHold) releaseBooking(b, 'reviewed');
-    else if (b.status === 'patient_confirmed' && !b.circumventionHold && b.patientConfirmedAt
+    if (b.status === 'reviewed' && !b.circumventionHold) {
+      if (b.kind === 'package') releasePackageBooking(b, 'reviewed'); else releaseBooking(b, 'reviewed');
+    } else if (b.status === 'patient_confirmed' && !b.circumventionHold && b.patientConfirmedAt
       && Date.now() - new Date(b.patientConfirmedAt).getTime() >= config.autoReleaseAfterMs) {
-      releaseBooking(b, 'auto');
+      if (b.kind === 'package') releasePackageBooking(b, 'auto'); else releaseBooking(b, 'auto');
     }
   }
   store.save();

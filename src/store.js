@@ -210,6 +210,9 @@ class Store {
     }
     if (!this.data.receiptImages) this.data.receiptImages = {};
     if (!this.data.languageTestSessions) this.data.languageTestSessions = {};
+    // v2.1.3 — monthly package requests + admin launch offer.
+    if (!Array.isArray(this.data.packageRequests)) this.data.packageRequests = [];
+    if (!('packageOffer' in this.data)) this.data.packageOffer = null;
     // v2.1.1 provider backfill: providerType = role, joinedAt = createdAt,
     // languageCertificates from legacy extraLanguages, empty courses.
     for (const p of Object.values(this.data.providers || {})) {
@@ -380,7 +383,11 @@ class Store {
     // for the visit) but NEVER the alternate contact, insurer or policy
     // number — those are admin-only. Patients see their own booking.
     if (viewer && viewer.role === 'provider' && b.providerId !== viewer.providerId && b.patientPhone !== viewer.phone) {
-      return this.radarBooking(b);
+      // v2.1.3 — a package's SUBSTITUTE provider is also assigned to it
+      // (their 4 extra days live on it), so they see the full booking.
+      if (!(b.kind === 'package' && b.substituteProviderId === viewer.providerId)) {
+        return this.radarBooking(b);
+      }
     }
     const out = { ...b, service: b.serviceCode, total: b.amountEgp, night: isNight(b.scheduledAt) };
     if (viewer && viewer.role === 'provider' && b.patientPhone !== viewer.phone) {
@@ -406,6 +413,13 @@ class Store {
       : null;
     out.canCancel = ['held', 'accepted'].includes(b.status)
       && !!out.cancelDeadline && now < new Date(out.cancelDeadline).getTime();
+    // v2.1.3 — packages do NOT use the 15-minute window (terms §12):
+    // cancel any time before the package completes; the deadline shown is
+    // the start date (full refund before it, remaining-days refund after).
+    if (b.kind === 'package') {
+      out.cancelDeadline = b.startDate ? new Date(b.startDate + 'T00:00:00Z').toISOString() : null;
+      out.canCancel = ['held', 'accepted'].includes(b.status);
+    }
     out.complaintDeadline = b.complaintDeadline || null;
     out.complaintStatus = b.complaintStatus || null;
     out.settleableAt = b.settleableAt || b.complaintDeadline || null;

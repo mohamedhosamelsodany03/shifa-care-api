@@ -198,7 +198,7 @@ const server = app.listen(PORT, async () => {
       }
     }
     r = await call('GET', '/api/terms');
-    check('terms v1.0 carries reversed rates 15/12/8, no 1,200 bonus', r.status === 200 && r.body.version === '1.0' && r.body.textAr.includes('Starter 15%') && r.body.textAr.includes('Elite 8%') && !r.body.textAr.includes('1,200'), JSON.stringify(r.body).slice(0, 200));
+    check('terms v1.0 carries reversed rates 15/12/8, no 1,200 bonus', r.status === 200 && r.body.version === '1.0' && r.body.textAr.includes('Starter 15%') && r.body.textAr.includes('Elite 8%') && !r.body.textAr.includes('1,200 جنيه'), JSON.stringify(r.body).slice(0, 200));
     r = await call('GET', '/api/bootstrap');
     check('bootstrap has promo field, inactive', r.status === 200 && r.body.promo && r.body.promo.active === false, JSON.stringify(r.body.promo));
     // Volume bonus v2.1.1 thresholds 15/30/60 (highest only).
@@ -237,6 +237,159 @@ const server = app.listen(PORT, async () => {
       distanceKm: 8, respectCharterAccepted: true, triage: { dangerSigns: [] },
     }, patToken);
     check('active voucher applies at booking (payable 300)', r.status === 201 && r.body.amountEgp === 350 && r.body.amountPayableEgp === 300 && r.body.voucherId === 'vou-active', JSON.stringify(r.body).slice(0, 200));
+
+    // 11. v2.1.3: monthly packages — full lifecycle with a fast-forwarded
+    // month (in-process store: the 26+4 days are logged by the test, then
+    // the real HTTP endpoints complete / confirm / review / release).
+    const pkgToday = new Date().toISOString().slice(0, 10);
+    const pkgDay = (i) => new Date(new Date(pkgToday + 'T00:00:00Z').getTime() + i * 86400000).toISOString().slice(0, 10);
+    r = await call('POST', '/api/package-requests', { ...TERMS,
+      patientName: 'Package Patient', packageType: 'package_technician_12',
+      condition: 'After hip surgery', conditionItems: ['post_surgery'],
+      diagnosis: 'Post hip replacement', treatment: 'Painkillers',
+      needs: ['mobility', 'wound_care'], startDate: pkgToday,
+      address: 'Quseir, Corniche St 12', distanceKm: 3, notes: '',
+    }, patTokenEarly);
+    check('integration package request -> 201', r.status === 201 && !!r.body.id, JSON.stringify(r.body).slice(0, 200));
+    const intPkr = r.body.id;
+    r = await call('POST', `/api/admin/package-requests/${intPkr}/quote`, { finalPriceEgp: 12600, providerId: 'prov_demo_starter', extraDaysOption: 'overtime' }, adminToken);
+    check('integration quote overtime -> total 15360', r.status === 200 && r.body.quote?.totalEgp === 15360, JSON.stringify(r.body.quote));
+    r = await call('POST', `/api/package-requests/${intPkr}/accept`, { ...TERMS, paymentMethod: 'cash_receipt' }, patTokenEarly);
+    check('integration accept cash -> 201, total 15360, commission locked from tier', r.status === 201 && typeof r.body.commissionPct === 'number' && r.body.amountEgp === 15360, JSON.stringify(r.body).slice(0, 300));
+    const intPkg = r.body.id;
+    // Expected shares, computed from the LOCKED commission (the demo
+    // provider's tier drifts by §11 — points auto-promotion — so the
+    // test never hardcodes 15%). Regular days: 25x485 + 475 remainder
+    // day; extra days: 4x690.
+    const pct1 = r.body.commissionPct;
+    const dayApp1 = (rate) => Math.round(rate * pct1 / 100);
+    const regApp1 = 25 * dayApp1(485) + dayApp1(475);
+    const regProv1 = 25 * (485 - dayApp1(485)) + (475 - dayApp1(475));
+    const expProv1 = regProv1 + 4 * (690 - dayApp1(690));
+    const expApp1 = regApp1 + 4 * dayApp1(690);
+    // Fast-forward: 26 regular days (25x485 + 475 remainder day) + 4
+    // overtime extra days (4x690), all unreleased — as if the month ran.
+    const intBk = store.data.bookings[intPkg];
+    for (let i = 0; i < 26; i++) {
+      intBk.daysLog.push({ date: pkgDay(i), type: 'regular', providerId: 'prov_demo_starter', rateEgp: i < 25 ? 485 : 475, loggedAt: seedNow, released: false, releasedAt: null, weekKey: null });
+    }
+    for (let i = 0; i < 4; i++) {
+      intBk.daysLog.push({ date: pkgDay(26 + i), type: 'extra', providerId: 'prov_demo_starter', rateEgp: 690, loggedAt: seedNow, released: false, releasedAt: null, weekKey: null });
+    }
+    intBk.daysCompleted = 26;
+    intBk.extraDaysCompleted = 4;
+    store.save();
+    r = await call('POST', `/api/bookings/${intPkg}/package-complete`, {}, provToken);
+    check('package-complete with 26+4 days -> provider_confirmed, no partial refund', r.status === 200 && r.body.status === 'provider_confirmed' && (r.body.partialRefundEgp || 0) === 0, JSON.stringify(r.body).slice(0, 300));
+    r = await call('POST', `/api/bookings/${intPkg}/confirm-patient`, {}, patTokenEarly);
+    check('patient confirms package -> patient_confirmed', r.status === 200 && r.body.status === 'patient_confirmed', JSON.stringify(r.body).slice(0, 200));
+    r = await call('POST', `/api/bookings/${intPkg}/review`, { rating: 5, comment: 'Excellent month of care.', circumventionReported: false }, patTokenEarly);
+    check('review releases the package -> released, shares match locked commission (exact)', r.status === 200 && r.body.status === 'released' && r.body.providerShareEgp === expProv1 && r.body.appShareEgp === expApp1, JSON.stringify({ status: r.body.status, providerShareEgp: r.body.providerShareEgp, appShareEgp: r.body.appShareEgp }));
+    r = await call('GET', '/api/providers/wallet', null, provToken);
+    const intLines = (r.body.ledger || []).filter((l) => l.bookingId === intPkg);
+    check('wallet: final package-day line (30 days) held for the 24h complaint window', intLines.some((l) => l.kind === 'package-day' && l.days === 30 && l.finalRelease === true && l.direction === 'complaint_hold' && l.amountEgp === expApp1), JSON.stringify(intLines));
+    // Sweep -> Thursday settlement record. NOTE: no settlement assertion
+    // here — generateSettlements SKIPS demo providers by design, and
+    // prov_demo_starter is a demo seed. The settlement inclusion of
+    // package days is asserted in the smoke test (§23g) on the non-demo
+    // substitute provider instead.
+    r = await call('POST', '/api/jobs/sweep', {}, adminToken);
+    check('sweep -> 200', r.status === 200, JSON.stringify(r.body).slice(0, 200));
+    // Complaint on package 1, rejected -> the held final line becomes settleable.
+    r = await call('POST', `/api/bookings/${intPkg}/safety-report`, { type: 'complaint', description: 'Checking the hold.' }, patTokenEarly);
+    check('complaint on released package -> 201', r.status === 201 && !!r.body.reportId, JSON.stringify(r.body).slice(0, 200));
+    r = await call('POST', `/api/admin/complaints/${r.body.reportId}/resolve`, { decision: 'rejected' }, adminToken);
+    check('complaint rejected -> complaintStatus rejected', r.status === 200 && r.body.booking?.complaintStatus === 'rejected', JSON.stringify(r.body).slice(0, 200));
+    r = await call('GET', '/api/providers/wallet', null, provToken);
+    const intLines2 = (r.body.ledger || []).filter((l) => l.bookingId === intPkg);
+    check('after rejection: final package-day line provider_owes_app (cash, settleable)', intLines2.some((l) => l.kind === 'package-day' && l.direction === 'provider_owes_app' && l.amountEgp === expApp1), JSON.stringify(intLines2));
+    // Complaint refund on a package with UNWORKED extra days: only the
+    // unreleased remainder is refunded (terms §12).
+    r = await call('POST', '/api/package-requests', { ...TERMS,
+      patientName: 'Package Patient 2', packageType: 'package_technician_12',
+      condition: 'Elderly care', conditionItems: ['elderly'],
+      diagnosis: 'Old age, needs care', treatment: '—',
+      needs: ['elderly_care'], startDate: pkgToday,
+      address: 'Quseir, Corniche St 12', distanceKm: 3, notes: '',
+    }, patTokenEarly);
+    const intPkr2 = r.body.id;
+    r = await call('POST', `/api/admin/package-requests/${intPkr2}/quote`, { finalPriceEgp: 12600, providerId: 'prov_demo_starter', extraDaysOption: 'overtime' }, adminToken);
+    r = await call('POST', `/api/package-requests/${intPkr2}/accept`, { ...TERMS, paymentMethod: 'cash_receipt' }, patTokenEarly);
+    const intPkg2 = r.body.id;
+    const pct2 = r.body.commissionPct;
+    const dayApp2 = (rate) => Math.round(rate * pct2 / 100);
+    const regApp2 = 25 * dayApp2(485) + dayApp2(475);
+    const regProv2 = 25 * (485 - dayApp2(485)) + (475 - dayApp2(475));
+    const expProv2 = regProv2 + 2 * (690 - dayApp2(690)); // same 26 regular days, only 2 extra days worked
+    const expApp2 = regApp2 + 2 * dayApp2(690);
+    const intBk2 = store.data.bookings[intPkg2];
+    for (let i = 0; i < 26; i++) {
+      intBk2.daysLog.push({ date: pkgDay(i), type: 'regular', providerId: 'prov_demo_starter', rateEgp: i < 25 ? 485 : 475, loggedAt: seedNow, released: false, releasedAt: null, weekKey: null });
+    }
+    for (let i = 0; i < 2; i++) {
+      intBk2.daysLog.push({ date: pkgDay(26 + i), type: 'extra', providerId: 'prov_demo_starter', rateEgp: 690, loggedAt: seedNow, released: false, releasedAt: null, weekKey: null });
+    }
+    intBk2.daysCompleted = 26;
+    intBk2.extraDaysCompleted = 2;
+    store.save();
+    r = await call('POST', `/api/bookings/${intPkg2}/package-complete`, {}, provToken);
+    check('package-complete with 2 unworked extra days -> partialRefund 1380', r.status === 200 && r.body.partialRefundEgp === 1380, JSON.stringify(r.body).slice(0, 200));
+    r = await call('POST', `/api/bookings/${intPkg2}/confirm-patient`, {}, patTokenEarly);
+    r = await call('POST', `/api/bookings/${intPkg2}/review`, { rating: 4, comment: 'Good.', circumventionReported: false }, patTokenEarly);
+    check('second package released: shares match locked commission (13980 released)', r.status === 200 && r.body.status === 'released' && r.body.providerShareEgp === expProv2 && r.body.appShareEgp === expApp2, JSON.stringify({ status: r.body.status, providerShareEgp: r.body.providerShareEgp, appShareEgp: r.body.appShareEgp }));
+    r = await call('POST', `/api/bookings/${intPkg2}/safety-report`, { type: 'complaint', description: 'Two extra days were paid but never worked.' }, patTokenEarly);
+    check('complaint filed on second package -> 201', r.status === 201 && !!r.body.reportId, JSON.stringify(r.body).slice(0, 200));
+    const intComplaint2 = r.body.reportId;
+    r = await call('POST', `/api/admin/complaints/${intComplaint2}/resolve`, { decision: 'accepted_refund' }, adminToken);
+    check('complaint accepted -> refund 1380 only (unreleased remainder), released shares stay', r.status === 200 && r.body.booking?.refundEgp === 1380 && r.body.booking?.providerShareEgp === expProv2 && r.body.booking?.appShareEgp === expApp2, JSON.stringify(r.body.booking)?.slice(0, 300));
+    // Tourist package full cycle (USD, technician 12h, no extra days).
+    // The demo starter passed the interview but never took the in-app
+    // English test, so it has no badge and is NOT tourist-compatible.
+    r = await call('POST', '/api/package-requests', { ...TERMS,
+      patientName: 'Tourist Patient', packageType: 'package_tourist_technician_12', currency: 'USD',
+      condition: 'Post-surgery recovery', conditionItems: ['post_surgery'],
+      diagnosis: 'Post hip replacement', treatment: 'Painkillers',
+      needs: ['mobility', 'wound_care'], startDate: pkgToday,
+      address: 'Movenpick Resort, El Quseir', distanceKm: 3, notes: '',
+    }, patTokenEarly);
+    check('integration tourist package request -> 201, USD, level technician', r.status === 201 && r.body.currency === 'USD' && r.body.level === 'technician', JSON.stringify(r.body).slice(0, 200));
+    const intPkrT = r.body.id;
+    r = await call('POST', `/api/admin/package-requests/${intPkrT}/quote`, { finalPrice: 800, providerId: 'prov_demo_starter', extraDaysOption: 'none' }, adminToken);
+    check('tourist quote without the English badge -> 409 tourist gate', r.status === 409 && JSON.stringify(r.body).includes('tourist-compatible'), JSON.stringify(r.body).slice(0, 200));
+    // Take the in-app English test (answers from the server catalog,
+    // test-only — the API never leaks them) and pass 8/8.
+    const { LANGUAGE_TESTS } = require('../src/catalog');
+    const ltSt = await call('POST', '/api/me/language-tests/en/start', null, provToken);
+    const ltAns = {};
+    for (const q of ltSt.body.questions || []) ltAns[q.id] = LANGUAGE_TESTS.en.find((x) => x.id === q.id)?.correct;
+    r = await call('POST', '/api/me/language-tests/en/submit', { attemptId: ltSt.body.attemptId, answers: ltAns }, provToken);
+    check('English test all-correct -> passed 8/8, badge earned', r.status === 200 && r.body.passed === true && r.body.score === 8, JSON.stringify(r.body).slice(0, 200));
+    r = await call('POST', `/api/admin/package-requests/${intPkrT}/quote`, { finalPrice: 800, providerId: 'prov_demo_starter', extraDaysOption: 'none' }, adminToken);
+    check('tourist quote after the badge -> 200, 800 USD = 38400 EGP', r.status === 200 && r.body.quote?.total === 800 && r.body.quote?.totalEgp === 38400 && r.body.quote?.currency === 'USD', JSON.stringify(r.body.quote));
+    r = await call('POST', `/api/package-requests/${intPkrT}/accept`, { ...TERMS, paymentMethod: 'cash_receipt' }, patTokenEarly);
+    check('accept tourist quote -> 201, USD, amountForeign 800, amountEgp 38400, dailyRate 31 / 1477', r.status === 201 && r.body.currency === 'USD' && r.body.amountForeign === 800 && r.body.amountEgp === 38400 && r.body.dailyRate === 31 && r.body.dailyRateEgp === 1477, JSON.stringify(r.body).slice(0, 300));
+    const intPkgT = r.body.id;
+    const pctT = r.body.commissionPct;
+    const dayAppT = (rate) => Math.round(rate * pctT / 100);
+    const expAppT = 25 * dayAppT(1477) + dayAppT(1475);
+    const expProvT = 25 * (1477 - dayAppT(1477)) + (1475 - dayAppT(1475));
+    // Fast-forward: 26 regular days (25x1477 + 1475 remainder day EGP;
+    // 25x31 + 25 remainder day USD), all unreleased.
+    const intBkT = store.data.bookings[intPkgT];
+    for (let i = 0; i < 26; i++) {
+      intBkT.daysLog.push({ date: pkgDay(i), type: 'regular', providerId: 'prov_demo_starter', rateEgp: i < 25 ? 1477 : 1475, rate: i < 25 ? 31 : 25, currency: 'USD', loggedAt: seedNow, released: false, releasedAt: null, weekKey: null });
+    }
+    intBkT.daysCompleted = 26;
+    intBkT.extraDaysCompleted = 0;
+    store.save();
+    r = await call('POST', `/api/bookings/${intPkgT}/package-complete`, {}, provToken);
+    check('tourist package-complete -> provider_confirmed, no partial refund', r.status === 200 && r.body.status === 'provider_confirmed' && (r.body.partialRefundEgp || 0) === 0, JSON.stringify(r.body).slice(0, 300));
+    r = await call('POST', `/api/bookings/${intPkgT}/confirm-patient`, {}, patTokenEarly);
+    r = await call('POST', `/api/bookings/${intPkgT}/review`, { rating: 5, comment: 'Great month.', circumventionReported: false }, patTokenEarly);
+    check('tourist package released: shares match locked commission (38400 EGP)', r.status === 200 && r.body.status === 'released' && r.body.providerShareEgp === expProvT && r.body.appShareEgp === expAppT, JSON.stringify({ status: r.body.status, providerShareEgp: r.body.providerShareEgp, appShareEgp: r.body.appShareEgp }));
+    r = await call('GET', '/api/providers/wallet', null, provToken);
+    const intLinesT = (r.body.ledger || []).filter((l) => l.bookingId === intPkgT);
+    check('wallet: tourist final package-day line (26 days) held for the 24h complaint window', intLinesT.some((l) => l.kind === 'package-day' && l.days === 26 && l.finalRelease === true && l.direction === 'complaint_hold' && l.amountEgp === expAppT), JSON.stringify(intLinesT));
   } catch (e) {
     fail++;
     results.push(`  FAIL exception: ${e && e.stack || e}`);

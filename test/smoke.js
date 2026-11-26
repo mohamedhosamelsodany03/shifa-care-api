@@ -615,7 +615,7 @@ async function main() {
     // Terms text carries the new commission line (version stays 1.0 — no
     // forced re-acceptance for a rates change).
     r = await req('GET', '/api/terms');
-    check('terms text has reversed rates 15/12/8, no Elite 1,200 bonus', r.status === 200 && r.json?.textAr?.includes('Starter 15%') && r.json?.textAr?.includes('Elite 8%') && !r.json?.textAr?.includes('1,200') && r.json?.version === '1.0', JSON.stringify(r.json)?.slice(0, 200));
+    check('terms text has reversed rates 15/12/8, no Elite 1,200 bonus', r.status === 200 && r.json?.textAr?.includes('Starter 15%') && r.json?.textAr?.includes('Elite 8%') && !r.json?.textAr?.includes('1,200 جنيه') && r.json?.version === '1.0', JSON.stringify(r.json)?.slice(0, 200));
     // Full visit cycle helper (create -> accept -> vitals -> complete ->
     // patient confirm -> review -> released).
     const completeVisit = async (patientTok, km) => {
@@ -817,8 +817,10 @@ async function main() {
     check('suture_removal 250 standard + requiresDoctorOrder', svc('suture_removal')?.price_egp === 250 && svc('suture_removal')?.riskLevel === 'standard' && svc('suture_removal')?.requiresDoctorOrder === true);
     check('standard new services priced', svc('blood_draw')?.price_egp === 200 && svc('injection')?.price_egp === 150 && svc('vitals_check')?.price_egp === 150 && svc('stoma_care')?.price_egp === 300);
     check('cvp_dressing 300 high-risk (owner-set 26 Nov)', svc('cvp_dressing')?.price_egp === 300 && svc('cvp_dressing')?.riskLevel === 'high' && svc('cvp_dressing')?.requiresDoctorOrder === true);
-    check('elderly shift mobile 400 / bedridden 500 (owner-set minimums)', svc('elderly_shift_mobile')?.price_egp === 400 && svc('elderly_shift_mobile')?.riskLevel === 'standard' && svc('elderly_shift_bedridden')?.price_egp === 500 && svc('elderly_shift_bedridden')?.riskLevel === 'standard');
-    check('generic 12h shift still 500 (untouched)', svc('shift12')?.price_egp === 500);
+    // v2.1.3 (owner-approved 26 Nov 2026): shift prices reviewed against
+    // Cairo — elderly floors raised to 600 / 700, 12h 500 → 700, 24h 850 → 1,200.
+    check('elderly shift mobile 600 / bedridden 700 (owner-set minimums, v2.1.3)', svc('elderly_shift_mobile')?.price_egp === 600 && svc('elderly_shift_mobile')?.riskLevel === 'standard' && svc('elderly_shift_bedridden')?.price_egp === 700 && svc('elderly_shift_bedridden')?.riskLevel === 'standard');
+    check('12h shift 700 / 24h shift 1,200 (v2.1.3)', svc('shift12')?.price_egp === 700 && svc('shift24')?.price_egp === 1200);
     check('bootstrap highRiskServices has 11 incl npwt + cannula_iv + cvp + iron', Array.isArray(r.json?.highRiskServices) && r.json.highRiskServices.length === 11 && r.json.highRiskServices.includes('npwt') && r.json.highRiskServices.includes('cannula_iv') && r.json.highRiskServices.includes('cvp_dressing') && r.json.highRiskServices.includes('iron_infusion'), JSON.stringify(r.json?.highRiskServices));
     check('bootstrap highRiskChecklist has 4 items', Array.isArray(r.json?.highRiskChecklist) && r.json.highRiskChecklist.length === 4 && r.json.highRiskChecklist.includes('sterileTechnique'), JSON.stringify(r.json?.highRiskChecklist));
     check('bootstrap otp/push/persistence flags (all off in test)', r.json?.otp?.smsConfigured === false && r.json?.otp?.whatsappConfigured === false && r.json?.push?.fcmConfigured === false && r.json?.persistence === 'file', JSON.stringify({ otp: r.json?.otp, push: r.json?.push, persistence: r.json?.persistence }));
@@ -1341,7 +1343,276 @@ async function main() {
     r = await req('GET', '/api/terms');
     check('terms v1.0 carries the intermediary clause (AR + EN)', r.status === 200 && r.json?.version === '1.0' && String(r.json?.textAr || '').includes('وسيط تقني يربط بينهما') && String(r.json?.textEn || '').includes('technical intermediary'), JSON.stringify({ version: r.json?.version }));
 
-    // --- 14. logout / refresh revocation ---------------------------------
+    // --- 23. v2.1.3 coverage: monthly packages + shift prices ----------
+    console.log('\n[v2.1.3 coverage]');
+    const TODAY = new Date().toISOString().slice(0, 10);
+    // 23a. bootstrap: 8 local packages (care-level ladder) + packageConfig.
+    r = await req('GET', '/api/bootstrap');
+    const pkgs = r.json?.packages || [];
+    const pkgByCode = (c) => pkgs.find((p) => p.code === c);
+    check('bootstrap carries 8 monthly packages (ladder) with exact owner prices', pkgs.length === 8 && pkgByCode('package_assistant_12')?.priceEgp === 8000 && pkgByCode('package_assistant_12')?.originalEgp === 9100 && pkgByCode('package_assistant_24')?.priceEgp === 13700 && pkgByCode('package_assistant_24')?.originalEgp === 15600 && pkgByCode('package_technician_12')?.priceEgp === 12600 && pkgByCode('package_technician_12')?.originalEgp === 14300 && pkgByCode('package_technician_24')?.priceEgp === 21700 && pkgByCode('package_technician_24')?.originalEgp === 24700 && pkgByCode('package_specialist_12')?.priceEgp === 17200 && pkgByCode('package_specialist_12')?.originalEgp === 19500 && pkgByCode('package_specialist_24')?.priceEgp === 28600 && pkgByCode('package_specialist_24')?.originalEgp === 32500 && pkgByCode('package_elderly_mobile')?.priceEgp === 8000 && pkgByCode('package_elderly_mobile')?.originalEgp === 9100 && pkgByCode('package_elderly_bedridden')?.priceEgp === 12600 && pkgByCode('package_elderly_bedridden')?.originalEgp === 14300, JSON.stringify(pkgs));
+    check('bootstrap packages carry levels (assistant/technician/specialist) + daily rates', pkgByCode('package_assistant_12')?.level === 'assistant' && pkgByCode('package_assistant_12')?.dailyRateEgp === 350 && pkgByCode('package_technician_12')?.level === 'technician' && pkgByCode('package_technician_12')?.dailyRateEgp === 550 && pkgByCode('package_specialist_24')?.level === 'specialist' && pkgByCode('package_specialist_24')?.dailyRateEgp === 1250 && pkgByCode('package_elderly_mobile')?.level === 'assistant' && pkgByCode('package_elderly_bedridden')?.level === 'technician', JSON.stringify(pkgs.map((p) => ({ code: p.code, level: p.level, daily: p.dailyRateEgp }))));
+    check('bootstrap has NO old package codes/prices (package12/16,000/28,000 deleted)', !pkgs.some((p) => p.code === 'package12' || p.code === 'package24') && !pkgs.some((p) => p.priceEgp === 16000 || p.priceEgp === 28000), JSON.stringify(pkgs.map((p) => p.code)));
+    check('bootstrap packageConfig: 26+4 days, +25% overtime, premium NOT waived by default', r.json?.packageConfig?.days === 26 && r.json?.packageConfig?.offDays === 4 && r.json?.packageConfig?.overtimePremiumPct === 25 && r.json?.packageConfig?.overtimePremiumWaived === false && Array.isArray(r.json?.packageConfig?.conditions) && r.json?.packageConfig?.conditions.length >= 9 && Array.isArray(r.json?.packageConfig?.needs) && r.json?.packageConfig?.needs.length >= 10, JSON.stringify(r.json?.packageConfig));
+    // 23b. request validation.
+    const pkgReq = async (body) => req('POST', '/api/package-requests', { token: patientToken2, body: { ...TERMS, patientName: 'Package Patient', packageType: 'package_technician_12', condition: 'After hip surgery, needs daily care', conditionItems: ['post_surgery'], diagnosis: 'Post hip replacement', treatment: 'Painkillers + antibiotics', needs: ['mobility', 'wound_care'], startDate: TODAY, address: 'Quseir, Corniche St 12', distanceKm: 3, notes: '', ...body } });
+    r = await pkgReq({ packageType: 'nope' });
+    check('package request unknown type -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await pkgReq({ condition: '' });
+    check('package request without condition -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await pkgReq({ startDate: '2020-01-05' });
+    check('package request past start date -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await pkgReq({ needs: ['teleport'] });
+    check('package request unknown need -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/package-requests', { token: patientToken2, body: { patientName: 'X', packageType: 'package_technician_12', condition: 'x', startDate: TODAY, address: 'Quseir' } });
+    check('package request without terms -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    // 23c. request A (overtime) -> quote -> accept (cash).
+    // NOTE: no new provider registrations here — the suite already hit
+    // the per-IP registration rate limit by §22. Reuse providers from
+    // §6: ethicsProv (registered, interview failed, NOT verified) for
+    // the unverified-quote check, manualProv (interview passed by admin)
+    // as the substitute (verified below, no new registration needed).
+    // The demo provider's tier drifts by §23 (points auto-promotion),
+    // so commission expectations are computed from the LOCKED commission
+    // the accept response itself reports — never hardcoded to 15%.
+    r = await pkgReq({});
+    check('package request A created -> 201 submitted', r.status === 201 && r.json?.status === 'submitted' && !!r.json?.id, JSON.stringify(r.json)?.slice(0, 300));
+    const pkrA = r.json?.id;
+    r = await req('GET', '/api/package-requests/mine', { token: patientToken2 });
+    check('my package requests lists A', r.status === 200 && (r.json?.requests || []).some((x) => x.id === pkrA), JSON.stringify((r.json?.requests || []).map((x) => x.id)));
+    r = await req('GET', '/api/admin/package-requests', { token: adminToken });
+    check('admin package-requests queue lists A', r.status === 200 && (r.json?.requests || []).some((x) => x.id === pkrA), JSON.stringify((r.json?.requests || []).map((x) => x.id)));
+    // Quote validation: unverified provider -> 409; bad price -> 400.
+    r = await req('POST', `/api/admin/package-requests/${pkrA}/quote`, { token: adminToken, body: { finalPriceEgp: 12600, providerId: ethicsProv.providerId } });
+    check('quote with unverified provider -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/package-requests/${pkrA}/quote`, { token: adminToken, body: { finalPriceEgp: -5, providerId: 'prov_demo_pro' } });
+    check('quote with bad price -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/package-requests/${pkrA}/quote`, { token: adminToken, body: { finalPriceEgp: 12600, providerId: 'prov_demo_pro', extraDaysOption: 'substitute' } });
+    check('quote substitute without substituteProviderId -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    // Quote A: verified demo provider, overtime extra days.
+    // Technician 12h: base 12,600; overtime 550 × 1.25 = 687.5 → 690
+    // (nearest 5) → 4 × 690 = 2,760 → total 15,360.
+    r = await req('POST', `/api/admin/package-requests/${pkrA}/quote`, { token: adminToken, body: { finalPriceEgp: 12600, providerId: 'prov_demo_pro', extraDaysOption: 'overtime', quoteNote: 'Standard case.' } });
+    check('quote A -> 200 quoted, total 12600 + 4x690 overtime = 15360', r.status === 200 && r.json?.status === 'quoted' && r.json?.quote?.finalPriceEgp === 12600 && r.json?.quote?.totalEgp === 15360 && r.json?.quote?.extraDays?.option === 'overtime' && r.json?.quote?.extraDays?.dailyRateEgp === 690 && r.json?.quote?.extraDays?.priceEgp === 2760 && r.json?.quote?.level === 'technician', JSON.stringify(r.json?.quote));
+    r = await req('POST', `/api/package-requests/${pkrA}/accept`, { token: patientToken2, body: { ...TERMS, paymentMethod: 'card' } });
+    check('accept with bad payment method -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/package-requests/${pkrA}/accept`, { token: patientToken2, body: { ...TERMS, paymentMethod: 'cash_receipt' } });
+    const pctA = r.json?.commissionPct;
+    const estA = Math.round(15360 * (1 - pctA / 100));
+    check('accept A cash -> 201 accepted package booking, commission locked, total 15360, est share matches', r.status === 201 && r.json?.kind === 'package' && r.json?.status === 'accepted' && r.json?.amountEgp === 15360 && typeof pctA === 'number' && r.json?.estimatedProviderShareEgp === estA && r.json?.canCancel === true && r.json?.daysCompleted === 0 && r.json?.level === 'technician', JSON.stringify(r.json)?.slice(0, 400));
+    const pkgA = r.json?.id;
+    // 23d. request B (substitute) — manualProv (interview passed by
+    // admin in §6) becomes the substitute via the admin verify endpoint.
+    r = await req('POST', `/api/admin/providers/${manualProv.providerId}/verify`, { token: adminToken, body: { role: 'nurse' } });
+    check('admin verifies manual-review provider (substitute) -> verified', r.status === 200 && r.json?.status === 'verified', JSON.stringify(r.json)?.slice(0, 200));
+    r = await pkgReq({ packageType: 'package_technician_24' });
+    check('package request B created -> 201', r.status === 201 && !!r.json?.id, JSON.stringify(r.json)?.slice(0, 200));
+    const pkrB = r.json?.id;
+    r = await req('POST', `/api/admin/package-requests/${pkrB}/quote`, { token: adminToken, body: { finalPriceEgp: 21700, providerId: 'prov_demo_pro', extraDaysOption: 'substitute', substituteProviderId: manualProv.providerId } });
+    check('quote B substitute -> total 21700 + 4x950 = 25500', r.status === 200 && r.json?.quote?.totalEgp === 25500 && r.json?.quote?.extraDays?.option === 'substitute' && r.json?.quote?.extraDays?.dailyRateEgp === 950 && r.json?.quote?.substituteProviderId === manualProv.providerId && r.json?.quote?.level === 'technician', JSON.stringify(r.json?.quote));
+    r = await req('POST', `/api/package-requests/${pkrB}/accept`, { token: patientToken2, body: { ...TERMS, paymentMethod: 'cash_receipt' } });
+    const pctB = r.json?.commissionPct;
+    const estB = Math.round(25500 * (1 - pctB / 100));
+    check('accept B cash -> 201, est share matches locked commission', r.status === 201 && r.json?.status === 'accepted' && r.json?.estimatedProviderShareEgp === estB, JSON.stringify(r.json)?.slice(0, 300));
+    const pkgB = r.json?.id;
+    // 23e. day logging rules (only TODAY is loggable — future days are rejected).
+    r = await req('POST', `/api/bookings/${pkgA}/package-day`, { token: provToken, body: { date: '2030-01-05', type: 'regular' } });
+    check('package day in the future -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${pkgA}/package-day`, { token: provToken, body: { date: TODAY, type: 'regular' } });
+    check('main logs regular day today -> 200, rate 485 (12600/26)', r.status === 200 && r.json?.daysCompleted === 1 && (r.json?.daysLog || [])[0]?.rateEgp === 485, JSON.stringify(r.json?.daysLog));
+    r = await req('POST', `/api/bookings/${pkgA}/package-day`, { token: provToken, body: { date: TODAY, type: 'regular' } });
+    check('same day twice -> 409 duplicate', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${pkgB}/package-day`, { token: provToken, body: { date: TODAY, type: 'extra' } });
+    check('main cannot log substitute extra days -> 403', r.status === 403, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${pkgB}/package-day`, { token: manualProv.token, body: { date: TODAY, type: 'regular' } });
+    check('substitute cannot log regular days -> 403', r.status === 403, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${pkgB}/package-day`, { token: manualProv.token, body: { date: TODAY, type: 'extra' } });
+    check('substitute logs extra day today -> 200, rate 950', r.status === 200 && r.json?.extraDaysCompleted === 1 && (r.json?.daysLog || [])[0]?.rateEgp === 950, JSON.stringify(r.json?.daysLog));
+    r = await req('POST', `/api/bookings/${pkgB}/package-day`, { token: provToken, body: { date: TODAY, type: 'regular' } });
+    check('main cannot log a day already logged (same date) -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    // 23f. monitor: pending request F + active packages A/B.
+    r = await pkgReq({ packageType: 'package_elderly_mobile' });
+    check('package request F created (stays submitted)', r.status === 201 && !!r.json?.id, JSON.stringify(r.json)?.slice(0, 200));
+    const pkrF = r.json?.id;
+    r = await req('GET', '/api/monitor/summary', { monitorToken: 'monitor-test-token' });
+    check('monitor pendingPackageRequests has F, no PII', r.status === 200 && (r.json?.pendingPackageRequests?.count || 0) >= 1 && (r.json?.pendingPackageRequests?.items || []).some((x) => x.id === pkrF && x.packageType === 'package_elderly_mobile') && !JSON.stringify(r.json?.pendingPackageRequests).includes('010'), JSON.stringify(r.json?.pendingPackageRequests));
+    check('monitor activePackages has A + B', r.status === 200 && (r.json?.activePackages?.count || 0) >= 2 && (r.json?.activePackages?.items || []).some((x) => x.id === pkgA) && (r.json?.activePackages?.items || []).some((x) => x.id === pkgB), JSON.stringify(r.json?.activePackages));
+    // 23g. weekly sweep releases the logged days; wallets show them.
+    r = await req('POST', '/api/jobs/sweep', { token: adminToken });
+    check('sweep runs -> 200, 2 package days released', r.status === 200 && r.json?.packageDaysReleased === 2, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('GET', '/api/providers/wallet', { token: provToken });
+    const pkgALines = (r.json?.ledger || []).filter((l) => l.bookingId === pkgA);
+    const appDayA = Math.round(485 * pctA / 100), provDayA = 485 - appDayA;
+    check('main wallet: package A day line provider_owes_app (cash, locked % of 485)', r.status === 200 && pkgALines.some((l) => l.kind === 'package-day' && l.direction === 'provider_owes_app' && l.amountEgp === appDayA && l.days === 1), JSON.stringify(pkgALines));
+    check('main wallet: package A remaining pending = est share - released provider share', pkgALines.some((l) => l.kind === 'package-remaining' && l.direction === 'pending' && l.amountEgp === estA - provDayA), JSON.stringify(pkgALines));
+    r = await req('GET', '/api/providers/wallet', { token: manualProv.token });
+    const pkgBLines = (r.json?.ledger || []).filter((l) => l.bookingId === pkgB);
+    const appDayB = Math.round(950 * pctB / 100);
+    check('sub wallet: package B extra day line provider_owes_app (cash, locked % of 950)', r.status === 200 && pkgBLines.some((l) => l.kind === 'package-day' && l.direction === 'provider_owes_app' && l.amountEgp === appDayB && l.days === 1), JSON.stringify(pkgBLines));
+    // Thursday settlement record includes the package day (manualProv is
+    // a REAL provider, not a demo seed — generateSettlements skips demos).
+    r = await req('GET', `/api/admin/settlements?providerId=${manualProv.providerId}`, { token: adminToken });
+    const stlB = (r.json?.settlements || [])[0];
+    check('settlement record for substitute: packageDays 1, package shares match locked %', !!stlB && stlB.totals.packageDays === 1 && stlB.totals.packageProviderShareEgp === 950 - appDayB && stlB.totals.packageAppShareEgp === appDayB, JSON.stringify(stlB?.totals));
+    // 23h. package-complete guard (days incomplete, period not ended).
+    r = await req('POST', `/api/bookings/${pkgA}/package-complete`, { token: provToken });
+    check('package-complete with 1/26 days -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    // 23i. cancel after start: refund = paid - worked days at logged rates.
+    r = await req('POST', `/api/bookings/${pkgA}/cancel`, { token: patientToken2 });
+    check('cancel A after start -> refund 15360 - 485 = 14875', r.status === 200 && r.json?.status === 'cancelled' && r.json?.refundEgp === 14875, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', `/api/bookings/${pkgB}/cancel`, { token: patientToken2 });
+    check('cancel B after start -> refund 25500 - 950 = 24550', r.status === 200 && r.json?.status === 'cancelled' && r.json?.refundEgp === 24550, JSON.stringify(r.json)?.slice(0, 300));
+    // 23j. package C (future start, instapay + receipt) -> held -> approved -> accepted -> full refund cancel.
+    r = await pkgReq({ packageType: 'package_elderly_mobile', startDate: '2030-01-05' });
+    check('package request C created (future start)', r.status === 201 && !!r.json?.id, JSON.stringify(r.json)?.slice(0, 200));
+    const pkrC = r.json?.id;
+    r = await req('POST', `/api/admin/package-requests/${pkrC}/quote`, { token: adminToken, body: { finalPriceEgp: 8000, providerId: 'prov_demo_pro', extraDaysOption: 'none' } });
+    check('quote C option none -> total 8000', r.status === 200 && r.json?.quote?.totalEgp === 8000 && r.json?.quote?.extraDays?.option === 'none', JSON.stringify(r.json?.quote));
+    r = await req('POST', `/api/package-requests/${pkrC}/accept`, { token: patientToken2, body: { ...TERMS, paymentMethod: 'instapay', receiptImage: RECEIPT_JPEG } });
+    check('accept C instapay+receipt -> 201 held', r.status === 201 && r.json?.status === 'held' && r.json?.receipt?.status === 'pending', JSON.stringify(r.json)?.slice(0, 300));
+    const pkgC = r.json?.id;
+    r = await req('POST', `/api/bookings/${pkgC}/package-day`, { token: provToken, body: { date: TODAY, type: 'regular' } });
+    check('held package cannot log days -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/bookings/${pkgC}/receipt/approve`, { token: adminToken, body: {} });
+    check('admin approves C receipt -> 200', r.status === 200 && r.json?.receipt?.status === 'approved', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', `/api/bookings/${pkgC}`, { token: patientToken2 });
+    check('receipt approval activates the held package -> accepted', r.status === 200 && r.json?.status === 'accepted', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${pkgC}/cancel`, { token: patientToken2 });
+    check('cancel C before start -> full refund 8000', r.status === 200 && r.json?.status === 'cancelled' && r.json?.refundEgp === 8000, JSON.stringify(r.json)?.slice(0, 300));
+    // 23k. decline flow.
+    r = await pkgReq({ packageType: 'package_elderly_bedridden' });
+    check('package request D created', r.status === 201 && !!r.json?.id, JSON.stringify(r.json)?.slice(0, 200));
+    const pkrD = r.json?.id;
+    r = await req('POST', `/api/admin/package-requests/${pkrD}/quote`, { token: adminToken, body: { finalPriceEgp: 12600, providerId: 'prov_demo_pro', extraDaysOption: 'none' } });
+    check('quote D -> quoted', r.status === 200 && r.json?.status === 'quoted', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/package-requests/${pkrD}/decline`, { token: patientToken2 });
+    check('patient declines D -> declined', r.status === 200 && r.json?.status === 'declined', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/package-requests/${pkrD}/accept`, { token: patientToken2, body: { ...TERMS, paymentMethod: 'cash_receipt' } });
+    check('accept a declined request -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    // 23l. launch offer: waive the overtime premium, quote F, un-waive.
+    r = await req('POST', '/api/admin/package-offer', { token: adminToken, body: { overtimePremiumWaived: true } });
+    check('admin sets package offer (premium waived) -> 200', r.status === 200 && r.json?.packageOffer?.overtimePremiumWaived === true, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', '/api/bootstrap');
+    check('bootstrap packageConfig shows premium waived', r.json?.packageConfig?.overtimePremiumWaived === true, JSON.stringify(r.json?.packageConfig));
+    r = await req('POST', `/api/admin/package-requests/${pkrF}/quote`, { token: adminToken, body: { finalPriceEgp: 8000, providerId: 'prov_demo_pro', extraDaysOption: 'overtime' } });
+    check('quote F with premium waived -> extra day 350 (not 440), total 9400', r.status === 200 && r.json?.quote?.extraDays?.dailyRateEgp === 350 && r.json?.quote?.extraDays?.premiumWaived === true && r.json?.quote?.totalEgp === 9400, JSON.stringify(r.json?.quote));
+    r = await req('POST', '/api/admin/package-offer', { token: adminToken, body: { overtimePremiumWaived: false } });
+    check('admin clears package offer -> 200', r.status === 200 && r.json?.packageOffer?.overtimePremiumWaived === false, JSON.stringify(r.json)?.slice(0, 200));
+    // 23m. terms §12 package clause (AR + EN), version stays 1.0.
+    r = await req('GET', '/api/terms');
+    check('terms v1.0 carries the monthly-packages clause (AR + EN) with the ladder + elderly treatment rule', r.status === 200 && r.json?.version === '1.0' && String(r.json?.textAr || '').includes('الباقات الشهرية') && String(r.json?.textAr || '').includes('26 يوم رعاية') && String(r.json?.textAr || '').includes('مساعد تمريض') && String(r.json?.textAr || '').includes('أخصائي تمريض') && String(r.json?.textAr || '').includes('8,000') && String(r.json?.textAr || '').includes('علاج المسن') && String(r.json?.textEn || '').includes('Monthly packages') && String(r.json?.textEn || '').includes('nursing assistant') && String(r.json?.textEn || '').includes('treatment/medications'), JSON.stringify({ version: r.json?.version }));
+    check('terms carry NO old package prices (16,000 / 28,000 deleted)', r.status === 200 && !String(r.json?.textAr || '').includes('16,000') && !String(r.json?.textAr || '').includes('28,000') && !String(r.json?.textEn || '').includes('16,000') && !String(r.json?.textEn || '').includes('28,000'), JSON.stringify({ version: r.json?.version }));
+    // 23n. admin dashboard carries package requests + bookings + offer.
+    r = await req('GET', '/api/admin/dashboard', { token: adminToken });
+    check('admin dashboard has packageRequests (A–F) + packageBookings (A–C) + packageOffer', r.status === 200 && Array.isArray(r.json?.packageRequests) && (r.json?.packageRequests || []).some((x) => x.id === pkrA) && Array.isArray(r.json?.packageBookings) && (r.json?.packageBookings || []).some((x) => x.id === pkgA) && 'packageOffer' in r.json, JSON.stringify({ requests: (r.json?.packageRequests || []).length, bookings: (r.json?.packageBookings || []).length }));
+
+    // --- 24. care-level ladder + tourist residence + elderly rule -------
+  console.log('\n[§24 ladder/tourist/elderly]');
+  // 24a. bootstrap: 8 local + 6 tourist packages, exact prices, levels, shiftHours.
+  r = await req('GET', '/api/bootstrap');
+  const bsPkgs = r.json?.packages || [];
+  const bsTPkgs = r.json?.touristPackages || [];
+  const pkg24ByCode = (list, code) => (list || []).find((p) => p.code === code);
+  check('bootstrap packages: 8 local, exact new ladder prices + levels + shiftHours', bsPkgs.length === 8
+    && pkg24ByCode(bsPkgs, 'package_assistant_12')?.priceEgp === 8000 && pkg24ByCode(bsPkgs, 'package_assistant_12')?.originalEgp === 9100 && pkg24ByCode(bsPkgs, 'package_assistant_12')?.dailyRateEgp === 350 && pkg24ByCode(bsPkgs, 'package_assistant_12')?.shiftHours === 12 && pkg24ByCode(bsPkgs, 'package_assistant_12')?.level === 'assistant'
+    && pkg24ByCode(bsPkgs, 'package_assistant_24')?.priceEgp === 13700 && pkg24ByCode(bsPkgs, 'package_assistant_24')?.dailyRateEgp === 600
+    && pkg24ByCode(bsPkgs, 'package_technician_12')?.priceEgp === 12600 && pkg24ByCode(bsPkgs, 'package_technician_12')?.dailyRateEgp === 550
+    && pkg24ByCode(bsPkgs, 'package_technician_24')?.priceEgp === 21700 && pkg24ByCode(bsPkgs, 'package_technician_24')?.dailyRateEgp === 950
+    && pkg24ByCode(bsPkgs, 'package_specialist_12')?.priceEgp === 17200 && pkg24ByCode(bsPkgs, 'package_specialist_12')?.dailyRateEgp === 750
+    && pkg24ByCode(bsPkgs, 'package_specialist_24')?.priceEgp === 28600 && pkg24ByCode(bsPkgs, 'package_specialist_24')?.dailyRateEgp === 1250 && pkg24ByCode(bsPkgs, 'package_specialist_24')?.shiftHours === 24
+    && pkg24ByCode(bsPkgs, 'package_elderly_mobile')?.priceEgp === 8000 && pkg24ByCode(bsPkgs, 'package_elderly_mobile')?.level === 'assistant'
+    && pkg24ByCode(bsPkgs, 'package_elderly_bedridden')?.priceEgp === 12600 && pkg24ByCode(bsPkgs, 'package_elderly_bedridden')?.level === 'technician', JSON.stringify(bsPkgs.map((p) => `${p.code}:${p.priceEgp}/${p.originalEgp}/${p.level}`)));
+  check('bootstrap touristPackages: 6, exact USD/EUR prices + levels', bsTPkgs.length === 6
+    && pkg24ByCode(bsTPkgs, 'package_tourist_assistant_12')?.priceUsd === 575 && pkg24ByCode(bsTPkgs, 'package_tourist_assistant_12')?.priceEur === 530 && pkg24ByCode(bsTPkgs, 'package_tourist_assistant_12')?.dailyRateUsd === 25
+    && pkg24ByCode(bsTPkgs, 'package_tourist_assistant_24')?.priceUsd === 1030 && pkg24ByCode(bsTPkgs, 'package_tourist_assistant_24')?.priceEur === 950 && pkg24ByCode(bsTPkgs, 'package_tourist_assistant_24')?.dailyRateUsd === 45
+    && pkg24ByCode(bsTPkgs, 'package_tourist_technician_12')?.priceUsd === 800 && pkg24ByCode(bsTPkgs, 'package_tourist_technician_12')?.priceEur === 735 && pkg24ByCode(bsTPkgs, 'package_tourist_technician_12')?.dailyRateUsd === 35
+    && pkg24ByCode(bsTPkgs, 'package_tourist_technician_24')?.priceUsd === 1375 && pkg24ByCode(bsTPkgs, 'package_tourist_technician_24')?.priceEur === 1265 && pkg24ByCode(bsTPkgs, 'package_tourist_technician_24')?.dailyRateUsd === 60
+    && pkg24ByCode(bsTPkgs, 'package_tourist_specialist_12')?.priceUsd === 1030 && pkg24ByCode(bsTPkgs, 'package_tourist_specialist_12')?.priceEur === 950
+    && pkg24ByCode(bsTPkgs, 'package_tourist_specialist_24')?.priceUsd === 1720 && pkg24ByCode(bsTPkgs, 'package_tourist_specialist_24')?.priceEur === 1580 && pkg24ByCode(bsTPkgs, 'package_tourist_specialist_24')?.dailyRateUsd === 75, JSON.stringify(bsTPkgs.map((p) => `${p.code}:${p.priceUsd}/${p.priceEur}`)));
+  check('bootstrap packageConfig lists the 3 levels', Array.isArray(r.json?.packageConfig?.levels) && r.json.packageConfig.levels.join(',') === 'assistant,technician,specialist', JSON.stringify(r.json?.packageConfig));
+  check('bootstrap has NO old package prices anywhere', !JSON.stringify(r.json).includes('16000') && !JSON.stringify(r.json).includes('28000'), JSON.stringify(bsPkgs.map((p) => p.priceEgp)));
+  // 24b. request validation: level / currency / elderly treatment.
+  r = await pkgReq({ packageType: 'package_assistant_12', level: 'technician' });
+  check('request level mismatch -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+  r = await pkgReq({ packageType: 'package_assistant_12', level: 'nurse' });
+  check('request unknown level -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+  r = await pkgReq({ packageType: 'package_technician_12', currency: 'USD' });
+  check('request local package with USD -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+  r = await pkgReq({ packageType: 'package_tourist_technician_12', currency: 'EGP' });
+  check('request tourist package with EGP -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+  r = await pkgReq({ packageType: 'package_tourist_technician_12' });
+  check('request tourist package without currency -> 201, defaults USD, level technician', r.status === 201 && r.json?.currency === 'USD' && r.json?.level === 'technician', JSON.stringify(r.json)?.slice(0, 200));
+  const pkrT0 = r.json?.id;
+  r = await pkgReq({ packageType: 'package_elderly_mobile', treatment: '' });
+  check('elderly request without treatment -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+  r = await pkgReq({ packageType: 'package_elderly_mobile' });
+  check('elderly request with treatment -> 201, level assistant', r.status === 201 && r.json?.level === 'assistant', JSON.stringify(r.json)?.slice(0, 200));
+  const pkrE = r.json?.id;
+  // 24c. level gates in the quote.
+  r = await pkgReq({ packageType: 'package_assistant_12' });
+  const pkrAsst = r.json?.id;
+  r = await req('POST', `/api/admin/package-requests/${pkrAsst}/quote`, { token: adminToken, body: { finalPriceEgp: 8000, providerId: asstProviderId, extraDaysOption: 'none' } });
+  check('quote assistant package with the assistant -> 200, level assistant', r.status === 200 && r.json?.quote?.level === 'assistant' && r.json?.quote?.totalEgp === 8000, JSON.stringify(r.json?.quote));
+  r = await pkgReq({ packageType: 'package_technician_12' });
+  const pkrTech = r.json?.id;
+  r = await req('POST', `/api/admin/package-requests/${pkrTech}/quote`, { token: adminToken, body: { finalPriceEgp: 12600, providerId: asstProviderId, extraDaysOption: 'none' } });
+  check('quote technician package with the assistant -> 409 level gate', r.status === 409 && JSON.stringify(r.json).includes('nursing technician'), JSON.stringify(r.json)?.slice(0, 200));
+  r = await req('POST', `/api/admin/providers/${manualProv.providerId}/tier`, { token: adminToken, body: { tier: 'Starter' } });
+  check('manual provider set Starter for the specialist gate', r.status === 200 && r.json?.tier === 'Starter', JSON.stringify(r.json));
+  r = await pkgReq({ packageType: 'package_specialist_12' });
+  const pkrSpec = r.json?.id;
+  r = await req('POST', `/api/admin/package-requests/${pkrSpec}/quote`, { token: adminToken, body: { finalPriceEgp: 17200, providerId: manualProv.providerId, extraDaysOption: 'none' } });
+  check('quote specialist package with a Starter nurse -> 409 specialist gate', r.status === 409 && JSON.stringify(r.json).includes('nursing specialist'), JSON.stringify(r.json)?.slice(0, 200));
+  r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Pro' } });
+  check('main provider set Pro for the specialist quote', r.status === 200 && r.json?.tier === 'Pro', JSON.stringify(r.json));
+  r = await req('POST', `/api/admin/package-requests/${pkrSpec}/quote`, { token: adminToken, body: { finalPriceEgp: 17200, providerId: 'prov_demo_pro', extraDaysOption: 'none' } });
+  check('quote specialist package with a Pro nurse -> 200, level specialist', r.status === 200 && r.json?.quote?.level === 'specialist' && r.json?.quote?.totalEgp === 17200, JSON.stringify(r.json?.quote));
+  // 24d. admin raises the level in the quote (assistant -> technician).
+  r = await pkgReq({ packageType: 'package_assistant_12' });
+  const pkrRaise = r.json?.id;
+  r = await req('POST', `/api/admin/package-requests/${pkrRaise}/quote`, { token: adminToken, body: { packageType: 'package_technician_12', finalPriceEgp: 12600, providerId: 'prov_demo_pro', extraDaysOption: 'none' } });
+  check('admin raises assistant request to technician in the quote -> 200, level technician', r.status === 200 && r.json?.quote?.packageType === 'package_technician_12' && r.json?.quote?.level === 'technician' && r.json?.quote?.totalEgp === 12600, JSON.stringify(r.json?.quote));
+  r = await req('POST', `/api/package-requests/${pkrRaise}/accept`, { token: patientToken2, body: { ...TERMS, paymentMethod: 'cash_receipt' } });
+  check('accept raised quote -> booking level technician, dailyRateEgp 485', r.status === 201 && r.json?.level === 'technician' && r.json?.packageType === 'package_technician_12' && r.json?.dailyRateEgp === 485, JSON.stringify(r.json)?.slice(0, 300));
+  r = await pkgReq({ packageType: 'package_assistant_12' });
+  const pkrShift = r.json?.id;
+  r = await req('POST', `/api/admin/package-requests/${pkrShift}/quote`, { token: adminToken, body: { packageType: 'package_technician_24', finalPriceEgp: 21700, providerId: 'prov_demo_pro', extraDaysOption: 'none' } });
+  check('quote override to a 24h package for a 12h request -> 400 shift mismatch', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+  r = await req('POST', `/api/admin/package-requests/${pkrShift}/quote`, { token: adminToken, body: { packageType: 'package_tourist_technician_12', finalPriceEgp: 800, providerId: 'prov_demo_pro', extraDaysOption: 'none' } });
+  check('quote override to a tourist package for a local request -> 400 family mismatch', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+  r = await req('POST', `/api/admin/package-requests/${pkrE}/quote`, { token: adminToken, body: { packageType: 'package_technician_12', finalPriceEgp: 12600, providerId: 'prov_demo_pro', extraDaysOption: 'none' } });
+  check('elderly mobile request raised to technician in the quote -> 200', r.status === 200 && r.json?.quote?.level === 'technician' && r.json?.quote?.packageType === 'package_technician_12', JSON.stringify(r.json?.quote));
+  // 24e. tourist package full flow (USD, technician 12h, overtime).
+  r = await req('POST', `/api/admin/package-requests/${pkrT0}/quote`, { token: adminToken, body: { finalPrice: 800, providerId: 'prov_demo_pro', extraDaysOption: 'overtime' } });
+  check('tourist quote overtime -> 800 + 4x45 = 980 USD, 47040 EGP, extra 45/day', r.status === 200 && r.json?.quote?.total === 980 && r.json?.quote?.totalEgp === 47040 && r.json?.quote?.currency === 'USD' && r.json?.quote?.extraDays?.dailyRate === 45 && r.json?.quote?.extraDays?.dailyRateEgp === 2160, JSON.stringify(r.json?.quote));
+  r = await req('POST', `/api/package-requests/${pkrT0}/accept`, { token: patientToken2, body: { ...TERMS, paymentMethod: 'cash_receipt' } });
+  check('accept tourist quote -> booking USD, amountForeign 980, amountEgp 47040, dailyRate 31 / 1477', r.status === 201 && r.json?.currency === 'USD' && r.json?.amountForeign === 980 && r.json?.amountEgp === 47040 && r.json?.dailyRate === 31 && r.json?.dailyRateEgp === 1477, JSON.stringify(r.json)?.slice(0, 300));
+  const pkgT = r.json?.id;
+  r = await req('POST', `/api/bookings/${pkgT}/package-day`, { token: provToken, body: { date: TODAY, type: 'regular' } });
+  check('tourist package regular day -> 200, rate 31 USD / 1477 EGP', r.status === 200 && r.json?.daysCompleted === 1 && (r.json?.daysLog || [])[0]?.rate === 31 && (r.json?.daysLog || [])[0]?.rateEgp === 1477, JSON.stringify(r.json?.daysLog));
+  // 24f. tourist gate: the assistant never took the in-app English test,
+  // so quoting a tourist package with them must fail the tourist gate
+  // (the level gate passes: assistant level accepts an assistant).
+  r = await pkgReq({ packageType: 'package_tourist_assistant_12' });
+  const pkrTAsst = r.json?.id;
+  r = await req('POST', `/api/admin/package-requests/${pkrTAsst}/quote`, { token: adminToken, body: { finalPrice: 575, providerId: asstProviderId, extraDaysOption: 'none' } });
+  check('quote tourist package with a provider without the English badge -> 409 tourist gate', r.status === 409 && JSON.stringify(r.json).includes('tourist-compatible'), JSON.stringify(r.json)?.slice(0, 200));
+  // 24g. per-level overtime (daily x 1.25, rounded to nearest 5) via quotes.
+  const overtimeCases = [
+    ['package_assistant_12', 8000, asstProviderId, 440],
+    ['package_assistant_24', 13700, 'prov_demo_pro', 750],
+    ['package_technician_24', 21700, 'prov_demo_pro', 1190],
+    ['package_specialist_12', 17200, 'prov_demo_pro', 940],
+    ['package_specialist_24', 28600, 'prov_demo_pro', 1565],
+  ];
+  for (const [code, price, provId, ot] of overtimeCases) {
+    r = await pkgReq({ packageType: code });
+    const qid = r.json?.id;
+    const q = await req('POST', `/api/admin/package-requests/${qid}/quote`, { token: adminToken, body: { finalPriceEgp: price, providerId: provId, extraDaysOption: 'overtime' } });
+    check(`overtime ${code} -> ${ot}/day, total ${price + 4 * ot}`, q.status === 200 && q.json?.quote?.extraDays?.dailyRateEgp === ot && q.json?.quote?.totalEgp === price + 4 * ot, JSON.stringify(q.json?.quote));
+  }
+
+  // --- 14. logout / refresh revocation ---------------------------------
     console.log('\n[logout]');
     r = await req('POST', '/api/auth/logout', { token: patientToken2, body: { refreshToken } });
     check('logout 200', r.status === 200, JSON.stringify(r.json));
