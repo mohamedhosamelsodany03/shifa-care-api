@@ -492,13 +492,13 @@ async function main() {
     r = await req('GET', '/api/terms');
     check('GET /api/terms -> v1.0 with Arabic text', r.status === 200 && r.json?.version === '1.0' && typeof r.json?.textAr === 'string' && r.json.textAr.includes('منع الالتفاف'), JSON.stringify(r.json)?.slice(0, 200));
     // A fresh user has not accepted -> mustAccept true; accept -> false.
-    const freshLogin = await req('POST', '/api/auth/login-phone', { body: { phone: '01077777777' } });
-    const freshToken = freshLogin.json?.accessToken;
-    r = await req('GET', '/api/me/terms', { token: freshToken });
+    const loLogin = await req('POST', '/api/auth/login-phone', { body: { phone: '01077777777' } });
+    const loToken = loLogin.json?.accessToken;
+    r = await req('GET', '/api/me/terms', { token: loToken });
     check('fresh user /me/terms -> mustAccept true', r.status === 200 && r.json?.mustAccept === true && r.json?.currentVersion === '1.0', JSON.stringify(r.json));
-    r = await req('POST', '/api/me/terms', { token: freshToken, body: { acceptedTerms: true, termsVersion: '1.0' } });
+    r = await req('POST', '/api/me/terms', { token: loToken, body: { acceptedTerms: true, termsVersion: '1.0' } });
     check('POST /me/terms accepts v1.0', r.status === 200 && r.json?.version === '1.0', JSON.stringify(r.json));
-    r = await req('GET', '/api/me/terms', { token: freshToken });
+    r = await req('GET', '/api/me/terms', { token: loToken });
     check('after accept /me/terms -> mustAccept false', r.status === 200 && r.json?.mustAccept === false, JSON.stringify(r.json));
     // Booking without terms -> 400; with a stale version -> 400.
     r = await req('POST', '/api/bookings', { token: patientToken2, body: {
@@ -817,10 +817,11 @@ async function main() {
     check('suture_removal 250 standard + requiresDoctorOrder', svc('suture_removal')?.price_egp === 250 && svc('suture_removal')?.riskLevel === 'standard' && svc('suture_removal')?.requiresDoctorOrder === true);
     check('standard new services priced', svc('blood_draw')?.price_egp === 200 && svc('injection')?.price_egp === 150 && svc('vitals_check')?.price_egp === 150 && svc('stoma_care')?.price_egp === 300);
     check('cvp_dressing 300 high-risk (owner-set 26 Nov)', svc('cvp_dressing')?.price_egp === 300 && svc('cvp_dressing')?.riskLevel === 'high' && svc('cvp_dressing')?.requiresDoctorOrder === true);
-    // v2.1.3 (owner-approved 26 Nov 2026): shift prices reviewed against
-    // Cairo — elderly floors raised to 600 / 700, 12h 500 → 700, 24h 850 → 1,200.
+    // v2.1.4 (owner-approved 26 Nov 2026, «سيبها: 500 / 850»): single-day
+    // shift prices go BACK to 12h 500 / 24h 850 (they were 700 / 1,200
+    // only in v2.1.3). The residence ladder and elderly floors are untouched.
     check('elderly shift mobile 600 / bedridden 700 (owner-set minimums, v2.1.3)', svc('elderly_shift_mobile')?.price_egp === 600 && svc('elderly_shift_mobile')?.riskLevel === 'standard' && svc('elderly_shift_bedridden')?.price_egp === 700 && svc('elderly_shift_bedridden')?.riskLevel === 'standard');
-    check('12h shift 700 / 24h shift 1,200 (v2.1.3)', svc('shift12')?.price_egp === 700 && svc('shift24')?.price_egp === 1200);
+    check('12h shift 500 / 24h shift 850 (v2.1.4 — back from 700 / 1,200)', svc('shift12')?.price_egp === 500 && svc('shift24')?.price_egp === 850);
     check('bootstrap highRiskServices has 11 incl npwt + cannula_iv + cvp + iron', Array.isArray(r.json?.highRiskServices) && r.json.highRiskServices.length === 11 && r.json.highRiskServices.includes('npwt') && r.json.highRiskServices.includes('cannula_iv') && r.json.highRiskServices.includes('cvp_dressing') && r.json.highRiskServices.includes('iron_infusion'), JSON.stringify(r.json?.highRiskServices));
     check('bootstrap highRiskChecklist has 4 items', Array.isArray(r.json?.highRiskChecklist) && r.json.highRiskChecklist.length === 4 && r.json.highRiskChecklist.includes('sterileTechnique'), JSON.stringify(r.json?.highRiskChecklist));
     check('bootstrap otp/push/persistence flags (all off in test)', r.json?.otp?.smsConfigured === false && r.json?.otp?.whatsappConfigured === false && r.json?.push?.fcmConfigured === false && r.json?.persistence === 'file', JSON.stringify({ otp: r.json?.otp, push: r.json?.push, persistence: r.json?.persistence }));
@@ -1611,6 +1612,114 @@ async function main() {
     const q = await req('POST', `/api/admin/package-requests/${qid}/quote`, { token: adminToken, body: { finalPriceEgp: price, providerId: provId, extraDaysOption: 'overtime' } });
     check(`overtime ${code} -> ${ot}/day, total ${price + 4 * ot}`, q.status === 200 && q.json?.quote?.extraDays?.dailyRateEgp === ot && q.json?.quote?.totalEgp === price + 4 * ot, JSON.stringify(q.json?.quote));
   }
+
+    // --- 25. v2.1.4: single-day shifts back to 500/850 + launch-month shift offer ---
+    console.log('\n[v2.1.4 shift prices 500/850 + launch-month offer]');
+    // The offer defaults OFF; the terms carry the offer clause (v1.0).
+    r = await req('GET', '/api/bootstrap');
+    check('bootstrap launchOffer defaults inactive', r.json?.launchOffer?.active === false, JSON.stringify(r.json?.launchOffer));
+    r = await req('GET', '/api/terms');
+    check('terms v1.0 has launch-offer clause + 500/850 shift prices, no 700 shift price', r.status === 200 && r.json?.version === '1.0' && r.json?.textAr?.includes('عرض شهر الإطلاق') && r.json?.textAr?.includes('12 ساعة 500') && !r.json?.textAr?.includes('12 ساعة 700') && r.json?.textEn?.includes('Launch-month offer'), JSON.stringify(r.json)?.slice(0, 200));
+    // Admin endpoint: auth + validation.
+    r = await req('POST', '/api/admin/launch-offer', { token: patientToken2, body: { active: true } });
+    check('launch-offer by non-admin -> 403', r.status === 403, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/launch-offer', { token: adminToken, body: { active: 'yes' } });
+    check('launch-offer active non-boolean -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/launch-offer', { token: adminToken, body: { active: true, until: new Date(Date.now() - 1000).toISOString() } });
+    check('launch-offer past until -> 400', r.status === 400, JSON.stringify(r.json));
+    // Reuse the §3b new-patient token (phone 01077777777): that patient
+    // has 0 completed visits, so the loyalty-voucher timing is
+    // deterministic — a voucher is issued after the 4th and 8th completed
+    // visits and auto-applies to the NEXT booking (50 EGP off the app
+    // share). A fresh login here would trip the IP login limiter (the
+    // suite already exercises it in §3b). The main provider's tier is
+    // set right before each cycle (§17a pattern — the review recomputes
+    // points and may re-derive it).
+    const offerToken = loToken;
+    const setTier = async (tier) => { const rr = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier } }); return rr.status === 200 && rr.json?.tier === tier; };
+    const completeShift = async (serviceCode, km) => {
+      const c = await req('POST', '/api/bookings', { token: offerToken, body: { ...TERMS,
+        patientName: 'Shift Patient', serviceCode, paymentMethod: 'cash_receipt',
+        distanceKm: km, respectCharterAccepted: true, triage: { dangerSigns: [] },
+      } });
+      if (c.status !== 201) return { ok: false, step: 'create', res: c };
+      const id = c.json.id;
+      const a = await req('POST', `/api/bookings/${id}/accept`, { token: provToken });
+      if (a.status !== 200) return { ok: false, step: 'accept', res: a };
+      const v = await req('POST', `/api/bookings/${id}/vitals`, { token: provToken, body: { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 } });
+      if (v.status !== 200) return { ok: false, step: 'vitals', res: v };
+      const cp = await req('POST', `/api/bookings/${id}/complete-provider`, { token: provToken });
+      if (cp.status !== 200) return { ok: false, step: 'complete-provider', res: cp };
+      const cf = await req('POST', `/api/bookings/${id}/confirm-patient`, { token: offerToken });
+      if (cf.status !== 200) return { ok: false, step: 'confirm-patient', res: cf };
+      const rv = await req('POST', `/api/bookings/${id}/review`, { token: offerToken, body: { rating: 5, comment: 'Good shift.' } });
+      if (rv.status !== 200 || rv.json?.status !== 'released') return { ok: false, step: 'review', res: rv };
+      return { ok: true, id, created: c.json, accepted: a.json, released: rv.json };
+    };
+    // Offer OFF: normal shares — Starter 12h provider 425, app 75.
+    check('main provider set to Starter (offer OFF baseline)', await setTier('Starter'));
+    const off12 = await completeShift('shift12', 2);
+    check('offer OFF: 12h shift cycle completes', off12.ok, JSON.stringify(off12.res?.json || off12)?.slice(0, 300));
+    check('offer OFF: 12h shift total 500, provider 425, app 75, no offer lock, no voucher yet', off12.ok && off12.created?.amountEgp === 500 && off12.released?.providerShareEgp === 425 && off12.released?.appShareEgp === 75 && (off12.released?.launchOffer == null) && (off12.released?.voucherDiscountEgp || 0) === 0, JSON.stringify(off12.released)?.slice(0, 300));
+    // Turn the offer ON (until tomorrow).
+    const offerUntil = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    r = await req('POST', '/api/admin/launch-offer', { token: adminToken, body: { active: true, until: offerUntil } });
+    check('admin sets launch offer ON -> 200 active', r.status === 200 && r.json?.launchOffer?.active === true, JSON.stringify(r.json));
+    r = await req('GET', '/api/bootstrap');
+    check('bootstrap shows launchOffer active', r.json?.launchOffer?.active === true, JSON.stringify(r.json?.launchOffer));
+    r = await req('GET', '/api/admin/dashboard', { token: adminToken });
+    check('admin dashboard shows launchOffer active', r.json?.launchOffer?.active === true, JSON.stringify(r.json?.launchOffer)?.slice(0, 200));
+    // Offer ON: Starter 12h — patient pays 500, provider 595 (on 700),
+    // app -95, top-up 200. Accept locks the reference + estimated share.
+    check('main provider set to Starter (offer ON 12h)', await setTier('Starter'));
+    const on12 = await completeShift('shift12', 2);
+    check('offer ON: 12h shift cycle completes', on12.ok, JSON.stringify(on12.res?.json || on12)?.slice(0, 300));
+    check('offer ON: 12h shift patient pays 500, provider 595, app -95, top-up 200', on12.ok && on12.created?.amountEgp === 500 && on12.released?.providerShareEgp === 595 && on12.released?.appShareEgp === -95 && on12.released?.launchOfferTopupEgp === 200 && on12.released?.launchOffer?.referenceEgp === 700, JSON.stringify(on12.released)?.slice(0, 300));
+    check('offer ON: accept locks launchOffer reference 700 + estimated share 595', on12.ok && on12.accepted?.launchOffer?.referenceEgp === 700 && on12.accepted?.estimatedProviderShareEgp === 595, JSON.stringify(on12.accepted)?.slice(0, 300));
+    // Offer ON: Starter 24h — patient pays 850, provider 1,020 (on 1,200),
+    // app -170, top-up 350.
+    check('main provider set to Starter (offer ON 24h)', await setTier('Starter'));
+    const on24 = await completeShift('shift24', 2);
+    check('offer ON: 24h shift cycle completes', on24.ok, JSON.stringify(on24.res?.json || on24)?.slice(0, 300));
+    check('offer ON: 24h shift patient pays 850, provider 1020, app -170, top-up 350', on24.ok && on24.created?.amountEgp === 850 && on24.released?.providerShareEgp === 1020 && on24.released?.appShareEgp === -170 && on24.released?.launchOfferTopupEgp === 350 && on24.released?.launchOffer?.referenceEgp === 1200, JSON.stringify(on24.released)?.slice(0, 300));
+    // Offer ON: Pro 12h — provider 616 (700 x 0.88), app -116.
+    check('main provider set to Pro (offer ON 12h)', await setTier('Pro'));
+    const onPro = await completeShift('shift12', 2);
+    check('offer ON: Pro 12h provider 616, app -116', onPro.ok && onPro.released?.providerShareEgp === 616 && onPro.released?.appShareEgp === -116 && onPro.released?.launchOffer?.referenceEgp === 700, JSON.stringify(onPro.released)?.slice(0, 300));
+    // Offer ON: Elite 12h — provider 644 (700 x 0.92); this is the
+    // patient's 5th completed visit, so the voucher earned after the 4th
+    // auto-applies: app share -144 - 50 = -194, discount recorded.
+    check('main provider set to Elite (offer ON 12h)', await setTier('Elite'));
+    const onElite = await completeShift('shift12', 2);
+    check('offer ON: Elite 12h provider 644, voucher composes (app -194, discount 50)', onElite.ok && onElite.released?.providerShareEgp === 644 && onElite.released?.appShareEgp === -194 && onElite.released?.voucherDiscountEgp === 50 && onElite.released?.launchOffer?.referenceEgp === 700, JSON.stringify(onElite.released)?.slice(0, 300));
+    // Offer ON: a NON-shift service is untouched (standard visit 250).
+    check('main provider set to Elite (offer ON standard visit)', await setTier('Elite'));
+    const onStd = await completeVisit(offerToken, 2);
+    check('offer ON: standard visit unaffected (250, provider 230 at Elite 8%, app 20, no offer lock)', onStd.ok && onStd.created?.amountEgp === 250 && onStd.released?.providerShareEgp === 230 && onStd.released?.appShareEgp === 20 && (onStd.released?.launchOffer == null), JSON.stringify(onStd.released)?.slice(0, 300));
+    // Offer ON: an elderly shift is untouched (mobile 600).
+    check('main provider set to Elite (offer ON elderly shift)', await setTier('Elite'));
+    const onEld = await completeShift('elderly_shift_mobile', 2);
+    check('offer ON: elderly shift unaffected (600, provider 552 at Elite 8%, app 48, no offer lock)', onEld.ok && onEld.created?.amountEgp === 600 && onEld.released?.providerShareEgp === 552 && onEld.released?.appShareEgp === 48 && (onEld.released?.launchOffer == null), JSON.stringify(onEld.released)?.slice(0, 300));
+    // Turn the offer OFF again: new shifts go back to normal shares.
+    r = await req('POST', '/api/admin/launch-offer', { token: adminToken, body: { active: false } });
+    check('admin clears launch offer -> inactive', r.status === 200 && r.json?.launchOffer?.active === false, JSON.stringify(r.json));
+    r = await req('GET', '/api/bootstrap');
+    check('bootstrap launchOffer inactive after clear', r.json?.launchOffer?.active === false, JSON.stringify(r.json?.launchOffer));
+    check('main provider restored to Starter after launch-offer checks', await setTier('Starter'));
+    const offAgain = await completeShift('shift12', 2);
+    check('offer OFF again: 12h shift provider 425, app 75', offAgain.ok && offAgain.released?.providerShareEgp === 425 && offAgain.released?.appShareEgp === 75 && (offAgain.released?.launchOffer == null), JSON.stringify(offAgain.released)?.slice(0, 300));
+    // Expired offer stops applying: set a 1.5-second offer, wait it out —
+    // bootstrap must show inactive and the next shift takes normal shares.
+    // (This is the patient's 9th completed visit, so the voucher earned
+    // after the 8th applies: app share 75 - 50 = 25.)
+    r = await req('POST', '/api/admin/launch-offer', { token: adminToken, body: { active: true, until: new Date(Date.now() + 1500).toISOString() } });
+    check('admin sets 1.5s launch offer -> 200 active', r.status === 200 && r.json?.launchOffer?.active === true, JSON.stringify(r.json));
+    await sleep(2000);
+    r = await req('GET', '/api/bootstrap');
+    check('expired launch offer stops applying (bootstrap inactive)', r.json?.launchOffer?.active === false, JSON.stringify(r.json?.launchOffer));
+    check('main provider set to Starter (after expiry)', await setTier('Starter'));
+    const afterExpiry = await completeShift('shift12', 2);
+    check('after expiry: 12h shift provider 425, app 25 (75 - voucher 50), no offer lock', afterExpiry.ok && afterExpiry.released?.providerShareEgp === 425 && afterExpiry.released?.appShareEgp === 25 && afterExpiry.released?.voucherDiscountEgp === 50 && (afterExpiry.released?.launchOffer == null), JSON.stringify(afterExpiry.released)?.slice(0, 300));
 
   // --- 14. logout / refresh revocation ---------------------------------
     console.log('\n[logout]');

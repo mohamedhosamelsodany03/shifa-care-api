@@ -369,6 +369,33 @@ function effectiveCommissionPct(tier) {
   return cat.TIERS[tier].commission_pct;
 }
 
+// ---------------------------------------------------------------- v2.1.4 — launch-month shift offer
+// (owner-approved 26 Nov 2026, «أيوه، اعتمدها كده»): while active,
+// single-day shift12/shift24 bookings are offered at 500 / 850 but the
+// provider is paid as if the price were 700 / 1,200
+// (cat.LAUNCH_OFFER_REFERENCE). The app funds the difference as a launch
+// cost. Default OFF — the admin enables it at launch
+// (POST /api/admin/launch-offer). An expired setting is inactive (the
+// sweep clears it), exactly like the promo-month override above.
+function activeLaunchOffer() {
+  const stored = store.data.launchOffer;
+  if (!stored || stored.active !== true) return null;
+  if (stored.until && new Date(stored.until).getTime() <= Date.now()) return null; // expired — the sweep clears it
+  return { active: true, until: stored.until || null, setAt: stored.setAt || null };
+}
+// Reference total for a launch-offer shift booking: the amount actually
+// paid, with the single-day base price replaced by its 700/1,200
+// reference. The distance fee (if any) is unchanged, so with no distance
+// fee the reference is exactly 700 / 1,200. Returns null for services
+// the offer never covers (everything except shift12/shift24).
+function launchOfferReferenceFor(booking) {
+  const refBase = cat.LAUNCH_OFFER_REFERENCE[booking.serviceCode];
+  if (refBase == null) return null;
+  const base = cat.SERVICES[booking.serviceCode]?.price_egp;
+  if (base == null) return null;
+  return booking.amountEgp + (refBase - base);
+}
+
 // Completed cases in a calendar month for one provider: bookings that
 // reached the released state (the same completion signal the Thursday
 // settlement uses). Refunded bookings drop out (status becomes 'refunded').
@@ -662,13 +689,32 @@ function recomputeRatingAvg(p) {
 function releaseBooking(b, mode) {
   const total = b.amountEgp;
   const pct = b.commissionPct ?? 0;
-  const grossAppShare = Math.round(total * (pct / 100));
-  // v2.0.9 — the app funds any loyalty-voucher discount in full: the
-  // provider's share is computed on the FULL pre-discount price; the
-  // discount comes out of the app's share (floored at 0 — any shortfall
-  // is the app's cost of the voucher).
-  b.appShareEgp = Math.max(0, grossAppShare - (b.voucherDiscountEgp || 0));
-  b.providerShareEgp = total - grossAppShare;
+  // v2.1.4 — launch-month shift offer (locked at accept time): the
+  // provider's share is computed on the REFERENCE total (700/1,200 base
+  // + distance fee), while the patient paid the offer price (500/850 +
+  // distance fee). The app share = amount actually paid − provider share,
+  // which goes NEGATIVE during the offer (e.g. Starter 12h: provider 595,
+  // app −95) — that negative share IS the launch cost the app funds, so
+  // it is NOT floored at 0 here (unlike the normal path below). A loyalty
+  // voucher still comes out of the app's share on top, as usual. The
+  // top-up (reference − paid) is recorded on the booking and audited as
+  // 'launch_offer.topup' for the ledger / admin view.
+  const offerRef = b.launchOffer && b.launchOffer.referenceEgp != null ? b.launchOffer.referenceEgp : null;
+  if (offerRef != null) {
+    const grossAppShare = Math.round(offerRef * (pct / 100));
+    b.providerShareEgp = offerRef - grossAppShare;
+    b.appShareEgp = total - b.providerShareEgp - (b.voucherDiscountEgp || 0);
+    b.launchOfferTopupEgp = offerRef - total;
+    store.audit('launch_offer.topup', b.providerId || 'system', { bookingId: b.id, serviceCode: b.serviceCode, referenceEgp: offerRef, amountEgp: total, commissionPct: pct, providerShareEgp: b.providerShareEgp, appShareEgp: b.appShareEgp, topupEgp: b.launchOfferTopupEgp, voucherDiscountEgp: b.voucherDiscountEgp || 0 });
+  } else {
+    const grossAppShare = Math.round(total * (pct / 100));
+    // v2.0.9 — the app funds any loyalty-voucher discount in full: the
+    // provider's share is computed on the FULL pre-discount price; the
+    // discount comes out of the app's share (floored at 0 — any shortfall
+    // is the app's cost of the voucher).
+    b.appShareEgp = Math.max(0, grossAppShare - (b.voucherDiscountEgp || 0));
+    b.providerShareEgp = total - grossAppShare;
+  }
   // v2.1.1 (audit #18): language bonus — if the tourist booking's
   // language matches a VERIFIED language certificate the provider holds,
   // add $15/€15 at the booking FX rate to the provider's share (the app
@@ -712,7 +758,7 @@ function releaseBooking(b, mode) {
       store.audit('bonus.earned', p.id, { bookingId: b.id, month: key, cases: vb.cases, bonusEgp: vb.bonusEgp, title: vb.title, paused: vb.paused });
     }
   }
-  store.audit('escrow.released', b.providerId || 'system', { bookingId: b.id, mode, totalEgp: total, appShareEgp: b.appShareEgp, providerShareEgp: b.providerShareEgp, voucherDiscountEgp: b.voucherDiscountEgp || 0 });
+  store.audit('escrow.released', b.providerId || 'system', { bookingId: b.id, mode, totalEgp: total, appShareEgp: b.appShareEgp, providerShareEgp: b.providerShareEgp, voucherDiscountEgp: b.voucherDiscountEgp || 0, launchOffer: offerRef != null, launchOfferTopupEgp: b.launchOfferTopupEgp || 0 });
   // Loyalty voucher: every 4th completed paid visit issues one.
   if (b.patientPhone) maybeIssueVouchers(b.patientPhone);
   store.save();
@@ -734,6 +780,13 @@ async function sweepAutoRelease() {
   if (store.data.promo && store.data.promo.until && new Date(store.data.promo.until).getTime() <= now) {
     store.data.promo = null;
     store.audit('promo.expired', 'system', {});
+    changed = true;
+  }
+  // v2.1.4 — an expired launch-month shift offer stops applying on its
+  // own (already-accepted bookings keep the lock they took at accept).
+  if (store.data.launchOffer && store.data.launchOffer.until && new Date(store.data.launchOffer.until).getTime() <= now) {
+    store.data.launchOffer = null;
+    store.audit('launch_offer.expired', 'system', {});
     changed = true;
   }
   for (const b of Object.values(store.data.bookings)) {
@@ -920,6 +973,10 @@ router.get('/bootstrap', (req, res) => {
     },
     // v2.0.9 — active promo-month override (commission %, no secrets).
     promo: (() => { const pr = activePromo(); return pr ? { active: true, commissionPct: pr.commissionPct, until: pr.until || null } : { active: false, commissionPct: null, until: null }; })(),
+    // v2.1.4 — launch-month shift offer (owner-approved 26 Nov 2026):
+    // single shifts at 500/850, provider paid on the 700/1,200
+    // reference. Default OFF until the admin enables it at launch.
+    launchOffer: (() => { const lo = activeLaunchOffer(); return lo ? { active: true, until: lo.until || null } : { active: false, until: null }; })(),
     note: 'Prices are fixed and announced in advance. No bargaining inside the app.',
   });
 });
@@ -2664,13 +2721,27 @@ router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, 
   b.commissionPct = promoNow ? promoNow.commissionPct : cat.TIERS[p.tier].commission_pct;
   b.promoCommissionPct = promoNow ? promoNow.commissionPct : null;
   b.commissionTier = p.tier;
+  // v2.1.4 — launch-month shift offer is locked at accept time, exactly
+  // like the commission: only single shift12/shift24 bookings accepted
+  // while the offer is active get the 700/1,200 reference. Packages,
+  // elderly shifts and every other service never get it. The reference
+  // total = amount paid with the base price swapped for its reference
+  // (distance fee unchanged). The ESTIMATED share uses the reference so
+  // the wallet shows the topped-up pending amount before release.
+  const offerNow = activeLaunchOffer();
+  const offerRef = offerNow ? launchOfferReferenceFor(b) : null;
+  if (offerRef != null) {
+    b.launchOffer = { active: true, referenceEgp: offerRef, referenceBaseEgp: cat.LAUNCH_OFFER_REFERENCE[b.serviceCode], topupEgp: offerRef - b.amountEgp, setAt: offerNow.setAt || null };
+  } else {
+    b.launchOffer = null;
+  }
   // v2.1.1 (audit M7): ESTIMATED provider share at accept time, so the
   // wallet shows a pending amount before release (release recomputes
   // exactly).
-  b.estimatedProviderShareEgp = Math.round(b.amountEgp * (1 - b.commissionPct / 100));
+  b.estimatedProviderShareEgp = Math.round((offerRef != null ? offerRef : b.amountEgp) * (1 - b.commissionPct / 100));
   b.status = 'accepted';
   b.acceptedAt = nowIso();
-  store.audit('booking.accepted', req.user.phone, { bookingId: b.id, providerId: p.id, commissionPct: b.commissionPct, promoApplied: !!promoNow });
+  store.audit('booking.accepted', req.user.phone, { bookingId: b.id, providerId: p.id, commissionPct: b.commissionPct, promoApplied: !!promoNow, launchOfferApplied: offerRef != null, launchOfferReferenceEgp: offerRef });
   store.save();
   // v2.1.0 — notify the patient (critical: booking accepted). Fire and
   // forget — the in-app record is written synchronously inside notifyUser;
@@ -3732,6 +3803,8 @@ router.get('/admin/dashboard', requireAdmin, (req, res) => {
   res.json({ providers, sosAlerts, lateVisits: overdue, bookings, auditLog, circumventionReports, circumventionFlags: circumventionFlags(),
     promo: promoNow ? { active: true, commissionPct: promoNow.commissionPct, until: promoNow.until || null, source: promoNow.source } : { active: false, commissionPct: null, until: null },
     promoMonthsUsed: store.data.promoMonths || {},
+    // v2.1.4 — launch-month shift offer state (default OFF until launch).
+    launchOffer: (() => { const lo = activeLaunchOffer(); return lo ? { active: true, until: lo.until || null, setAt: lo.setAt || null } : { active: false, until: null }; })(),
     doctors, doctorsCount: doctors.length,
     medicalFileInterestCount: (store.data.medicalFileInterest || {}).count || 0,
     settlementsCount: (store.data.settlements || []).length,
@@ -3980,6 +4053,36 @@ router.post('/admin/promo', requireAdmin, (req, res) => {
   store.audit('admin.promo_set', 'admin', { commissionPct: n, until, monthsCovered: covered });
   store.save();
   res.json({ ok: true, promo: { active: true, commissionPct: n, until, monthsCovered: covered } });
+});
+
+// ---------------------------------------------------------------- v2.1.4 — launch-month shift offer
+// (owner-approved 26 Nov 2026, «أيوه، اعتمدها كده»): while active, single
+// shift12/shift24 bookings are offered at 500 / 850 but the provider is
+// paid on the 700 / 1,200 reference — the app funds the difference.
+// Default OFF (no launch date is set yet — the owner enables it at
+// launch). Applies ONLY to shifts accepted while active; packages,
+// elderly shifts and all other services are unaffected. `until` is
+// optional; an expired offer stops applying on its own (sweep).
+router.post('/admin/launch-offer', requireAdmin, (req, res) => {
+  const active = req.body?.active;
+  if (typeof active !== 'boolean') return bad(res, 400, 'active must be true or false.');
+  if (active === false) {
+    const was = store.data.launchOffer;
+    store.data.launchOffer = null;
+    store.audit('admin.launch_offer_cleared', 'admin', { was: was ? { active: was.active, until: was.until || null } : null });
+    store.save();
+    return res.json({ ok: true, launchOffer: { active: false, until: null } });
+  }
+  let until = null;
+  if (req.body?.until != null) {
+    const t = new Date(req.body.until).getTime();
+    if (!Number.isFinite(t) || t <= Date.now()) return bad(res, 400, 'until must be a future ISO date.');
+    until = new Date(t).toISOString();
+  }
+  store.data.launchOffer = { active: true, until, setAt: nowIso(), setBy: 'admin' };
+  store.audit('admin.launch_offer_set', 'admin', { active: true, until });
+  store.save();
+  res.json({ ok: true, launchOffer: { active: true, until } });
 });
 
 // ---------------------------------------------------------------- v2.0.8 — graduated discipline (warn / suspend / unsuspend)

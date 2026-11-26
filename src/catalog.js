@@ -14,12 +14,19 @@ const SERVICES = {
   // only, safety checklist before completion. (Plain cannula stays
   // standard risk.)
   cannula_iv: { code: 'cannula_iv', category: 'nursing', name_en: 'Cannula + IV fluids', name_ar: 'كانيولا + محاليل', price_egp: 350, riskLevel: 'high' },
-  // v2.1.3 (26 Nov 2026, owner-approved): shift prices reviewed against
-  // Cairo (see CAIRO-SERVICES-INVENTORY-2026-11-26.md) — 12h 500 → 700,
-  // 24h 850 → 1,200. These are the normal prices the monthly packages
-  // are priced off (26 × 700 = 18,200; 26 × 1,200 = 31,200).
-  shift12: { code: 'shift12', category: 'nursing', name_en: '12-hour shift', name_ar: 'شيفت 12 ساعة', price_egp: 700 },
-  shift24: { code: 'shift24', category: 'nursing', name_en: '24-hour shift', name_ar: 'شيفت 24 ساعة', price_egp: 1200 },
+  // v2.1.4 (26 Nov 2026, owner decision — «سيبها: 500 / 850»): single-day
+  // shift prices go BACK to 12h 500 / 24h 850 (they were 700 / 1,200 only
+  // briefly in v2.1.3). The monthly-package ladder is priced off its OWN
+  // daily rates (assistant 350/600, technician 550/950, specialist
+  // 750/1,250) — NOT off these single-day prices.
+  shift12: { code: 'shift12', category: 'nursing', name_en: '12-hour shift', name_ar: 'شيفت 12 ساعة', price_egp: 500 },
+  shift24: { code: 'shift24', category: 'nursing', name_en: '24-hour shift', name_ar: 'شيفت 24 ساعة', price_egp: 850 },
+  // v2.1.4 — LAUNCH-MONTH SHIFT OFFER (owner-approved 26 Nov 2026):
+  // during the launch month, single shifts are offered at 500 / 850 but
+  // the provider is paid as if the price were 700 / 1,200 (the reference
+  // prices below). The app funds the difference as a launch cost.
+  // Reference prices are the PRE-OFFER single-day prices, NOT the
+  // package-ladder daily rates.
   postop: { code: 'postop', category: 'nursing', name_en: 'Post-operative care', name_ar: 'رعاية ما بعد العمليات', price_egp: 1400 },
   gp: { code: 'gp', category: 'nursing', name_en: 'GP home visit', name_ar: 'طبيب عام منزلي', price_egp: 500 },
   specialist: { code: 'specialist', category: 'nursing', name_en: 'Specialist home visit', name_ar: 'أخصائي منزلي', price_egp: 900 },
@@ -92,6 +99,19 @@ const SERVICES = {
   // 2026 and APPROVED the same day — they are live above (physio_*).
 };
 
+// v2.1.4 — LAUNCH-MONTH SHIFT OFFER (owner-approved 26 Nov 2026,
+// «أيوه، اعتمدها كده»): during the launch month, single-day shifts are
+// offered at 500 / 850 (the live SERVICES prices above), but the provider
+// is paid as if the price were the reference below (700 / 1,200). The app
+// funds the difference as a launch cost (see releaseBooking in routes.js:
+// provider share is computed on the reference total, app share = amount
+// actually paid − provider share, which goes NEGATIVE during the offer).
+// Applies ONLY to single shift12/shift24 bookings accepted while the
+// offer is active (locked at accept time) — packages, elderly shifts and
+// all other services are unaffected. Default OFF; enabled by the admin
+// at launch (POST /api/admin/launch-offer).
+const LAUNCH_OFFER_REFERENCE = { shift12: 700, shift24: 1200 };
+
 // --- v2.1.3 — monthly packages (owner-approved 26 Nov 2026) -------------
 // A package = 26 days of care + 4 nurse days off (the Egyptian working
 // month: 26 days + 4 days off). PRICES ARE INDICATIVE ("يبدأ من") — the
@@ -105,7 +125,7 @@ const SERVICES = {
 // 21,700 (بدل 24,700); specialist 12h 750 → 17,200 (بدل 19,500) / 24h
 // 1,250 → 28,600 (بدل 32,500); elderly mobile 350 → 8,000 (بدل 9,100),
 // bedridden 550 → 12,600 (بدل 14,300). Single-day (non-package) shifts
-// stay 12h 700 / 24h 1,200. Tourist residence (USD/EUR per day, 26-day
+// are 12h 500 / 24h 850 (v2.1.4 — back from 700 / 1,200 in v2.1.3).
 // package "starting from"): assistant $25/$45 → $575/$1,030 (€530/€950);
 // technician $35/$60 → $800/$1,375 (€735/€1,265); specialist $45/$75 →
 // $1,030/$1,720 (€950/€1,580).
@@ -132,8 +152,8 @@ const PACKAGE_OVERTIME_PREMIUM_PCT = 25;
 // procedures). Owner-set ladder prices (26 Nov 2026 — supersedes the
 // earlier ladder): affordable for Quseir — the lowest 12h residence
 // shift (assistant) is 350, rising gradually by level; package ≈ 12%
-// below 26 × daily. Single-day (non-package) shifts stay 12h 700 /
-// 24h 1,200. The "200 EGP below Cairo" rule was superseded in practice
+// below 26 × daily. Single-day (non-package) shifts are 12h 500 /
+// 24h 850 (v2.1.4 — back from 700 / 1,200 in v2.1.3). The "200 EGP below Cairo" rule was superseded in practice
 // by this cheaper ladder (the whole ladder sits below the Cairo average:
 // 12h 700–1,100, 24h 1,200–1,800).
 // Elderly packages are REALIGNED to the ladder (never more than the
@@ -508,7 +528,8 @@ const TERMS_AR = `الشروط والأحكام — شفاء كير (الإصد�
 12) الباقات الشهرية
 - الباقة الشهرية = 26 يوم رعاية + 4 أيام إجازة للممرض (شهر العمل المصري: 26 يومًا + 4 أيام).
 - الأسعار المعروضة للباقات «تبدأ من» وليست ثابتة: السعر النهائي بعرض سعر مكتوب من الإدارة بعد تقييم الحالة (ما يعاني منه المريض، التشخيص، العلاج، والاحتياجات). يقدّم العميل طلب باقة بتفاصيل الحالة، وتحدد الإدارة السعر النهائي، ويراه العميل ويقبل أو يرفض.
-- سلم مستويات الرعاية: **مساعد تمريض** (رعاية أساسية: استحمام/إطعام/حركة/مرافقة/علامات حيوية) 12 ساعة 350 جنيه/يوم ← باقة 8,000 (بدل 9,100)، و24 ساعة 600 ← 13,700 (بدل 15,600)؛ **فني تمريض** (تمريض عادي: غيارات/حقن/كانيولا/قساطر) 12 ساعة 550 ← 12,600 (بدل 14,300)، و24 ساعة 950 ← 21,700 (بدل 24,700)؛ **أخصائي تمريض** (متقدم/معقد: NPWT وإجراءات عالية الخطورة) 12 ساعة 750 ← 17,200 (بدل 19,500)، و24 ساعة 1,250 ← 28,600 (بدل 32,500)؛ باقات المسنين 12 ساعة: متحرك 8,000 (بدل 9,100) و قعيد 12,600 (بدل 14,300) — وهذه الأسعار «تبدأ من» فقط: سعر باقة المسنين النهائي يعتمد على **علاج المسن وأدويته وحالته الصحية** إضافة إلى حركته والمستوى الذي يحتاجه، وتحدده الإدارة في عرض السعر المكتوب بعد تقييم الحالة. لذلك يلتقط نموذج طلب باقة المسنين العلاج/الأدوية والحالة الصحية صراحةً (إلزامي) إلى جانب الحركة والاحتياجات. تحدد الإدارة في عرض السعر المستوى الذي تستدعيه الحالة فعلًا، ولا يعمل أي مستوى فوق مؤهله أبدًا. شيفت اليوم الواحد (خارج الباقة) يبقى 12 ساعة 700 و24 ساعة 1,200 — اليوم المنفرد أغلى من اليوم داخل شهر مضمون.
+- سلم مستويات الرعاية: **مساعد تمريض** (رعاية أساسية: استحمام/إطعام/حركة/مرافقة/علامات حيوية) 12 ساعة 350 جنيه/يوم ← باقة 8,000 (بدل 9,100)، و24 ساعة 600 ← 13,700 (بدل 15,600)؛ **فني تمريض** (تمريض عادي: غيارات/حقن/كانيولا/قساطر) 12 ساعة 550 ← 12,600 (بدل 14,300)، و24 ساعة 950 ← 21,700 (بدل 24,700)؛ **أخصائي تمريض** (متقدم/معقد: NPWT وإجراءات عالية الخطورة) 12 ساعة 750 ← 17,200 (بدل 19,500)، و24 ساعة 1,250 ← 28,600 (بدل 32,500)؛ باقات المسنين 12 ساعة: متحرك 8,000 (بدل 9,100) و قعيد 12,600 (بدل 14,300) — وهذه الأسعار «تبدأ من» فقط: سعر باقة المسنين النهائي يعتمد على **علاج المسن وأدويته وحالته الصحية** إضافة إلى حركته والمستوى الذي يحتاجه، وتحدده الإدارة في عرض السعر المكتوب بعد تقييم الحالة. لذلك يلتقط نموذج طلب باقة المسنين العلاج/الأدوية والحالة الصحية صراحةً (إلزامي) إلى جانب الحركة والاحتياجات. تحدد الإدارة في عرض السعر المستوى الذي تستدعيه الحالة فعلًا، ولا يعمل أي مستوى فوق مؤهله أبدًا. شيفت اليوم الواحد (خارج الباقة) يبقى 12 ساعة 500 و24 ساعة 850 — اليوم المنفرد أغلى من اليوم داخل شهر مضمون.
+- عرض شهر الإطلاق (لفترة محدودة يعلنها التطبيق مسبقًا): شيفت اليوم الواحد (12 ساعة / 24 ساعة) بسعر العرض 500 / 850 جنيهًا، ويحصل مقدم الخدمة على حصته كأن السعر المرجعي 700 (12 ساعة) / 1,200 (24 ساعة) بالجنيه المصري — والتطبيق يموّل الفرق كاملًا من حسابه كاستثمار إطلاق، فلا يتحمل الممرض أي خصم بسبب العرض. العرض على شيفتات اليوم الواحد فقط، ولا يشمل الباقات الشهرية أو أي خدمة أخرى.
 - باقات إقامة السياح (بالدولار/يورو في اليوم، وباقة 26 يومًا «تبدأ من»): مساعد $25/$45 ← $575/$1,030 (€530/€950)؛ فني $35/$60 ← $800/$1,375 (€735/€1,265)؛ أخصائي $45/$75 ← $1,030/$1,720 (€950/€1,580) — (12 ساعة/24 ساعة).
 - الأيام الأربعة الإضافية غير مشمولة افتراضيًا، ويضيفها العميل باختياره: ممرض بديل بالسعر اليومي العادي للمستوى، أو الممرض الأساسي إضافي بعلاوة 25% (تُعفى العلاوة في شهر عرض الإطلاق).
 - رسم المسافة مضمّن في سعر الباقة داخل مدينة القصير.
@@ -531,7 +552,7 @@ const TERMS_EN = `Terms & Conditions — Shifa Care (Version 1.0, 25 November 20
 9) Shifa Care is a technical intermediary only: the medical service contract is between the patient and the provider directly, and the app does not itself provide the medical service; the treating provider holds final clinical responsibility.
 10) Graduated penalties: recorded warning, temporary suspension (radar, acceptance and wallet closed), permanent ban with forfeiture of pending settlement for repeated or grave violations. You may appeal to admin within 7 days.
 11) Terms may change with in-app notice; continued use means acceptance, and you will be asked to confirm a new version before any new booking or registration.
-12) Monthly packages: a package = 26 days of care + 4 nurse days off (the Egyptian working month). Displayed package prices are indicative ("starting from") — the final price is a written admin quote after assessing the case (condition, diagnosis, treatment, needs); the patient submits a package request, admin sets the final price, and the patient accepts or declines. Care-level ladder: **nursing assistant** (basic care: bathing, feeding, movement, companionship, vitals) 12h 350 EGP/day → package 8,000 (instead of 9,100), 24h 600 → 13,700 (instead of 15,600); **nursing technician** (standard nursing: dressings, injections, cannula, catheters) 12h 550 → 12,600 (instead of 14,300), 24h 950 → 21,700 (instead of 24,700); **nursing specialist** (advanced/complex: NPWT and high-risk procedures) 12h 750 → 17,200 (instead of 19,500), 24h 1,250 → 28,600 (instead of 32,500); elderly 12h packages: mobile 8,000 (instead of 9,100), bedridden 12,600 (instead of 14,300) — these are "starting from" only: the final elderly package price depends on the **elderly person's treatment/medications and condition** in addition to mobility and the level needed, and the admin sets it in the written quote after assessing the case. The elderly package request form therefore captures treatment/medications and condition explicitly (required) alongside mobility and needs. The admin confirms the level the case actually needs in the quote, and no level ever works above its qualification. A single-day (non-package) shift stays 12h 700 / 24h 1,200 — a single day costs more than a day inside a guaranteed month. Tourist residence packages (per day in USD/EUR, 26-day package "starting from"): assistant $25/$45 → $575/$1,030 (€530/€950); technician $35/$60 → $800/$1,375 (€735/€1,265); specialist $45/$75 → $1,030/$1,720 (€950/€1,580) — (12h/24h). The 4 extra days are not included by default: a substitute nurse at the level's normal daily rate, or the main nurse as overtime at a +25% premium (premium waived in the launch-offer month). The distance fee is included inside El Quseir. Payment: the full month is paid upfront into escrow; the provider is paid weekly every Thursday for completed days only; completed days already settled are not refundable. Cancellation: before the package starts = full refund; after the start = refund of the remaining days at the package daily rate (package price ÷ 26); unworked extra days are refunded as well. The app commission on packages is the usual tier rate (Starter 15%, Pro 12%, Elite 8%) on the final package price.
+12) Monthly packages: a package = 26 days of care + 4 nurse days off (the Egyptian working month). Displayed package prices are indicative ("starting from") — the final price is a written admin quote after assessing the case (condition, diagnosis, treatment, needs); the patient submits a package request, admin sets the final price, and the patient accepts or declines. Care-level ladder: **nursing assistant** (basic care: bathing, feeding, movement, companionship, vitals) 12h 350 EGP/day → package 8,000 (instead of 9,100), 24h 600 → 13,700 (instead of 15,600); **nursing technician** (standard nursing: dressings, injections, cannula, catheters) 12h 550 → 12,600 (instead of 14,300), 24h 950 → 21,700 (instead of 24,700); **nursing specialist** (advanced/complex: NPWT and high-risk procedures) 12h 750 → 17,200 (instead of 19,500), 24h 1,250 → 28,600 (instead of 32,500); elderly 12h packages: mobile 8,000 (instead of 9,100), bedridden 12,600 (instead of 14,300) — these are "starting from" only: the final elderly package price depends on the **elderly person's treatment/medications and condition** in addition to mobility and the level needed, and the admin sets it in the written quote after assessing the case. The elderly package request form therefore captures treatment/medications and condition explicitly (required) alongside mobility and needs. The admin confirms the level the case actually needs in the quote, and no level ever works above its qualification. A single-day (non-package) shift stays 12h 500 / 24h 850 — a single day costs more than a day inside a guaranteed month. Launch-month offer (for a limited period announced in advance in the app): a single-day shift (12h / 24h) is offered at 500 / 850 EGP, and the provider still receives their share as if the price were 700 / 1,200 EGP — the app funds the full difference from its own account as a launch investment, so the provider loses nothing because of the offer. The offer covers single-day shifts only, not monthly packages or any other service. Tourist residence packages (per day in USD/EUR, 26-day package "starting from"): assistant $25/$45 → $575/$1,030 (€530/€950); technician $35/$60 → $800/$1,375 (€735/€1,265); specialist $45/$75 → $1,030/$1,720 (€950/€1,580) — (12h/24h). The 4 extra days are not included by default: a substitute nurse at the level's normal daily rate, or the main nurse as overtime at a +25% premium (premium waived in the launch-offer month). The distance fee is included inside El Quseir. Payment: the full month is paid upfront into escrow; the provider is paid weekly every Thursday for completed days only; completed days already settled are not refundable. Cancellation: before the package starts = full refund; after the start = refund of the remaining days at the package daily rate (package price ÷ 26); unworked extra days are refunded as well. The app commission on packages is the usual tier rate (Starter 15%, Pro 12%, Elite 8%) on the final package price.
 
 By using the app you confirm you have read, understood and fully accepted these Terms & Conditions.`;
 
@@ -1944,6 +1965,7 @@ module.exports = {
   DEFAULT_LANGUAGES, LANGUAGE_TESTS, LANGUAGE_TEST_QUESTIONS, LANGUAGE_TEST_PASS_MIN,
   LANGUAGE_TEST_MINUTES, LANGUAGE_TEST_RETAKE_DAYS, LANGUAGE_TEST_TOPICS,
   MONTHLY_PACKAGES, TOURIST_PACKAGES, PACKAGE_LEVELS, PACKAGE_DAYS, PACKAGE_OFF_DAYS, PACKAGE_OVERTIME_PREMIUM_PCT,
+  LAUNCH_OFFER_REFERENCE,
   packageExtraDaysPrice, packageExtraDailyRate, packageDailyRateIn, packagePriceIn, PACKAGE_CONDITIONS, PACKAGE_NEEDS,
   distanceFee, servicePriceEgp,
 };

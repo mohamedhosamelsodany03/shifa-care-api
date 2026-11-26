@@ -97,6 +97,12 @@ function seed() {
     vouchers: [], // {id, patientPhone, amountEgp, issuedAt, expiresAt, minBookingEgp, status, sourceBookingId, usedBookingId, usedAt}
     promo: null, // {commissionPct, until, setAt, setBy} — live admin override; null = tier rates
     promoMonths: {}, // 'YYYY-MM' -> true — promo months used (max 2 per calendar year)
+    // v2.1.4 — launch-month shift offer (owner-approved 26 Nov 2026):
+    // {active, until, setAt, setBy}; null = off. When active, single
+    // shift12/shift24 bookings pay the provider on the 700/1,200
+    // reference price while the patient pays 500/850 (see catalog.js
+    // LAUNCH_OFFER_REFERENCE + releaseBooking in routes.js).
+    launchOffer: null,
     // v2.1.0 — notifications (in-app center + FCM push + SMS fallback)
     // and the Quseir doctors directory (seeded EMPTY on purpose — the
     // admin adds real doctors with their consent; no fake doctors).
@@ -194,6 +200,7 @@ class Store {
     if (!this.data.vouchers) this.data.vouchers = [];
     if (!this.data.promoMonths) this.data.promoMonths = {};
     if (!('promo' in this.data)) this.data.promo = null;
+    if (!('launchOffer' in this.data)) this.data.launchOffer = null;
     if (!this.data.devices) this.data.devices = {};
     if (!this.data.notifications) this.data.notifications = {};
     if (!this.data.doctors) this.data.doctors = [];
