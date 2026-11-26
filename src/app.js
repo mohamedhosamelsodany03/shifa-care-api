@@ -6,6 +6,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const config = require('./config');
 const { router } = require('./routes');
+const { store } = require('./store');
 
 function createApp() {
   const app = express();
@@ -50,18 +51,29 @@ function createApp() {
 
   // Rate limits.
   const otpLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many OTP requests from this IP.' } });
+  // v2.1.0 — verify attempts are rate-limited per IP as well as per
+  // phone (the per-phone 5-attempt cap lives in /otp/verify itself).
+  const otpVerifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many OTP verification attempts from this IP.' } });
   const phoneLoginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many login attempts from this IP.' } });
   const pinLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many PIN attempts from this IP.' } });
   // BOOKING_LIMIT_MAX is test-only (smoke/integration raise it so one
   // run's many booking calls don't trip the limiter); production default 60.
   const bookingLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: Number(process.env.BOOKING_LIMIT_MAX) || 60, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many booking requests from this IP.' } });
   app.use('/api/otp/request', otpLimiter);
+  app.use('/api/otp/verify', otpVerifyLimiter);
   app.use('/api/auth/login-phone', phoneLoginLimiter);
   app.use('/api/admin/pin/verify', pinLimiter);
   app.use('/api/bookings', bookingLimiter);
   app.use('/api/tourist-bookings', bookingLimiter);
+  app.use('/api/npwt/bookings', bookingLimiter);
 
   app.get('/health', (req, res) => res.json({ ok: true, app: 'shifa-care', version: '1.0.0', city: 'El Quseir' }));
+  // v2.1.0 — Postgres mode loads the document asynchronously; no /api
+  // request may run before the store is ready (file mode resolves
+  // immediately). /health above stays ungated on purpose.
+  app.use('/api', async (req, res, next) => {
+    try { await store.ready; next(); } catch (e) { next(e); }
+  });
   app.use('/api', router);
 
   // 404 + error handler — never leak stack traces in production.

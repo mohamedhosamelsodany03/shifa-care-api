@@ -5,9 +5,10 @@
     "express": "^4.21.2",
     "express-rate-limit": "^7.4.1",
     "helmet": "^7.2.0",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.1"
   },
-  "description": "Shifa Care \u2014 home healthcare API (Phase 1 core, El Quseir only). Escrow bookings, OTP+JWT auth, provider MCQ interview, admin PIN, hotels, NPWT calculator.",
+  "description": "Shifa Care — home healthcare API (Phase 1 core, El Quseir only). Escrow bookings, OTP+JWT auth, provider MCQ interview, admin PIN, hotels, NPWT calculator.",
   "engines": {
     "node": ">=20"
   },
@@ -20,7 +21,8 @@
     "test": "node test/smoke.js",
     "test:otp": "node test/test-otp-meta.js",
     "test:integration": "node test/integration.js",
-    "test:all": "node test/smoke.js && node test/integration.js && node test/test-otp-meta.js"
+    "test:pgstore": "node test/test-pgstore.js",
+    "test:all": "node test/smoke.js && node test/integration.js && node test/test-otp-meta.js && node test/test-pgstore.js"
   },
   "type": "commonjs",
   "version": "2.0.1"

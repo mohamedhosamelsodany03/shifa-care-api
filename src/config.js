@@ -57,10 +57,47 @@ const config = {
     apiVersion: process.env.WHATSAPP_API_VERSION || 'v21.0',
   },
   sms: {
+    // Together SMS (Egypt) — HTTPS GET API, docs at
+    // https://sms.masrbokra.com/en/smspro-service-api.html
+    // Endpoint: https://togethersms.com/sendsms.php (new; legacy
+    // https://sms.masrbokra.com/sendsms.php until 30 Jun 2027).
+    // Auth is user + password (NOT an API key) + an approved Sender ID.
+    // Provider: 'together' | '' (unset = no real provider).
+    // STATUS (owner decision 26 Nov 2026): the owner will NOT pay the
+    // sender activation now (~2,451 EGP one-time incl. VAT), so this is
+    // CODE-READY but DISABLED until the env vars below are set in
+    // Railway. Until then OTP login runs on the mock provider in dev
+    // and phone-only login stays the fallback in production.
     provider: process.env.SMS_PROVIDER || '',
-    apiKey: process.env.SMS_API_KEY || '',
-    sender: process.env.SMS_SENDER || '',
+    apiKey: process.env.SMS_API_KEY || '', // legacy alias — NOT used by Together
+    user: process.env.TOGETHER_SMS_USER || '',
+    password: process.env.TOGETHER_SMS_PASSWORD || '',
+    sender: process.env.TOGETHER_SMS_SENDER || process.env.SMS_SENDER || '',
+    endpoint: process.env.TOGETHER_SMS_ENDPOINT || 'https://togethersms.com/sendsms.php',
   },
+  // Firebase Cloud Messaging (push notifications) — HTTP v1 API, no SDK.
+  // The service-account JSON is supplied ONLY as an env var in Railway
+  // (FIREBASE_SERVICE_ACCOUNT_JSON) or as its three parts below.
+  // NEVER commit the JSON or the private key. No Firebase project exists
+  // yet (parent agent creates it — it is free); until the env vars are
+  // set, push is disabled and notifications stay in-app only.
+  firebase: {
+    projectId: process.env.FIREBASE_PROJECT_ID || '',
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL || '',
+    // Private key with literal \n sequences (as pasted in Railway).
+    privateKey: process.env.FIREBASE_PRIVATE_KEY || '',
+    serviceAccountJson: process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '',
+  },
+  // Postgres persistence (v2.1.0) — DATABASE_URL is the toggle.
+  // Unset = the local data.json file store (current behaviour, dev
+  // fallback). Set = the whole app document lives in one Postgres row
+  // (table shifa_state) and survives redeploys. The Postgres SERVICE
+  // itself is created in Railway by the owner (see BUILD-STATUS.md);
+  // the code only reads the URL. Enabling it adds ~$5–7/mo of Railway
+  // usage (Hobby: bill = max($5, total usage); app + small Postgres
+  // ≈ $8.65/mo total) and burns trial credit faster — it is NOT
+  // enabled here; the owner enables it by adding DATABASE_URL.
+  databaseUrl: process.env.DATABASE_URL || '',
   sweepIntervalMs: envInt('SWEEP_INTERVAL_MS', 5 * 60 * 1000), // 5 min
   autoReleaseAfterMs: envInt('AUTO_RELEASE_MS', 60 * 60 * 1000), // 1 hour after patient confirmation
   // v2.0.1 — complaint window: 24h after service completion (patient
@@ -91,6 +128,23 @@ const config = {
   // value; bumping it forces every user to re-accept (see /api/me/terms).
   termsVersion: '1.0',
 };
+
+// --- derived availability flags (env-only, no secrets) -----------------
+// SMS (Together) is configured when provider='together' AND the account
+// user + password + approved sender are all set.
+config.smsConfigured = function () {
+  return config.sms.provider === 'together'
+    && !!config.sms.user && !!config.sms.password && !!config.sms.sender;
+};
+// FCM is configured when a project id + service-account credentials exist.
+config.fcmConfigured = function () {
+  if (config.firebase.serviceAccountJson) {
+    try { const j = JSON.parse(config.firebase.serviceAccountJson); return !!(j.project_id && j.client_email && j.private_key); } catch { return false; }
+  }
+  return !!(config.firebase.projectId && config.firebase.clientEmail && config.firebase.privateKey);
+};
+// Postgres is configured when DATABASE_URL is set.
+config.postgresConfigured = function () { return !!config.databaseUrl; };
 
 if (!process.env.JWT_SECRET && config.isProd) {
   throw new Error('JWT_SECRET must be set in production');

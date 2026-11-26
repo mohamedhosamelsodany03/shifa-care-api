@@ -61,6 +61,13 @@ function seed() {
     vouchers: [], // {id, patientPhone, amountEgp, issuedAt, expiresAt, minBookingEgp, status, sourceBookingId, usedBookingId, usedAt}
     promo: null, // {commissionPct, until, setAt, setBy} — live admin override; null = tier rates
     promoMonths: {}, // 'YYYY-MM' -> true — promo months used (max 2 per calendar year)
+    // v2.1.0 — notifications (in-app center + FCM push + SMS fallback)
+    // and the Quseir doctors directory (seeded EMPTY on purpose — the
+    // admin adds real doctors with their consent; no fake doctors).
+    devices: {}, // phone -> [{token, tokenHash, platform, updatedAt}] — FCM tokens; NEVER returned by any API
+    notifications: {}, // phone -> [{id, type, titleAr/titleEn, bodyAr/bodyEn, data, createdAt, validUntil, readAt, pushStatus, smsStatus, critical}]
+    doctors: [], // {id, name, specialty, phone, clinic, address, workingHours, notes, active, createdAt}
+    settlementNotifiedOn: null, // 'YYYY-MM-DD' (Africa/Cairo) of the last Thursday-settlement notification pass
     adminPin: {
       // No PIN configured => hash a random value so NO pin can ever match.
       // Admin login is disabled until ADMIN_PIN is set and the service restarts.
@@ -79,19 +86,67 @@ class Store {
   constructor(file) {
     this.file = file;
     this.data = null;
-    this.load();
+    // v2.1.0 — persistence backend. File mode loads SYNCHRONOUSLY here
+    // (unchanged behaviour: store.data is populated at require time).
+    // Postgres mode loads asynchronously; store.ready resolves when the
+    // document is loaded (server.js awaits it before listening, and
+    // app.js gates /api on it) — store.data is null until then.
+    this.backend = null; // PgBackend when DATABASE_URL is set, else null (file)
+    this.persistence = 'file';
+    this.postgresError = null;
+    if (config.postgresConfigured()) {
+      this.ready = this._initPostgres();
+    } else {
+      this.ready = Promise.resolve();
+      this.load();
+    }
+  }
+  async _initPostgres() {
+    try {
+      const { PgBackend } = require('./pgstore');
+      const backend = new PgBackend(config.databaseUrl, { dataFile: this.file });
+      const data = await backend.load();
+      this.backend = backend;
+      this.persistence = 'postgres';
+      if (data) {
+        this.data = data;
+        this.applyDefaults();
+        this.syncAdminPinFromEnv();
+      } else {
+        this.data = seed();
+        this.applyDefaults();
+        this.save();
+      }
+      console.log('[store] persistence=postgres (DATABASE_URL set).');
+    } catch (e) {
+      // Availability first: if Postgres cannot be reached, fall back to
+      // the file store and say so loudly — the API must stay up, and the
+      // failure is visible in logs + the admin persistence endpoint.
+      console.error('[store] Postgres init failed, falling back to file store:', e.message);
+      this.postgresError = e.message;
+      this.backend = null;
+      this.persistence = 'file';
+      this.load();
+    }
+  }
+  // Collections added after the first seed — default them on load so an
+  // older document (file or Postgres row) never breaks the new routes.
+  applyDefaults() {
+    if (!this.data.messages) this.data.messages = {};
+    if (!this.data.circumventionReports) this.data.circumventionReports = [];
+    if (!this.data.vouchers) this.data.vouchers = [];
+    if (!this.data.promoMonths) this.data.promoMonths = {};
+    if (!('promo' in this.data)) this.data.promo = null;
+    if (!this.data.devices) this.data.devices = {};
+    if (!this.data.notifications) this.data.notifications = {};
+    if (!this.data.doctors) this.data.doctors = [];
+    if (!('settlementNotifiedOn' in this.data)) this.data.settlementNotifiedOn = null;
   }
   load() {
     try {
       if (fs.existsSync(this.file)) {
         this.data = JSON.parse(fs.readFileSync(this.file, 'utf8'));
-        // v2.0.8: collections added after the first seed — default them
-        // on load so an older data.json never breaks the new routes.
-        if (!this.data.messages) this.data.messages = {};
-        if (!this.data.circumventionReports) this.data.circumventionReports = [];
-        if (!this.data.vouchers) this.data.vouchers = [];
-        if (!this.data.promoMonths) this.data.promoMonths = {};
-        if (!('promo' in this.data)) this.data.promo = null;
+        this.applyDefaults();
         this.syncAdminPinFromEnv();
         return;
       }
@@ -119,8 +174,18 @@ class Store {
       console.log('[store] admin PIN synced from ADMIN_PIN env var.');
     }
   }
-  // Atomic: write to temp file in same dir, then rename over the real file.
+  // Save the current in-memory document.
+  // File mode: atomic write (temp file + rename), synchronous as before.
+  // Postgres mode: serialised async upsert of the whole document — the
+  // backend captures the CURRENT data at execution time, so a burst of
+  // saves can never persist out of order. Failures are logged by the
+  // backend and never throw here (the in-memory data stays authoritative
+  // for this process).
   save() {
+    if (this.backend) {
+      this.backend.save(() => this.data);
+      return;
+    }
     const dir = path.dirname(this.file);
     fs.mkdirSync(dir, { recursive: true });
     const tmp = `${this.file}.tmp-${process.pid}`;
@@ -204,6 +269,17 @@ class Store {
       delete out.alternateContact;
       delete out.insurer;
       delete out.policyNo;
+    }
+    // v2.1.0 — doctor referrals: the doctor's phone is visible to the
+    // ASSIGNED provider and admin only — never to the patient
+    // (anti-leakage: patients never see doctors' numbers, same rule as
+    // provider numbers). The referral itself (name/specialty/time) stays.
+    if (Array.isArray(out.referrals) && viewer && viewer.role === 'patient') {
+      out.referrals = out.referrals.map((r) => {
+        const copy = { ...r };
+        delete copy.phone;
+        return copy;
+      });
     }
     if (includePaymentNumber) out.paymentNumber = config.paymentNumber;
     const now = Date.now();

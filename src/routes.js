@@ -8,6 +8,7 @@ const { store, sha256, newId, nowIso } = require('./store');
 const { makeCode, pickProvider, normalizePhone } = require('./otp');
 const { issueTokens, verifyRefreshToken, revokeRefreshToken, requireAuth, requireRole, issueAdminToken } = require('./auth');
 const cat = require('./catalog');
+const notify = require('./notify');
 
 const router = express.Router();
 
@@ -321,16 +322,24 @@ function releaseBooking(b, mode) {
   if (b.patientPhone) maybeIssueVouchers(b.patientPhone);
   store.save();
 }
-function sweepAutoRelease() {
+// v2.1.0 — notification helpers for the sweep (Africa/Cairo calendar:
+// the business runs on Egyptian time, not UTC).
+function cairoDateStr(d = new Date()) { return d.toLocaleDateString('en-CA', { timeZone: 'Africa/Cairo' }); } // 'YYYY-MM-DD'
+function cairoWeekdayShort(d = new Date()) { return d.toLocaleDateString('en-US', { timeZone: 'Africa/Cairo', weekday: 'short' }); } // 'Thu'
+
+async function sweepAutoRelease() {
   const now = Date.now();
   const released = [];
   const overdue = [];
+  let notificationsSent = 0;
+  let changed = false;
   // v2.0.9 — expire loyalty vouchers past their date; clear an expired
   // admin promo so tier rates resume.
   expireVouchers();
   if (store.data.promo && store.data.promo.until && new Date(store.data.promo.until).getTime() <= now) {
     store.data.promo = null;
     store.audit('promo.expired', 'system', {});
+    changed = true;
   }
   for (const b of Object.values(store.data.bookings)) {
     if (b.status === 'patient_confirmed' && b.patientConfirmedAt && !b.review && !b.complaint) {
@@ -352,11 +361,74 @@ function sweepAutoRelease() {
         b.overdue = true;
         overdue.push(b.id);
         store.audit('visit.overdue', 'system', { bookingId: b.id, minutes: 120 });
+        changed = true;
+      }
+    }
+    // v2.1.0 — 1-hour review reminder (SPEC §4: reminders within exactly
+    // one hour, then auto-release): at ~50 minutes after patient
+    // confirmation (10 minutes before auto-release), notify the patient
+    // ONCE (critical) to review. Only while still unreviewed, with no
+    // complaint and no circumvention hold. The SMS fallback (unread after
+    // 10 more minutes) is handled by processSmsFallbacks below.
+    if (b.status === 'patient_confirmed' && b.patientConfirmedAt && !b.review && !b.complaint && !b.circumventionHold && !b.reviewReminderSentAt) {
+      const remindAfterMs = Math.max(0, config.autoReleaseAfterMs - 10 * 60 * 1000);
+      if (now - new Date(b.patientConfirmedAt).getTime() >= remindAfterMs) {
+        b.reviewReminderSentAt = nowIso();
+        changed = true;
+        try {
+          await notify.notifyUser(b.patientPhone, {
+            type: 'review_reminder', critical: true,
+            titleAr: 'قيّم زيارتك', titleEn: 'Review your visit',
+            bodyAr: 'قيّم زيارتك خلال الساعة ليتم تحويل المبلغ لمقدم الخدمة — افتح التطبيق للتقييم.',
+            bodyEn: 'Please review your visit within the hour so the held amount is released to your provider.',
+            data: { bookingId: b.id },
+            validUntilMs: new Date(b.patientConfirmedAt).getTime() + config.autoReleaseAfterMs,
+          });
+          notificationsSent += 1;
+        } catch (e) {
+          console.error('[sweep] review reminder failed:', e.message);
+        }
       }
     }
   }
-  if (released.length || overdue.length) store.save();
-  return { released, overdue };
+  // v2.1.0 — Thursday settlement notifications (Africa/Cairo calendar).
+  // Once per Thursday: notify every provider with released money or a
+  // volume bonus to check their wallet. Demo providers are skipped —
+  // they are not real people (and must never receive a real SMS).
+  const todayCairo = cairoDateStr();
+  if (cairoWeekdayShort() === 'Thu' && store.data.settlementNotifiedOn !== todayCairo) {
+    store.data.settlementNotifiedOn = todayCairo;
+    changed = true;
+    for (const p of Object.values(store.data.providers)) {
+      if (p.demo) continue;
+      const hasReleased = Object.values(store.data.bookings).some((bk) => bk.providerId === p.id && ['released', 'auto_released'].includes(bk.status));
+      const vb = volumeBonusFor(p.id, monthKey());
+      if (!hasReleased && !(vb.bonusEgp > 0)) continue;
+      try {
+        await notify.notifyUser(p.phone, {
+          type: 'settlement', critical: true,
+          titleAr: 'تسوية الخميس', titleEn: 'Thursday settlement',
+          bodyAr: 'تسوية يوم الخميس جاهزة — راجع محفظتك في التطبيق لمعرفة مستحقاتك.',
+          bodyEn: 'Thursday settlement is ready — check your wallet in the app for your balance.',
+          data: { settlementDate: todayCairo },
+          validUntilMs: now + 12 * 60 * 60 * 1000,
+        });
+        notificationsSent += 1;
+      } catch (e) {
+        console.error('[sweep] settlement notify failed:', e.message);
+      }
+    }
+  }
+  // v2.1.0 — unread-critical SMS fallback pass: a critical notification
+  // still unread 10 minutes after creation gets one SMS attempt.
+  let fb = { attempted: 0, sent: 0 };
+  try {
+    fb = await notify.processSmsFallbacks();
+  } catch (e) {
+    console.error('[sweep] sms fallback pass failed:', e.message);
+  }
+  if (released.length || overdue.length || changed) store.save();
+  return { released, overdue, notificationsSent, smsSent: fb.sent, smsFallbackAttempted: fb.attempted };
 }
 
 // ---------------------------------------------------------------- bootstrap
@@ -370,6 +442,10 @@ router.get('/bootstrap', (req, res) => {
     .map((s) => ({
       id: s.code, code: s.code, name_en: s.name_en, name_ar: s.name_ar,
       price: s.price_egp, price_egp: s.price_egp,
+      // v2.1.0 — risk tier (owner refinement 26 Nov 2026): 'high' services
+      // need a doctor's order to book and a verified nurse to accept.
+      riskLevel: s.riskLevel || 'standard',
+      requiresDoctorOrder: s.requiresDoctorOrder === true,
       experience_bands: s.experience_bands || undefined,
     }));
   const touristMap = { tourist_doctor: 'doctor', tourist_iv: 'iv', tourist_dressing: 'dressing', tourist_nurse: 'nurse' };
@@ -391,6 +467,15 @@ router.get('/bootstrap', (req, res) => {
     mockMode: config.mockOtp,
     ambulance: '123',
     termsVersion: config.termsVersion,
+    // v2.1.0 — capability flags (no secrets): the app uses these to pick
+    // the login flow (SMS OTP when configured, phone-only fallback when
+    // not) and to know whether push registration is meaningful.
+    otp: { smsConfigured: config.smsConfigured(), whatsappConfigured: config.whatsapp.provider === 'meta' },
+    push: { fcmConfigured: config.fcmConfigured() },
+    persistence: store.persistence,
+    // v2.1.0 — high-risk tier (owner refinement 26 Nov 2026).
+    highRiskServices: cat.HIGH_RISK_SERVICES,
+    highRiskChecklist: cat.HIGH_RISK_CHECKLIST,
     // v2.0.9 — active promo-month override (commission %, no secrets).
     promo: (() => { const pr = activePromo(); return pr ? { active: true, commissionPct: pr.commissionPct, until: pr.until || null } : { active: false, commissionPct: null, until: null }; })(),
     note: 'Prices are fixed and announced in advance. No bargaining inside the app.',
@@ -455,6 +540,45 @@ router.get('/me/vouchers', requireAuth, (req, res) => {
     voucherValidDays: cat.VOUCHER_VALID_DAYS,
     voucherMinBookingEgp: cat.VOUCHER_MIN_BOOKING_EGP,
   });
+});
+
+// ---------------------------------------------------------------- v2.1.0 — notifications (in-app center + FCM push + SMS fallback)
+// Delivery order (owner decision 26 Nov 2026 — keep the cost down):
+// in-app notification (always, free) -> FCM push (free, when Firebase is
+// configured and the user registered a device) -> SMS fallback (0.27
+// EGP/message, Together SMS) for CRITICAL events only, when push could
+// not reach the user (no device / FCM not configured / all sends failed,
+// or still unread 10 minutes later — see the sweep). FCM registration
+// tokens are stored server-side only and NEVER returned by any API.
+router.post('/me/devices', requireAuth, (req, res) => {
+  const token = String(req.body?.fcmToken || '');
+  const platform = String(req.body?.platform || '').slice(0, 20) || null;
+  try {
+    const n = notify.registerDevice(req.user.phone, token, platform);
+    res.json({ ok: true, devices: n });
+  } catch (e) {
+    return bad(res, 400, e.message);
+  }
+});
+
+router.delete('/me/devices', requireAuth, (req, res) => {
+  const removed = notify.unregisterDevice(req.user.phone, req.body?.fcmToken || '');
+  res.json({ ok: true, removed });
+});
+
+router.get('/me/notifications', requireAuth, (req, res) => {
+  const list = notify.notificationsFor(req.user.phone).slice().reverse().map(notify.publicNotification);
+  res.json({ notifications: list, unreadCount: list.filter((n) => !n.readAt).length });
+});
+
+router.post('/me/notifications/read-all', requireAuth, (req, res) => {
+  res.json({ ok: true, readCount: notify.markAllRead(req.user.phone) });
+});
+
+router.post('/me/notifications/:id/read', requireAuth, (req, res) => {
+  const rec = notify.markRead(req.user.phone, req.params.id);
+  if (!rec) return res.status(404).json({ error: 'not_found', message: 'Notification not found.' });
+  res.json({ ok: true, notification: rec });
 });
 
 // ---------------------------------------------------------------- OTP
@@ -547,6 +671,14 @@ router.post('/otp/verify', (req, res) => {
 router.post('/auth/login-phone', (req, res) => {
   const phone = normalizePhone(req.body?.phone);
   if (!phone) return bad(res, 400, 'Valid Egyptian phone number required (01xxxxxxxxx).');
+  // v2.1.0 — phone-only login is ONLY a fallback while no real OTP
+  // provider is configured. Once SMS OTP is switched on (owner decision
+  // 26 Nov 2026: code-ready now, activation later), phone-only login is
+  // disabled in production — anyone who knows a number could otherwise
+  // enter as that account. Dev/test are unaffected (mock OTP there).
+  if (config.isProd && config.smsConfigured()) {
+    return res.status(410).json({ error: 'phone_login_disabled', message: 'Phone-only login is disabled now that SMS OTP login is active. Request a login code instead.' });
+  }
   const provider = store.getProviderByPhone(phone);
   if (req.body?.role === 'provider' && !provider) {
     return res.status(403).json({ error: 'forbidden', message: 'This phone is not registered as a provider. Register as a provider first.' });
@@ -641,6 +773,17 @@ router.post('/bookings', requireAuth, (req, res) => {
   if (!b.patientName || typeof b.patientName !== 'string') return bad(res, 400, 'patientName required.');
   if (!b.serviceCode || !cat.SERVICES[b.serviceCode]) return bad(res, 400, 'Valid serviceCode required.');
   if (!['cash_receipt', 'instapay'].includes(b.paymentMethod)) return bad(res, 400, 'paymentMethod must be cash_receipt or instapay.');
+  // v2.1.0 — doctor's order gate (owner refinement 26 Nov 2026): HIGH-risk
+  // services (catheter insertion, Ryle insertion, tracheostomy care, IV
+  // infusion) AND suture removal require a written doctor order
+  // (ordering doctor name + order number). No order = no booking (400).
+  // The order is stored on the booking; for suture removal the provider
+  // must also confirm seeing it before completing the visit.
+  const doctorOrder = b.doctorOrder && typeof b.doctorOrder === 'object' ? b.doctorOrder : null;
+  const orderOk = !!(doctorOrder && String(doctorOrder.doctorName || '').trim() && String(doctorOrder.orderNumber || '').trim());
+  if ((cat.isHighRiskService(b.serviceCode) || b.serviceCode === 'suture_removal') && !orderOk) {
+    return bad(res, 400, 'This service requires a written doctor order (ordering doctor name + order number). No order = no booking.');
+  }
   // Emergency triage — ANY danger sign rejects the booking.
   const triage = b.triage || {};
   const danger = (triage.dangerSigns || []).filter((s) => cat.DANGER_SIGNS.includes(s));
@@ -674,6 +817,13 @@ router.post('/bookings', requireAuth, (req, res) => {
     currency: 'EGP', amountForeign: null, fxRate: null,
     paymentMethod: b.paymentMethod, respectCharterAccepted: true,
     termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
+    // v2.1.0 — doctor's order (required for high-risk services + suture
+    // removal; recorded for catheter insertion and any other service that
+    // sends one). doctorOrderSeenByProvider is set by the provider during
+    // the visit (required before completing a suture-removal visit).
+    doctorOrder: orderOk ? { doctorName: String(doctorOrder.doctorName).trim().slice(0, 120), orderNumber: String(doctorOrder.orderNumber).trim().slice(0, 80) } : null,
+    doctorOrderConfirmed: b.doctorOrderConfirmed === true,
+    doctorOrderSeenByProvider: false,
     triage: { dangerSigns: danger, notes: triage.notes || null },
     address: b.address || null, scheduledAt: b.scheduledAt || null, notes: b.notes || null,
     alternateContact: b.alternateContact || null, // admin-only if needed
@@ -916,8 +1066,10 @@ router.post('/bookings/:id/cash-collected', requireAuth, requireRole('provider')
 });
 
 // Manual + scheduled escrow sweep (admin only via HTTP; interval calls it directly).
-router.post('/jobs/sweep', requireAuth, requireRole('admin'), (req, res) => {
-  const result = sweepAutoRelease();
+// v2.1.0 — the sweep is async now (review reminder + settlement
+// notifications + SMS fallback pass).
+router.post('/jobs/sweep', requireAuth, requireRole('admin'), async (req, res) => {
+  const result = await sweepAutoRelease();
   store.audit('jobs.sweep', req.user.phone, result);
   res.json({ ok: true, ...result });
 });
@@ -986,7 +1138,11 @@ router.get('/providers/radar', requireAuth, requireRole('provider'), (req, res) 
   // name, address, contact, notes, triage or insurer data.
   const maxKm = Math.min(35, Number(req.query.maxKm) || 35);
   const held = Object.values(store.data.bookings)
-    .filter((b) => b.status === 'held' && !b.providerId && (b.distanceKm ?? 99) <= maxKm)
+    // v2.1.0 — high-risk tier: nursing assistants never see high-risk
+    // bookings on the radar (they cannot accept them — enforced at
+    // accept time too). Nurses and doctors see everything.
+    .filter((b) => b.status === 'held' && !b.providerId && (b.distanceKm ?? 99) <= maxKm
+      && !(p.role === 'assistant' && cat.isHighRiskService(b.serviceCode)))
     .sort((a, b) => (a.distanceKm ?? 99) - (b.distanceKm ?? 99))
     .map((b) => store.radarBooking(b));
   res.json({ providerId: p.id, tier: p.tier, pending: held });
@@ -1002,6 +1158,17 @@ router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, 
   // v2.0.8 — a suspended / banned provider cannot accept work.
   const blocked = providerBlocked(p);
   if (blocked) return res.status(403).json({ error: 'forbidden', message: blocked });
+  // v2.1.0 — high-risk tier (owner refinement 26 Nov 2026): only VERIFIED
+  // nurses (or doctors) may accept high-risk bookings. Nursing assistants
+  // cannot — enforced here, and the radar hides these bookings from them.
+  if (cat.isHighRiskService(b.serviceCode)) {
+    if (p.role !== 'nurse' && p.role !== 'doctor') {
+      return res.status(403).json({ error: 'forbidden', message: 'High-risk services can only be accepted by a verified nurse (or doctor). Nursing assistants cannot take these bookings.' });
+    }
+    if (p.status !== 'verified') {
+      return res.status(403).json({ error: 'forbidden', message: 'High-risk services can only be accepted after admin document verification (status=verified).' });
+    }
+  }
   if (b.status !== 'held' || b.providerId) return bad(res, 409, `Booking cannot be accepted while status is ${b.status}.`);
   b.providerId = p.id;
   // v2.0.9 — commission is locked at accept time. An active promo month
@@ -1016,6 +1183,40 @@ router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, 
   b.acceptedAt = nowIso();
   store.audit('booking.accepted', req.user.phone, { bookingId: b.id, providerId: p.id, commissionPct: b.commissionPct, promoApplied: !!promoNow });
   store.save();
+  // v2.1.0 — notify the patient (critical: booking accepted). Fire and
+  // forget — the in-app record is written synchronously inside notifyUser;
+  // push/SMS delivery must never block the response.
+  notify.notifyUser(b.patientPhone, {
+    type: 'booking_accepted', critical: true,
+    titleAr: 'تم قبول حجزك', titleEn: 'Your booking was accepted',
+    bodyAr: 'قبل مقدم الخدمة حجزك، وهو في الطريق إليك. تابع وصوله من التطبيق.',
+    bodyEn: 'Your booking was accepted — your provider is on the way. Track the visit in the app.',
+    data: { bookingId: b.id },
+    validUntilMs: Date.now() + 6 * 60 * 60 * 1000,
+  }).catch((e) => console.error('[notify] booking.accepted:', e.message));
+  res.json(pubBooking(req, b, { includePaymentNumber: true }));
+});
+
+// v2.1.0 — provider marks themselves en route (after acceptance, before
+// the visit). The patient gets a critical notification (in-app + push,
+// SMS fallback when push cannot reach them). Does not change escrow,
+// status, or any window — it only stamps enRouteAt.
+router.post('/bookings/:id/en-route', requireAuth, requireRole('provider'), (req, res) => {
+  const b = loadBooking(req, res);
+  if (!b) return;
+  if (b.providerId !== req.user.providerId) return res.status(403).json({ error: 'forbidden', message: 'Not your booking.' });
+  if (b.status !== 'accepted') return bad(res, 409, `Cannot mark en route while status is ${b.status}.`);
+  b.enRouteAt = nowIso();
+  store.audit('booking.en_route', req.user.phone, { bookingId: b.id });
+  store.save();
+  notify.notifyUser(b.patientPhone, {
+    type: 'provider_en_route', critical: true,
+    titleAr: 'مقدم الخدمة في الطريق', titleEn: 'Your provider is on the way',
+    bodyAr: 'مقدم الخدمة في الطريق إليك الآن. تابع وصوله من التطبيق.',
+    bodyEn: 'Your provider is on the way to you now. Track their arrival in the app.',
+    data: { bookingId: b.id },
+    validUntilMs: Date.now() + 2 * 60 * 60 * 1000,
+  }).catch((e) => console.error('[notify] booking.en_route:', e.message));
   res.json(pubBooking(req, b, { includePaymentNumber: true }));
 });
 
@@ -1039,6 +1240,9 @@ router.post('/bookings/:id/vitals', requireAuth, requireRole('provider'), (req, 
   const missing = Object.entries(vitals).filter(([, x]) => x == null).map(([k]) => k);
   if (missing.length) return bad(res, 400, `Mandatory vitals missing or out of range: ${missing.join(', ')}`, { required: ['bpSystolic', 'bpDiastolic', 'pulse', 'glucose', 'oxygen', 'temp'] });
   b.vitals = { ...vitals, at: nowIso(), notes: String(v.notes || '').slice(0, 500) };
+  // v2.1.0 — suture removal: the provider may confirm here that they
+  // have seen the written doctor order (also accepted at completion).
+  if (v.doctorOrderSeen === true) b.doctorOrderSeenByProvider = true;
   store.audit('booking.vitals', req.user.phone, { bookingId: b.id });
   store.save();
   res.json(pubBooking(req, b, { includePaymentNumber: true }));
@@ -1052,6 +1256,22 @@ router.post('/bookings/:id/complete-provider', requireAuth, requireRole('provide
   if (blockedComplete) return res.status(403).json({ error: 'forbidden', message: blockedComplete });
   if (b.status !== 'accepted') return bad(res, 409, `Cannot confirm completion while status is ${b.status}.`);
   if (!b.vitals) return bad(res, 409, 'Mandatory vitals must be recorded before completing the visit.');
+  // v2.1.0 — suture removal: the provider must confirm seeing the written
+  // doctor order before completing the visit (also accepted at vitals).
+  if (b.serviceCode === 'suture_removal' && !b.doctorOrderSeenByProvider) {
+    if (req.body?.doctorOrderSeen === true) b.doctorOrderSeenByProvider = true;
+    else return bad(res, 409, 'Suture removal: confirm you have seen the written doctor order before completing the visit (send doctorOrderSeen=true).');
+  }
+  // v2.1.0 — high-risk tier: the in-app safety checklist must be
+  // completed before finishing the visit. All four items are required.
+  if (cat.isHighRiskService(b.serviceCode)) {
+    const sc = req.body?.safetyChecklist || {};
+    const missing = cat.HIGH_RISK_CHECKLIST.filter((k) => sc[k] !== true);
+    if (missing.length) {
+      return bad(res, 409, `High-risk service: complete the safety checklist before finishing the visit (missing: ${missing.join(', ')}).`, { required: cat.HIGH_RISK_CHECKLIST, missing });
+    }
+    b.safetyChecklist = { orderSeen: true, sterileTechnique: true, identityConfirmed: true, complicationCheck: true, at: nowIso() };
+  }
   b.status = 'provider_confirmed';
   b.providerConfirmedAt = nowIso();
   store.audit('booking.provider_confirmed', req.user.phone, { bookingId: b.id, note: 'Provider confirmed completion before leaving; patient confirmation is separate.' });
@@ -1290,6 +1510,132 @@ router.get('/hotels/:id', requireAuth, (req, res) => {
   res.json(h);
 });
 
+// ---------------------------------------------------------------- v2.1.0 — Quseir doctors directory
+// Seeded EMPTY on purpose — no fake doctors. The admin adds real doctors
+// with their consent (name, specialty, phone, clinic/address, working
+// hours, notes, active/inactive). Provider-side READ ONLY. Patients NEVER
+// see doctors' numbers (anti-leakage: same rule as provider numbers) —
+// there is NO patient-facing doctors endpoint at all. Referrals are
+// audit-logged on the booking, with a snapshot of the doctor (so a later
+// edit/delete never rewrites history).
+function publicDoctor(d, { includePhone = false } = {}) {
+  const out = {
+    id: d.id, name: d.name, specialty: d.specialty,
+    clinic: d.clinic || null, address: d.address || null,
+    workingHours: d.workingHours || null, notes: d.notes || null,
+    active: d.active !== false, createdAt: d.createdAt,
+  };
+  if (includePhone) out.phone = d.phone;
+  return out;
+}
+function validateDoctorBody(body, { partial = false } = {}) {
+  const v = {};
+  if (body?.name !== undefined || !partial) {
+    const name = String(body?.name || '').trim().slice(0, 120);
+    if (!name) return { error: 'name required.' };
+    v.name = name;
+  }
+  if (body?.specialty !== undefined || !partial) {
+    const specialty = String(body?.specialty || '').trim().slice(0, 80);
+    if (!specialty) return { error: 'specialty required.' };
+    v.specialty = specialty;
+  }
+  if (body?.phone !== undefined || !partial) {
+    const phone = normalizePhone(body?.phone);
+    if (!phone) return { error: 'Valid Egyptian phone number required (01xxxxxxxxx).' };
+    v.phone = phone;
+  }
+  if (body?.clinic !== undefined) v.clinic = String(body.clinic || '').slice(0, 200);
+  if (body?.address !== undefined) v.address = String(body.address || '').slice(0, 300);
+  if (body?.workingHours !== undefined) v.workingHours = String(body.workingHours || '').slice(0, 300);
+  if (body?.notes !== undefined) v.notes = String(body.notes || '').slice(0, 1000);
+  if (body?.active !== undefined) v.active = body.active !== false;
+  return { value: v };
+}
+
+router.get('/admin/doctors', requireAuth, requireRole('admin'), (req, res) => {
+  const list = (store.data.doctors || []).map((d) => publicDoctor(d, { includePhone: true }));
+  res.json({ doctors: list, count: list.length });
+});
+
+router.post('/admin/doctors', requireAuth, requireRole('admin'), (req, res) => {
+  const checked = validateDoctorBody(req.body);
+  if (checked.error) return bad(res, 400, checked.error);
+  const d = { id: newId('doc'), ...checked.value, active: checked.value.active !== false, createdAt: nowIso() };
+  store.data.doctors.push(d);
+  store.audit('admin.doctor_added', 'admin', { doctorId: d.id, name: d.name, specialty: d.specialty });
+  store.save();
+  res.status(201).json(publicDoctor(d, { includePhone: true }));
+});
+
+router.get('/admin/doctors/:id', requireAuth, requireRole('admin'), (req, res) => {
+  const d = (store.data.doctors || []).find((x) => x.id === req.params.id);
+  if (!d) return res.status(404).json({ error: 'not_found', message: 'Doctor not found.' });
+  res.json(publicDoctor(d, { includePhone: true }));
+});
+
+router.put('/admin/doctors/:id', requireAuth, requireRole('admin'), (req, res) => {
+  const d = (store.data.doctors || []).find((x) => x.id === req.params.id);
+  if (!d) return res.status(404).json({ error: 'not_found', message: 'Doctor not found.' });
+  const checked = validateDoctorBody(req.body, { partial: true });
+  if (checked.error) return bad(res, 400, checked.error);
+  Object.assign(d, checked.value);
+  store.audit('admin.doctor_updated', 'admin', { doctorId: d.id, fields: Object.keys(checked.value) });
+  store.save();
+  res.json(publicDoctor(d, { includePhone: true }));
+});
+
+router.delete('/admin/doctors/:id', requireAuth, requireRole('admin'), (req, res) => {
+  const list = store.data.doctors || [];
+  const i = list.findIndex((x) => x.id === req.params.id);
+  if (i < 0) return res.status(404).json({ error: 'not_found', message: 'Doctor not found.' });
+  const [d] = list.splice(i, 1);
+  // Referrals already recorded keep their snapshot (name/specialty/phone
+  // stored on the referral), so deleting a doctor never rewrites history.
+  store.audit('admin.doctor_deleted', 'admin', { doctorId: d.id, name: d.name });
+  store.save();
+  res.json({ ok: true, deletedId: d.id });
+});
+
+// Provider-side read only: ACTIVE doctors, phone included (the provider
+// needs to call). ?specialty= filters (case-insensitive substring).
+// Patients get 403 here — there is no patient-facing doctors endpoint.
+router.get('/providers/doctors', requireAuth, requireRole('provider'), (req, res) => {
+  const q = String(req.query.specialty || '').trim().toLowerCase();
+  let list = (store.data.doctors || []).filter((d) => d.active !== false);
+  if (q) list = list.filter((d) => String(d.specialty || '').toLowerCase().includes(q));
+  list = list.map((d) => publicDoctor(d, { includePhone: true }));
+  res.json({ doctors: list, count: list.length });
+});
+
+// "إحالة لطبيب" — the assigned provider refers a booking to a doctor.
+// The referral (with a doctor snapshot) is stored on the booking and
+// audit-logged. The doctor's phone is visible to the assigned provider
+// and admin only — publicBooking strips it for patient viewers.
+router.post('/bookings/:id/refer-doctor', requireAuth, requireRole('provider'), (req, res) => {
+  const b = loadBooking(req, res);
+  if (!b) return;
+  if (b.providerId !== req.user.providerId) return res.status(403).json({ error: 'forbidden', message: 'Not your booking.' });
+  if (!['accepted', 'provider_confirmed', 'patient_confirmed', 'reviewed'].includes(b.status)) {
+    return bad(res, 409, `Cannot refer a doctor while status is ${b.status}.`);
+  }
+  const doctorId = String(req.body?.doctorId || '');
+  const d = (store.data.doctors || []).find((x) => x.id === doctorId);
+  if (!d) return res.status(404).json({ error: 'not_found', message: 'Doctor not found.' });
+  if (d.active === false) return res.status(409).json({ error: 'doctor_inactive', message: 'This doctor is inactive.' });
+  const referral = {
+    id: newId('ref'), doctorId: d.id, doctorName: d.name, specialty: d.specialty,
+    phone: d.phone, clinic: d.clinic || null,
+    note: String(req.body?.note || '').slice(0, 500) || null,
+    at: nowIso(), by: req.user.phone,
+  };
+  b.referrals = b.referrals || [];
+  b.referrals.push(referral);
+  store.audit('booking.doctor_referred', req.user.phone, { bookingId: b.id, doctorId: d.id, doctorName: d.name, specialty: d.specialty });
+  store.save();
+  res.status(201).json({ ok: true, referral, booking: pubBooking(req, b, { includePaymentNumber: true }) });
+});
+
 // ---------------------------------------------------------------- tourist bookings
 router.post('/tourist-bookings', requireAuth, (req, res) => {
   const b = normalizeBookingBody(req.body);
@@ -1420,24 +1766,27 @@ router.get('/bookings/:id/insurance-report', requireAuth, (req, res) => {
 });
 
 // ---------------------------------------------------------------- NPWT
-router.post('/npwt/calculate', requireAuth, (req, res) => {
-  const days = Number(req.body?.days);
-  if (!Number.isInteger(days) || days < 1 || days > 90) return bad(res, 400, 'days must be an integer 1–90.');
-  let kitPrice = req.body?.kitPrice == null ? 300 : Number(req.body.kitPrice);
-  if (!Number.isFinite(kitPrice) || kitPrice < 250 || kitPrice > 350) return bad(res, 400, 'kitPrice must be 250–350 EGP (invoice price).');
-  // Dressing every 3 days; 5 dressings in a 14-day course.
+// Shared calculator (SPEC §3 + §5): real NPWT device with true negative
+// pressure ONLY. Dressing every 3 days; 5 dressings in a 14-day course.
+// Device rental 750/week or 1,000/15 days; specialist dressing visit 600;
+// kit (foam + dressing + tubes) 250–350 at invoice price, per dressing.
+// Canister changed separately ONLY when full.
+function calculateNpwt(body) {
+  const days = Number(body?.days);
+  if (!Number.isInteger(days) || days < 1 || days > 90) return { error: 'days must be an integer 1–90.' };
+  const kitPrice = body?.kitPrice == null ? 300 : Number(body.kitPrice);
+  if (!Number.isFinite(kitPrice) || kitPrice < 250 || kitPrice > 350) return { error: 'kitPrice must be 250–350 EGP (invoice price).' };
   const dressings = Math.ceil(days / 3);
   const visitCost = dressings * 600; // specialist dressing visit
-  const kitCost = dressings * kitPrice; // kit (foam + dressing + tubes) per dressing
+  const kitCost = dressings * kitPrice; // kit per dressing
   let rental;
   if (days <= 7) rental = 750;
   else if (days <= 15) rental = 1000;
   else rental = 1000 + 750 * Math.ceil((days - 15) / 7);
-  const canisterFull = req.body?.canisterFull === true;
-  const canisterPrice = canisterFull ? Number(req.body?.canisterPrice || 0) : 0;
-  if (canisterFull && (!Number.isFinite(canisterPrice) || canisterPrice < 0)) return bad(res, 400, 'canisterPrice must be a non-negative number when canisterFull=true.');
-  const total = rental + visitCost + kitCost + canisterPrice;
-  res.json({
+  const canisterFull = body?.canisterFull === true;
+  const canisterPrice = canisterFull ? Number(body?.canisterPrice || 0) : 0;
+  if (canisterFull && (!Number.isFinite(canisterPrice) || canisterPrice < 0)) return { error: 'canisterPrice must be a non-negative number when canisterFull=true.' };
+  return {
     days, dressings, schedule: 'Dressing every 3 days',
     breakdown: {
       deviceRentalEgp: rental, rentalRule: days <= 7 ? '750/week' : days <= 15 ? '1000/15 days' : '1000/15 days + 750 per extra week',
@@ -1445,12 +1794,109 @@ router.post('/npwt/calculate', requireAuth, (req, res) => {
       kitsEgp: kitCost, kitUnitEgp: kitPrice, kits: dressings,
       canisterEgp: canisterPrice, canisterNote: canisterFull ? 'Canister replaced because full — charged separately.' : 'Canister changed separately ONLY when full.',
     },
-    totalEgp: total,
+    totalEgp: rental + visitCost + kitCost + canisterPrice,
+  };
+}
+
+router.post('/npwt/calculate', requireAuth, (req, res) => {
+  const calc = calculateNpwt(req.body);
+  if (calc.error) return bad(res, 400, calc.error);
+  res.json({
+    ...calc,
     reference: 'A single full dressing ≈ 1,100 EGP; a full 14-day course (5 dressings) ≈ 5,250–6,250 EGP.',
     requiresDoctorOrder: true,
     doctorOrderProvided: req.body?.doctorOrderProvided === true,
     warning: req.body?.doctorOrderProvided === true ? null : 'A written doctor order (doctor name + order number) is required before starting NPWT, plus the safety checklist (foam count in/out, bleeding check, canister status) and a wound photo at every visit. Real NPWT device with true negative pressure only.',
   });
+});
+
+// v2.1.0 — real NPWT booking (was calculator-only in the app).
+// HIGH-risk service: a written doctor order is REQUIRED (doctor name +
+// order number), and the NPWT safety checklist must be attested at
+// booking (foam count in/out, bleeding check, canister status, wound
+// photo to be provided at the first visit). The provider must ALSO
+// complete the generic high-risk safety checklist before finishing the
+// visit (see complete-provider) — the booking-time checklist is the
+// NPWT-specific one, not a substitute.
+// Pricing = NPWT total (calculator above) + the standard distance fee.
+// The loyalty voucher applies like any other booking (amount >= 300).
+router.post('/npwt/bookings', requireAuth, (req, res) => {
+  const b = normalizeBookingBody(req.body);
+  if (b.respectCharterAccepted !== true) return bad(res, 400, 'Respect charter must be accepted (respectCharterAccepted=true).');
+  // v2.0.8 — Terms & Conditions are mandatory for every booking type.
+  if (!termsAccepted(req.body)) return termsError(res);
+  if (!b.patientName || typeof b.patientName !== 'string') return bad(res, 400, 'patientName required.');
+  if (!['cash_receipt', 'instapay'].includes(b.paymentMethod)) return bad(res, 400, 'paymentMethod must be cash_receipt or instapay.');
+  const calc = calculateNpwt(req.body);
+  if (calc.error) return bad(res, 400, calc.error);
+  // Doctor's order — REQUIRED (high-risk gate, same as suture removal).
+  const doctorOrder = b.doctorOrder && typeof b.doctorOrder === 'object' ? b.doctorOrder : null;
+  if (!doctorOrder || !String(doctorOrder.doctorName || '').trim() || !String(doctorOrder.orderNumber || '').trim()) {
+    return bad(res, 400, 'NPWT requires a written doctor order (ordering doctor name + order number). No order = no booking.');
+  }
+  // NPWT safety checklist — all four attestations required at booking.
+  const sc = req.body?.safetyChecklist || {};
+  const npwtChecklist = ['foamCountConfirmed', 'bleedingChecked', 'canisterChecked', 'woundPhotoConfirmed'];
+  const missing = npwtChecklist.filter((k) => sc[k] !== true);
+  if (missing.length) {
+    return bad(res, 400, `NPWT safety checklist incomplete (missing: ${missing.join(', ')}). Foam count in/out, bleeding check, canister status and a wound photo at the first visit are all required.`, { required: npwtChecklist, missing });
+  }
+  const triage = b.triage || {};
+  const danger = (triage.dangerSigns || []).filter((s) => cat.DANGER_SIGNS.includes(s));
+  if (triage.danger === true || danger.length > 0 || triage.emergency === true) {
+    store.audit('booking.triage_rejected', req.user.phone, { danger });
+    return res.status(422).json({
+      error: 'emergency_triage',
+      message: 'Danger sign detected. Do NOT book a home visit — call the ambulance now.',
+      ambulance: '123', danger_signs: danger,
+    });
+  }
+  const priced = priceBooking({ serviceCode: 'standard', distanceKm: b.distanceKm, hotelId: b.hotelId, transport: b.transport });
+  if (priced.error) return bad(res, 400, priced.error);
+  if (priced.contract_required) return res.status(422).json({ error: 'contract_required', ...priced });
+  // priceBooking with 'standard' prices the DISTANCE FEE only here (its
+  // base is discarded): NPWT total + distance fee.
+  const distanceFeeEgp = priced.distanceFeeEgp;
+  const totalEgp = calc.totalEgp + distanceFeeEgp;
+  const id = newId('bk');
+  const vou = findVoucher(req.user.phone, totalEgp);
+  const booking = {
+    id, kind: 'npwt', patientPhone: req.user.phone, patientName: b.patientName,
+    serviceCode: 'npwt', serviceName: 'NPWT — vacuum-assisted closure (real device only)', status: 'held',
+    amountEgp: totalEgp, baseEgp: calc.totalEgp, distanceFeeEgp,
+    voucherId: vou ? vou.id : null, voucherDiscountEgp: vou ? vou.amountEgp : 0,
+    amountPayableEgp: vou ? totalEgp - vou.amountEgp : totalEgp,
+    distanceKm: priced.distanceKm, distanceBand: priced.band, distanceEstimate: true,
+    transport: b.transport || 'none', hotelId: b.hotelId || null,
+    currency: 'EGP', amountForeign: null, fxRate: null,
+    paymentMethod: b.paymentMethod, respectCharterAccepted: true,
+    termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
+    doctorOrder: { doctorName: String(doctorOrder.doctorName).trim().slice(0, 120), orderNumber: String(doctorOrder.orderNumber).trim().slice(0, 80) },
+    doctorOrderConfirmed: true, doctorOrderSeenByProvider: false,
+    npwt: {
+      days: calc.days, dressings: calc.dressings,
+      doctorOrder: { doctorName: String(doctorOrder.doctorName).trim().slice(0, 120), orderNumber: String(doctorOrder.orderNumber).trim().slice(0, 80) },
+      safetyChecklist: { foamCountConfirmed: true, bleedingChecked: true, canisterChecked: true, woundPhotoConfirmed: true },
+      breakdown: calc.breakdown,
+    },
+    triage: { dangerSigns: danger, notes: triage.notes || null },
+    address: b.address || null, scheduledAt: b.scheduledAt || null, notes: b.notes || null,
+    alternateContact: b.alternateContact || null,
+    providerId: null, commissionPct: null, providerShareEgp: null, appShareEgp: null,
+    vitals: null, review: null, providerReview: null, complaint: false,
+    circumventionHold: false, circumventionReportId: null,
+    complaintStatus: null, complaintDeadline: null, complaintAt: null, complaintResolvedAt: null,
+    settleableAt: null, cancelledAt: null, refundedAt: null, refundEgp: null,
+    cashCollectedByProvider: false, overdue: false,
+    createdAt: nowIso(), acceptedAt: null, providerConfirmedAt: null,
+    patientConfirmedAt: null, reviewedAt: null, releasedAt: null, releaseMode: null,
+  };
+  store.data.bookings[id] = booking;
+  if (vou) { vou.status = 'used'; vou.usedAt = nowIso(); vou.usedBookingId = id; }
+  store.audit('npwt_booking.created', req.user.phone, { bookingId: id, days: calc.days, dressings: calc.dressings, totalEgp, voucherId: booking.voucherId, voucherDiscountEgp: booking.voucherDiscountEgp });
+  recordTermsAcceptance(req.user.phone);
+  store.save();
+  res.status(201).json(pubBooking(req, booking));
 });
 
 // ---------------------------------------------------------------- post-op
@@ -1547,9 +1993,26 @@ router.get('/admin/dashboard', requireAuth, requireRole('admin'), (req, res) => 
   const circumventionReports = (store.data.circumventionReports || []).slice().reverse().map((r) => ({ ...r, createdAt: r.at }));
   // v2.0.9 — active promo-month override + promo months used this year.
   const promoNow = activePromo();
+  // v2.1.0 — Quseir doctors directory (admin sees phone numbers; the
+  // provider list is read-only and patient-side never sees them).
+  const doctors = (store.data.doctors || []).map((d) => publicDoctor(d, { includePhone: true }));
   res.json({ providers, sosAlerts, lateVisits: overdue, bookings, auditLog, circumventionReports, circumventionFlags: circumventionFlags(),
     promo: promoNow ? { active: true, commissionPct: promoNow.commissionPct, until: promoNow.until || null, source: promoNow.source } : { active: false, commissionPct: null, until: null },
     promoMonthsUsed: store.data.promoMonths || {},
+    doctors, doctorsCount: doctors.length,
+  });
+});
+
+// v2.1.0 — persistence status (admin only): which backend holds the data
+// and whether the Postgres fallback is active. No URLs or secrets here.
+router.get('/admin/persistence', requireAuth, requireRole('admin'), (req, res) => {
+  res.json({
+    persistence: store.persistence,
+    postgresConfigured: config.postgresConfigured(),
+    postgresError: store.postgresError || null,
+    note: store.persistence === 'postgres'
+      ? 'Data lives in Postgres and survives redeploys.'
+      : 'Data lives in the local data.json file and is WIPED on every redeploy. Add a Postgres service in Railway + DATABASE_URL to make it persistent.',
   });
 });
 

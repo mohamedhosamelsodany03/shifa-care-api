@@ -121,13 +121,31 @@ const WhatsAppOtpProvider = {
   },
 };
 
-// --- SMS provider — TODO (fallback channel) -------------------------------
+// --- SMS provider — Together SMS (Egypt) --------------------------------
+// HTTPS GET API (docs: https://sms.masrbokra.com/en/smspro-service-api.html).
+// Env: SMS_PROVIDER=together + TOGETHER_SMS_USER + TOGETHER_SMS_PASSWORD +
+// TOGETHER_SMS_SENDER (approved Sender ID). The OTP message is English
+// (GSM-7, 160 chars/part) so one unit covers it.
+// STATUS (owner decision 26 Nov 2026): the owner will NOT pay the sender
+// activation now (~2,451 EGP one-time incl. VAT), so this provider is
+// CODE-READY but DISABLED until the env vars are set. Until then the SMS
+// channel in production throws a clear configuration error (fail-closed),
+// and phone-only login stays the fallback. The password travels in the
+// request URL — it is NEVER logged (see src/sms.js).
+const { sendSmsText } = require('./sms');
+
 const SmsOtpProvider = {
-  name: 'sms',
-  async send() {
-    throw new Error(
-      'SMS OTP provider not configured (TODO). Set SMS_PROVIDER / SMS_API_KEY / SMS_SENDER and implement src/otp.js SmsOtpProvider.'
-    );
+  name: 'sms-together',
+  async send({ phone, channel, code }) {
+    if (config.sms.provider !== 'together') {
+      throw new Error(
+        'SMS OTP provider not configured: set SMS_PROVIDER=together, TOGETHER_SMS_USER, TOGETHER_SMS_PASSWORD and TOGETHER_SMS_SENDER in the host dashboard (sender activation ~2,451 EGP one-time).'
+      );
+    }
+    // OTP text: English only — one SMS unit, no ambiguity about digits.
+    const text = `Shifa Care login code: ${code}. Valid for 5 minutes. Do not share it with anyone.`;
+    await sendSmsText({ to: phone, text, lang: 'en' });
+    return { ok: true, provider: 'sms-together' };
   },
 };
 
@@ -140,6 +158,16 @@ function pickProvider(channel) {
   if (config.whatsapp.provider && config.whatsapp.provider !== 'meta') {
     throw new Error(
       `Unsupported WHATSAPP_PROVIDER "${config.whatsapp.provider}" (supported: 'meta').`
+    );
+  }
+  // Together SMS provider, when explicitly configured, wins in any env
+  // too (so it can be tested against the real gateway from dev/test).
+  if (config.sms.provider === 'together' && channel === 'sms') {
+    return SmsOtpProvider;
+  }
+  if (config.sms.provider && config.sms.provider !== 'together') {
+    throw new Error(
+      `Unsupported SMS_PROVIDER "${config.sms.provider}" (supported: 'together').`
     );
   }
   // In production with a real provider configured, WhatsApp first, SMS fallback.
@@ -161,4 +189,4 @@ function normalizePhone(raw) {
   return p;
 }
 
-module.exports = { makeCode, pickProvider, normalizePhone, sha256, MockOtpProvider, WhatsAppOtpProvider, toE164WhatsApp };
+module.exports = { makeCode, pickProvider, normalizePhone, sha256, MockOtpProvider, WhatsAppOtpProvider, SmsOtpProvider, toE164WhatsApp };

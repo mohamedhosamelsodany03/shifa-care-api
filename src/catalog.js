@@ -9,7 +9,11 @@ const SERVICES = {
   package7: { code: 'package7', name_en: '7-dressing package', name_ar: 'باقة 7 غيارات', price_egp: 1640 },
   vip: { code: 'vip', name_en: 'Rapid / VIP visit (20–30 min)', name_ar: 'وصول سريع / VIP', price_egp: 350 },
   cannula: { code: 'cannula', name_en: 'Cannula only', name_ar: 'كانيولا فقط', price_egp: 250 },
-  cannula_iv: { code: 'cannula_iv', name_en: 'Cannula + IV fluids', name_ar: 'كانيولا + محاليل', price_egp: 350 },
+  // v2.1.0 — HIGH risk (owner correction 26 Nov 2026): cannula+IV fluids
+  // joins the high-risk tier — doctor's order required, verified nurse
+  // only, safety checklist before completion. (Plain cannula stays
+  // standard risk.)
+  cannula_iv: { code: 'cannula_iv', name_en: 'Cannula + IV fluids', name_ar: 'كانيولا + محاليل', price_egp: 350, riskLevel: 'high' },
   shift12: { code: 'shift12', name_en: '12-hour shift', name_ar: 'شيفت 12 ساعة', price_egp: 500 },
   shift24: { code: 'shift24', name_en: '24-hour shift', name_ar: 'شيفت 24 ساعة', price_egp: 850 },
   postop: { code: 'postop', name_en: 'Post-operative care', name_ar: 'رعاية ما بعد العمليات', price_egp: 1400 },
@@ -23,6 +27,74 @@ const SERVICES = {
     { min_years: 5, max_years: 9.99, price_egp: 235, label: '5–9 years' },
     { min_years: 10, max_years: 99, price_egp: 260, label: '10+ years' },
   ]},
+  // --- v2.1.0 — new nursing services (owner refinement 26 Nov 2026) -----
+  // PRICES APPROVED BY THE OWNER 26 Nov 2026 («اعتمد يلا») — FINAL, not
+  // proposed. Change only on a new owner decision.
+  // High-risk services (riskLevel 'high'): doctor's order REQUIRED to
+  // book, only verified NURSES (or doctors) may accept, and the provider
+  // must complete the in-app safety checklist before finishing the visit.
+  // Owner correction 26 Nov 2026: ALL catheter handling and ALL drain
+  // handling are HIGH risk — not just insertion. The high-risk tier is:
+  // catheter insertion 400, catheter removal 300, catheter flush 300,
+  // Ryle insertion 400, drain removal 300 (owner-set price),
+  // tracheostomy care 400, IV infusion therapy 400, NPWT dressing 600,
+  // cannula+IV fluids 350.
+  catheter_insert: { code: 'catheter_insert', name_en: 'Urinary catheter insertion', name_ar: 'تركيب قسطرة بولية', price_egp: 400, riskLevel: 'high' },
+  catheter_remove: { code: 'catheter_remove', name_en: 'Urinary catheter removal', name_ar: 'إزالة قسطرة بولية', price_egp: 300, riskLevel: 'high' },
+  catheter_flush: { code: 'catheter_flush', name_en: 'Catheter unblocking / flush', name_ar: 'تسليك / غسيل قسطرة', price_egp: 300, riskLevel: 'high' },
+  // Suture removal is STANDARD risk, but keeps its own doctor-order gate
+  // (owner scope 26 Nov 2026): no written order = no booking, and the
+  // provider must confirm seeing the order before completing the visit.
+  suture_removal: { code: 'suture_removal', name_en: 'Surgical suture removal', name_ar: 'فك غرز جراحية', price_egp: 250, riskLevel: 'standard', requiresDoctorOrder: true },
+  ryle_insert: { code: 'ryle_insert', name_en: 'Ryle (NG) tube insertion', name_ar: 'تركيب أنبوبة رايل (أنفية معدية)', price_egp: 400, riskLevel: 'high' },
+  trach_care: { code: 'trach_care', name_en: 'Tracheostomy care', name_ar: 'العناية بالقصطرة الرغامية (تراكيوستومي)', price_egp: 400, riskLevel: 'high' },
+  iv_infusion: { code: 'iv_infusion', name_en: 'IV antibiotic / infusion therapy', name_ar: 'علاج وريدي (مضاد حيوي / محاليل)', price_egp: 400, riskLevel: 'high' },
+  drain_removal: { code: 'drain_removal', name_en: 'Surgical drain removal', name_ar: 'إزالة درنقة جراحية', price_egp: 300, riskLevel: 'high' },
+  blood_draw: { code: 'blood_draw', name_en: 'Blood draw (phlebotomy)', name_ar: 'سحب عينة دم', price_egp: 200, riskLevel: 'standard' },
+  injection: { code: 'injection', name_en: 'IM / IV injection', name_ar: 'حقن عضلي / وريدي', price_egp: 150, riskLevel: 'standard' },
+  vitals_check: { code: 'vitals_check', name_en: 'Vital signs check', name_ar: 'قياس العلامات الحيوية', price_egp: 150, riskLevel: 'standard' },
+  stoma_care: { code: 'stoma_care', name_en: 'Stoma care', name_ar: 'العناية بفتحة الإخراج (ستوما)', price_egp: 300, riskLevel: 'standard' },
+  // --- v2.1.0 — owner additions 26 Nov 2026 (APPROVED, FINAL) -----------
+  // CVP central-line dressing: HIGH risk, same gates as the rest of the
+  // tier (doctor's order, verified nurse only, safety checklist).
+  cvp_dressing: { code: 'cvp_dressing', name_en: 'CVP central-line dressing', name_ar: 'غيار قسطرة CVP (قسطرة وريدية مركزية)', price_egp: 300, riskLevel: 'high', requiresDoctorOrder: true },
+  // Elderly care, 12-hour shift — its OWN service (the generic 12h shift
+  // at 500 stays as-is). TWO condition-based prices, both owner-set
+  // MINIMUMS ("لا يقل عن"): mobile patient 400, bedridden patient 500.
+  // The patient picks the condition at booking (two catalog entries).
+  elderly_shift_mobile: { code: 'elderly_shift_mobile', name_en: 'Elderly care — 12h shift (mobile patient)', name_ar: 'رعاية مسنين — شيفت 12 ساعة (حالة متحركة)', price_egp: 400, riskLevel: 'standard' },
+  elderly_shift_bedridden: { code: 'elderly_shift_bedridden', name_en: 'Elderly care — 12h shift (bedridden patient)', name_ar: 'رعاية مسنين — شيفت 12 ساعة (حالة قعيدة / طريحة فراش)', price_egp: 500, riskLevel: 'standard' },
+  // NOTE: physiotherapy services were proposed by the owner 26 Nov 2026
+  // but are NOT approved yet — do NOT add physio services until he confirms.
+};
+
+// High-risk services (owner refinement + correction 26 Nov 2026;
+// PRICES APPROVED 26 Nov 2026 — FINAL): ALL catheter handling
+// (insertion 400, removal 300, flush 300), Ryle (NG) tube insertion
+// 400, drain removal 300, tracheostomy care 400, IV
+// antibiotic/infusion therapy 400, NPWT dressing 600, cannula+IV fluids
+// 350, CVP central-line dressing 300 (owner-set 26 Nov 2026). 'npwt' is
+// not a SERVICES entry (it has its own booking endpoint) but is high-risk too.
+// Rules (enforced server-side in routes.js): doctor's order REQUIRED to
+// book; only verified nurses (or doctors) may accept — nursing
+// assistants cannot; the provider must complete the safety checklist
+// (HIGH_RISK_CHECKLIST) before finishing the visit. The owner stresses
+// these need professionalism — the gates are server-side, and the app
+// must show the requirements clearly to the patient at booking time.
+const HIGH_RISK_SERVICES = ['catheter_insert', 'catheter_remove', 'catheter_flush', 'ryle_insert', 'drain_removal', 'npwt', 'trach_care', 'iv_infusion', 'cannula_iv', 'cvp_dressing'];
+function isHighRiskService(serviceCode) {
+  if (!serviceCode) return false;
+  if (HIGH_RISK_SERVICES.includes(serviceCode)) return true;
+  return (SERVICES[serviceCode] && SERVICES[serviceCode].riskLevel === 'high') || false;
+}
+// In-app safety checklist the provider completes before finishing a
+// high-risk visit (all four must be true at complete-provider time).
+const HIGH_RISK_CHECKLIST = ['orderSeen', 'sterileTechnique', 'identityConfirmed', 'complicationCheck'];
+const HIGH_RISK_CHECKLIST_LABELS = {
+  orderSeen: 'I have seen the written doctor order',
+  sterileTechnique: 'Sterile / clean technique followed',
+  identityConfirmed: 'Patient identity confirmed',
+  complicationCheck: 'Checked for complications / bleeding before leaving',
 };
 
 // Tourist services (hotel / foreign-currency). Urgent adds +$20 / +€15.
@@ -361,6 +433,7 @@ module.exports = {
   SERVICES, TOURIST_SERVICES, TOURIST_URGENT_EXTRA, EXTRA_LANGUAGE_BONUS,
   TIERS, VOLUME_BONUS_TIERS, VOUCHER_AMOUNT_EGP, VOUCHER_MIN_BOOKING_EGP,
   VOUCHER_VALID_DAYS, VOUCHER_EVERY_N_VISITS,
+  HIGH_RISK_SERVICES, HIGH_RISK_CHECKLIST, HIGH_RISK_CHECKLIST_LABELS, isHighRiskService,
   HOTELS, MCQ, ENGLISH_CHECK, DANGER_SIGNS,
   TERMS_VERSION, TERMS_UPDATED_AT, TERMS_AR, TERMS_EN,
   distanceFee, servicePriceEgp,

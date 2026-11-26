@@ -154,14 +154,58 @@ confirmed (accepted) — never in `/bootstrap` and never on a `held` booking.**
 Free tier sleeps when idle; the first request after idle can take
 ~30–60 s to wake. `data.json` lives on the instance disk — for real
 production, move the store to persistent disk / a database before launch
-(Phase 2).
+(v2.1.0 adds Postgres support behind `DATABASE_URL`; see below).
+
+## v2.1.0 additions
+
+- **Notifications:** FCM push (HTTP v1, no SDK) + in-app notification
+  centre (`GET /api/me/notifications`, mark read / read-all) + device
+  registration (`POST/DELETE /api/me/devices`, max 5/user). SMS fallback
+  only for critical events (booking accepted, provider en route, 1-hour
+  review reminder, Thursday settlement) and only when push failed or no
+  device is registered. FCM needs a Firebase project (not created yet —
+  free; see BUILD-STATUS.md). SMS fallback needs Together SMS
+  credentials (owner decision 26 Nov 2026: NOT paying the ~2,451 EGP
+  sender activation now; code is ready and disabled behind env vars).
+- **Postgres persistence:** set `DATABASE_URL` and the whole app
+  document lives in one Postgres row (`shifa_state`, JSONB) and survives
+  redeploys; first boot imports `data.json` once. Unset = file store
+  (local dev default). Cost: app + small Postgres ≈ $8.65/mo total on
+  Railway Hobby; enabling it burns trial credit faster — do NOT set it
+  until the owner agrees.
+- **SMS OTP login (Together SMS):** `SmsOtpProvider` in `src/otp.js`
+  (provider `'together'`, `SMS_PROVIDER=together`). Code-ready, disabled
+  until the account is activated. Phone-only login stays the fallback
+  when the SMS provider is unconfigured (known weakness: anyone who
+  knows a phone number can enter as that account) and is disabled in
+  production (410 `phone_login_disabled`) once SMS is configured.
+- **NPWT bookings:** `POST /api/npwt/bookings` (doctor order + 4-item
+  safety checklist + terms/charter + payment; price from
+  `/npwt/calculate` + distance fee; vouchers apply).
+- **New services + high-risk tier:** 12 new catalog services; HIGH
+  risk = all catheter handling, Ryle insertion, drain removal,
+  tracheostomy care, IV infusion therapy, NPWT dressing, cannula+IV
+  fluids. High-risk bookings require a doctor's order, only verified
+  nurses/doctors may accept, and a 4-item safety checklist is required
+  before completion. Prices APPROVED by the owner 26 Nov 2026 (see
+  `src/catalog.js`); suture removal (250) also requires a doctor's order.
+- **Quseir doctors directory:** admin CRUD (`/api/admin/doctors`),
+  provider read (`GET /api/providers/doctors`, phone included),
+  patients NEVER see doctors' numbers; refer-a-doctor action on a
+  booking (`POST /api/bookings/:id/refer-doctor`, audit-logged).
+  Directory is seeded EMPTY — admin adds real doctors with consent.
+- **Commissions (v2.0.9, live):** reversed — Starter 15% / Pro 12% /
+  Elite 8%, volume bonuses 500/1,000/1,500 EGP at 30/60/100 cases,
+  promo months (max 2/year), patient loyalty vouchers (50 EGP after
+  every 4 completed paid visits, app-funded).
 
 ## What is NOT in Phase 1 (per spec, deferred)
 
 - Hurghada (cities/zones, German/Russian tourist paths, card payments).
 - Direct billing with insurers (insurance reports are stamped PDFs/HTML
   for the tourist to submit).
-- Real WhatsApp OTP provider (Meta Cloud API, `src/otp.js`).
-  SMS fallback is still a TODO stub — WhatsApp is the only live channel.
+- Real WhatsApp OTP provider (Meta Cloud API, `src/otp.js` — implemented
+  but Meta has refused the `otp_code` template 7 times; see
+  WHATSAPP-OTP-SETUP.md).
 - Shifa Bag, Takaful fund, hotel B2B contracts, advanced NPWT.
 - PIN change endpoint (use the env var).

@@ -320,7 +320,12 @@ async function main() {
     console.log('\n[provider register]');
     const newPhone = '01055555555';
     await req('POST', '/api/otp/request', { body: { phone: newPhone, channel: 'whatsapp' } });
-    const nm = out.match(/\[MOCK OTP\] channel=whatsapp phone=01055555555 code=(\d{6})/);
+    // Poll for the mock-code log line (stdout delivery is async).
+    let nm = null;
+    for (let i = 0; i < 20 && !nm; i++) {
+      nm = out.match(/\[MOCK OTP\] channel=whatsapp phone=01055555555 code=(\d{6})/);
+      if (!nm) await sleep(100);
+    }
     const nl = await req('POST', '/api/otp/verify', { body: { phone: newPhone, code: nm ? nm[1] : '000000' } });
     const newToken = nl.json?.accessToken;
     r = await req('POST', '/api/providers/register', { token: newToken, body: { ...TERMS,
@@ -686,6 +691,193 @@ async function main() {
       urgent: false, paymentMethod: 'cash_receipt', respectCharterAccepted: true, triage: { dangerSigns: [] },
     } });
     check('tourist booking applies voucher in USD: 55 - 1.04 = 53.96', r.status === 201 && r.json?.amountForeign === 53.96 && r.json?.voucherDiscountEgp === 50 && r.json?.voucherDiscountForeign === 1.04 && r.json?.amountPayableEgp === 2590, JSON.stringify(r.json));
+
+    // --- 18. v2.1.0: notifications + Postgres flags + SMS OTP gate +
+    // NPWT booking + new services / high-risk tier + doctors directory --
+    console.log('\n[v2.1.0 notifications + high-risk + doctors + npwt booking]');
+    // --- 18a. bootstrap flags + new services ---------------------------
+    r = await req('GET', '/api/bootstrap');
+    check('bootstrap has 27 services (12 original + 15 new)', r.json?.services?.length === 27, `got ${r.json?.services?.length}`);
+    const svc = (code) => r.json.services.find((s) => s.code === code);
+    check('catheter_insert 400 high-risk', svc('catheter_insert')?.price_egp === 400 && svc('catheter_insert')?.riskLevel === 'high', JSON.stringify(svc('catheter_insert')));
+    check('catheter_remove 300 high-risk', svc('catheter_remove')?.price_egp === 300 && svc('catheter_remove')?.riskLevel === 'high');
+    check('catheter_flush 300 high-risk', svc('catheter_flush')?.price_egp === 300 && svc('catheter_flush')?.riskLevel === 'high');
+    check('ryle_insert 400 high-risk', svc('ryle_insert')?.price_egp === 400 && svc('ryle_insert')?.riskLevel === 'high');
+    check('drain_removal 300 high-risk (owner-set)', svc('drain_removal')?.price_egp === 300 && svc('drain_removal')?.riskLevel === 'high');
+    check('trach_care 400 high-risk', svc('trach_care')?.price_egp === 400 && svc('trach_care')?.riskLevel === 'high');
+    check('iv_infusion 400 high-risk', svc('iv_infusion')?.price_egp === 400 && svc('iv_infusion')?.riskLevel === 'high');
+    check('cannula_iv 350 now high-risk', svc('cannula_iv')?.price_egp === 350 && svc('cannula_iv')?.riskLevel === 'high');
+    check('suture_removal 250 standard + requiresDoctorOrder', svc('suture_removal')?.price_egp === 250 && svc('suture_removal')?.riskLevel === 'standard' && svc('suture_removal')?.requiresDoctorOrder === true);
+    check('standard new services priced', svc('blood_draw')?.price_egp === 200 && svc('injection')?.price_egp === 150 && svc('vitals_check')?.price_egp === 150 && svc('stoma_care')?.price_egp === 300);
+    check('cvp_dressing 300 high-risk (owner-set 26 Nov)', svc('cvp_dressing')?.price_egp === 300 && svc('cvp_dressing')?.riskLevel === 'high' && svc('cvp_dressing')?.requiresDoctorOrder === true);
+    check('elderly shift mobile 400 / bedridden 500 (owner-set minimums)', svc('elderly_shift_mobile')?.price_egp === 400 && svc('elderly_shift_mobile')?.riskLevel === 'standard' && svc('elderly_shift_bedridden')?.price_egp === 500 && svc('elderly_shift_bedridden')?.riskLevel === 'standard');
+    check('generic 12h shift still 500 (untouched)', svc('shift12')?.price_egp === 500);
+    check('bootstrap highRiskServices has 10 incl npwt + cannula_iv + cvp', Array.isArray(r.json?.highRiskServices) && r.json.highRiskServices.length === 10 && r.json.highRiskServices.includes('npwt') && r.json.highRiskServices.includes('cannula_iv') && r.json.highRiskServices.includes('cvp_dressing'), JSON.stringify(r.json?.highRiskServices));
+    check('bootstrap highRiskChecklist has 4 items', Array.isArray(r.json?.highRiskChecklist) && r.json.highRiskChecklist.length === 4 && r.json.highRiskChecklist.includes('sterileTechnique'), JSON.stringify(r.json?.highRiskChecklist));
+    check('bootstrap otp/push/persistence flags (all off in test)', r.json?.otp?.smsConfigured === false && r.json?.otp?.whatsappConfigured === false && r.json?.push?.fcmConfigured === false && r.json?.persistence === 'file', JSON.stringify({ otp: r.json?.otp, push: r.json?.push, persistence: r.json?.persistence }));
+    // --- 18b. doctor-order gate + high-risk accept + checklist --------
+    const order = { doctorName: 'Dr. Ahmed', orderNumber: 'ORD-123' };
+    const bookSvc = async (serviceCode, extra = {}) => req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Risk Test', serviceCode, paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] }, ...extra,
+    } });
+    r = await bookSvc('suture_removal');
+    check('suture removal without doctor order -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await bookSvc('suture_removal', { doctorOrder: order });
+    check('suture removal with order -> 201, 250 EGP', r.status === 201 && r.json?.amountEgp === 250 && r.json?.doctorOrder?.doctorName === 'Dr. Ahmed', JSON.stringify(r.json));
+    const bkSuture = r.json?.id;
+    r = await bookSvc('catheter_insert');
+    check('catheter insertion without doctor order -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await bookSvc('catheter_insert', { doctorOrder: order });
+    check('catheter insertion with order -> 201, 400 EGP', r.status === 201 && r.json?.amountEgp === 400, JSON.stringify(r.json));
+    const bkCath = r.json?.id;
+    // Register a nursing ASSISTANT, pass the interview, then prove the
+    // high-risk gates: radar hides it, accept refuses it (role gate fires
+    // before the verified-status gate).
+    const asstPhone = '01044444444';
+    const asstOtpReq = await req('POST', '/api/otp/request', { body: { phone: asstPhone, channel: 'whatsapp' } });
+    check('assistant otp request 200', asstOtpReq.status === 200, JSON.stringify(asstOtpReq.json));
+    // The mock code is logged to the server console; stdout delivery to
+    // this process is async, so poll briefly until the line appears
+    // (matching immediately after the request can race the log flush).
+    let am = null;
+    for (let i = 0; i < 20 && !am; i++) {
+      am = out.match(/\[MOCK OTP\] channel=whatsapp phone=01044444444 code=(\d{6})/);
+      if (!am) await sleep(100);
+    }
+    const al = await req('POST', '/api/otp/verify', { body: { phone: asstPhone, code: am ? am[1] : '000000' } });
+    check('assistant otp verify 200', al.status === 200 && !!al.json?.accessToken, JSON.stringify(al.json)?.slice(0, 150));
+    const asstToken = al.json?.accessToken;
+    r = await req('POST', '/api/providers/register', { token: asstToken, body: { ...TERMS,
+      name: 'Test Assistant', role: 'assistant', nationalId: '12345678901234', licenseNo: 'LIC-ASST1',
+    } });
+    check('assistant registered', r.status === 201 && r.json?.role === 'assistant', JSON.stringify(r.json));
+    // The OTP token was issued BEFORE registration (role=patient), so
+    // re-login as provider to get a provider-role token for the interview.
+    r = await req('POST', '/api/auth/login-phone', { body: { phone: asstPhone, role: 'provider' } });
+    check('assistant re-login as provider -> 200', r.status === 200 && r.json?.role === 'provider' && !!r.json?.accessToken, JSON.stringify(r.json)?.slice(0, 200));
+    const asstProvToken = r.json?.accessToken;
+    r = await req('POST', '/api/providers/interview/start', { token: asstProvToken });
+    const aAtt = r.json?.attemptId;
+    const aRight = {};
+    for (const q of r.json.questions) aRight[q.id] = CORRECT[q.id];
+    const aEn = {};
+    for (const q of r.json.englishCheck.questions) aEn[q.id] = EN_CORRECT[q.id];
+    r = await req('POST', '/api/providers/interview/submit', { token: asstProvToken, body: { attemptId: aAtt, answers: aRight, englishAnswers: aEn } });
+    check('assistant passes interview 20/20', r.status === 200 && r.json?.result === 'passed', JSON.stringify(r.json));
+    r = await req('GET', '/api/providers/radar', { token: asstProvToken });
+    const radarCodes = (r.json?.pending || []).map((b) => b.serviceCode);
+    check('assistant radar hides high-risk, shows standard', r.status === 200 && !radarCodes.includes('catheter_insert') && radarCodes.includes('standard'), JSON.stringify(radarCodes));
+    r = await req('POST', `/api/bookings/${bkCath}/accept`, { token: asstProvToken });
+    check('assistant cannot accept high-risk -> 403 nurse-only', r.status === 403 && JSON.stringify(r.json).includes('Nursing assistants cannot'), JSON.stringify(r.json));
+    r = await req('POST', `/api/bookings/${bkCath}/accept`, { token: provToken });
+    check('verified nurse accepts high-risk -> 200, 15%', r.status === 200 && r.json?.status === 'accepted' && r.json?.commissionPct === 15, JSON.stringify(r.json));
+    r = await req('POST', `/api/bookings/${bkSuture}/accept`, { token: provToken });
+    check('verified nurse accepts suture removal -> 200', r.status === 200 && r.json?.status === 'accepted', JSON.stringify(r.json));
+    const vitalsBody = { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 };
+    r = await req('POST', `/api/bookings/${bkSuture}/vitals`, { token: provToken, body: vitalsBody });
+    check('suture vitals recorded', r.status === 200, JSON.stringify(r.json));
+    r = await req('POST', `/api/bookings/${bkSuture}/complete-provider`, { token: provToken });
+    check('suture complete without doctorOrderSeen -> 409', r.status === 409, JSON.stringify(r.json));
+    r = await req('POST', `/api/bookings/${bkSuture}/complete-provider`, { token: provToken, body: { doctorOrderSeen: true } });
+    check('suture complete with doctorOrderSeen -> 200', r.status === 200 && r.json?.status === 'provider_confirmed', JSON.stringify(r.json));
+    r = await req('POST', `/api/bookings/${bkCath}/vitals`, { token: provToken, body: vitalsBody });
+    check('catheter vitals recorded', r.status === 200, JSON.stringify(r.json));
+    r = await req('POST', `/api/bookings/${bkCath}/complete-provider`, { token: provToken });
+    check('high-risk complete without checklist -> 409 listing missing', r.status === 409 && Array.isArray(r.json?.missing) && r.json.missing.length === 4, JSON.stringify(r.json));
+    r = await req('POST', `/api/bookings/${bkCath}/complete-provider`, { token: provToken, body: { safetyChecklist: { orderSeen: true, sterileTechnique: true, identityConfirmed: true, complicationCheck: true } } });
+    check('high-risk complete with full checklist -> 200', r.status === 200 && r.json?.status === 'provider_confirmed' && !!r.json?.safetyChecklist, JSON.stringify(r.json));
+    // --- 18c. NPWT booking endpoint ------------------------------------
+    const npwtBody = { ...TERMS, patientName: 'NPWT Test', paymentMethod: 'cash_receipt',
+      days: 14, kitPrice: 300, distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] } };
+    r = await req('POST', '/api/npwt/bookings', { token: patientToken2, body: npwtBody });
+    check('NPWT booking without order/checklist -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/npwt/bookings', { token: patientToken2, body: { ...npwtBody, doctorOrder: order } });
+    check('NPWT booking without checklist -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/npwt/bookings', { token: patientToken2, body: { ...npwtBody, doctorOrder: order,
+      safetyChecklist: { foamCountConfirmed: true, bleedingChecked: true, canisterChecked: true, woundPhotoConfirmed: true } } });
+    check('NPWT booking complete -> 201, 5500 EGP, kind npwt', r.status === 201 && r.json?.amountEgp === 5500 && r.json?.kind === 'npwt' && r.json?.serviceCode === 'npwt', JSON.stringify(r.json));
+    const bkNpwt = r.json?.id;
+    r = await req('POST', `/api/bookings/${bkNpwt}/accept`, { token: provToken });
+    check('verified nurse accepts NPWT -> 200', r.status === 200 && r.json?.status === 'accepted', JSON.stringify(r.json));
+    await req('POST', `/api/bookings/${bkNpwt}/vitals`, { token: provToken, body: vitalsBody });
+    r = await req('POST', `/api/bookings/${bkNpwt}/complete-provider`, { token: provToken, body: { safetyChecklist: { orderSeen: true, sterileTechnique: true, identityConfirmed: true, complicationCheck: true } } });
+    check('NPWT complete with checklist -> 200', r.status === 200 && r.json?.status === 'provider_confirmed', JSON.stringify(r.json));
+    // --- 18d. doctors directory + referral ------------------------------
+    r = await req('GET', '/api/admin/doctors', { token: adminToken });
+    check('doctors directory starts EMPTY (no fake doctors)', r.status === 200 && r.json?.count === 0 && Array.isArray(r.json?.doctors), JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/doctors', { token: adminToken, body: { name: 'Dr. Test', specialty: 'جراحة عامة', phone: '123' } });
+    check('doctor with bad phone -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/doctors', { token: adminToken, body: { name: 'Dr. Test', specialty: 'جراحة عامة', phone: '01011112222', clinic: 'عيادة القصير', workingHours: '9-5' } });
+    check('admin adds doctor -> 201 with phone', r.status === 201 && !!r.json?.id && r.json?.phone === '01011112222', JSON.stringify(r.json));
+    const docId = r.json?.id;
+    r = await req('GET', '/api/providers/doctors', { token: provToken });
+    check('provider sees doctor WITH phone', r.status === 200 && r.json?.count === 1 && r.json?.doctors?.[0]?.phone === '01011112222', JSON.stringify(r.json));
+    r = await req('GET', '/api/providers/doctors?specialty=جراحة', { token: provToken });
+    check('provider specialty filter matches', r.status === 200 && r.json?.count === 1, JSON.stringify(r.json));
+    r = await req('GET', '/api/providers/doctors?specialty=قلب', { token: provToken });
+    check('provider specialty filter excludes', r.status === 200 && r.json?.count === 0, JSON.stringify(r.json));
+    r = await req('GET', '/api/providers/doctors', { token: patientToken2 });
+    check('patient CANNOT list doctors -> 403', r.status === 403, JSON.stringify(r.json));
+    r = await req('POST', `/api/bookings/${bkCath}/refer-doctor`, { token: provToken, body: { doctorId: docId, note: 'Needs surgical review.' } });
+    check('provider refers booking to doctor -> 201', r.status === 201 && r.json?.referral?.doctorName === 'Dr. Test' && r.json?.referral?.phone === '01011112222', JSON.stringify(r.json));
+    r = await req('GET', `/api/bookings/${bkCath}`, { token: patientToken2 });
+    check('patient sees referral but NOT the doctor phone (anti-leakage)', r.status === 200 && Array.isArray(r.json?.referrals) && r.json.referrals.length === 1 && JSON.stringify(r.json).indexOf('01011112222') === -1, JSON.stringify(r.json?.referrals));
+    r = await req('GET', '/api/admin/dashboard', { token: adminToken });
+    check('admin dashboard includes doctors + doctorsCount 1', r.status === 200 && r.json?.doctorsCount === 1 && Array.isArray(r.json?.doctors), JSON.stringify(r.json?.doctorsCount));
+    r = await req('PUT', `/api/admin/doctors/${docId}`, { token: adminToken, body: { workingHours: '10-6' } });
+    check('admin updates doctor hours -> 200', r.status === 200 && r.json?.workingHours === '10-6', JSON.stringify(r.json));
+    r = await req('DELETE', `/api/admin/doctors/${docId}`, { token: adminToken });
+    check('admin deletes doctor -> 200', r.status === 200 && r.json?.deletedId === docId, JSON.stringify(r.json));
+    r = await req('GET', '/api/admin/doctors', { token: adminToken });
+    check('directory empty again after delete', r.status === 200 && r.json?.count === 0, JSON.stringify(r.json));
+    // --- 18e. notifications: devices, en-route, review reminder --------
+    r = await req('POST', '/api/me/devices', { token: patientToken2, body: { fcmToken: 'short' } });
+    check('device token too short -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/me/devices', { token: patientToken2, body: { fcmToken: 'fcm-test-token-aaaaaaaaaa', platform: 'android' } });
+    check('device registered -> devices 1', r.status === 200 && r.json?.devices === 1, JSON.stringify(r.json));
+    r = await req('POST', '/api/me/devices', { token: patientToken2, body: { fcmToken: 'fcm-test-token-aaaaaaaaaa', platform: 'android' } });
+    check('same device token deduped -> still 1', r.status === 200 && r.json?.devices === 1, JSON.stringify(r.json));
+    r = await req('POST', '/api/me/devices', { token: patientToken2, body: { fcmToken: 'fcm-test-token-bbbbbbbbbb', platform: 'android' } });
+    check('second device -> 2', r.status === 200 && r.json?.devices === 2, JSON.stringify(r.json));
+    r = await req('DELETE', '/api/me/devices', { token: patientToken2, body: { fcmToken: 'fcm-test-token-aaaaaaaaaa' } });
+    check('device unregistered -> removed 1', r.status === 200 && r.json?.removed === 1, JSON.stringify(r.json));
+    r = await req('GET', '/api/me/notifications', { token: patientToken2 });
+    check('notifications list readable (in-app centre works with no FCM)', r.status === 200 && Array.isArray(r.json?.notifications) && typeof r.json?.unreadCount === 'number', JSON.stringify(r.json)?.slice(0, 200));
+    // En-route: fresh standard booking, accept, en-route.
+    r = await bookSvc('standard');
+    const bkRoute = r.json?.id;
+    await req('POST', `/api/bookings/${bkRoute}/accept`, { token: provToken });
+    r = await req('POST', `/api/bookings/${bkRoute}/en-route`, { token: provToken });
+    check('en-route -> 200 with enRouteAt, status still accepted', r.status === 200 && !!r.json?.enRouteAt && r.json?.status === 'accepted', JSON.stringify(r.json));
+    r = await req('GET', '/api/me/notifications', { token: patientToken2 });
+    const enRouteNotif = (r.json?.notifications || []).find((n) => n.type === 'provider_en_route');
+    check('patient got provider_en_route notification (unread)', !!enRouteNotif && !enRouteNotif.readAt, JSON.stringify(enRouteNotif));
+    r = await req('POST', `/api/me/notifications/${enRouteNotif.id}/read`, { token: patientToken2 });
+    check('mark one notification read -> 200', r.status === 200 && !!r.json?.notification?.readAt, JSON.stringify(r.json));
+    r = await req('POST', '/api/me/notifications/read-all', { token: patientToken2 });
+    check('mark all read -> readCount > 0', r.status === 200 && r.json?.readCount > 0, JSON.stringify(r.json));
+    r = await req('GET', '/api/me/notifications', { token: patientToken2 });
+    check('unreadCount 0 after read-all', r.json?.unreadCount === 0, JSON.stringify(r.json?.unreadCount));
+    // Review reminder: confirm a visit, sweep IMMEDIATELY (auto-release
+    // is 1000 ms in this test, reminder threshold is max(0, 1000-10min)=0,
+    // so the reminder fires on this sweep while the release does not).
+    r = await bookSvc('standard');
+    const bkRem = r.json?.id;
+    await req('POST', `/api/bookings/${bkRem}/accept`, { token: provToken });
+    await req('POST', `/api/bookings/${bkRem}/vitals`, { token: provToken, body: vitalsBody });
+    await req('POST', `/api/bookings/${bkRem}/complete-provider`, { token: provToken });
+    await req('POST', `/api/bookings/${bkRem}/confirm-patient`, { token: patientToken2 });
+    r = await req('POST', '/api/jobs/sweep', { token: adminToken });
+    check('sweep runs (reminder pass included)', r.status === 200 && typeof r.json?.notificationsSent === 'number', JSON.stringify(r.json));
+    r = await req('GET', '/api/me/notifications', { token: patientToken2 });
+    const remNotif = (r.json?.notifications || []).find((n) => n.type === 'review_reminder' && n.data?.bookingId === bkRem);
+    check('patient got review_reminder for the confirmed visit', !!remNotif, JSON.stringify((r.json?.notifications || []).map((n) => n.type)));
+    r = await req('POST', `/api/bookings/${bkRem}/review`, { token: patientToken2, body: { rating: 5, comment: 'Reviewed after reminder.' } });
+    check('review after reminder releases the visit', r.status === 200 && r.json?.status === 'released', JSON.stringify(r.json));
+    // --- 18f. admin persistence endpoint --------------------------------
+    r = await req('GET', '/api/admin/persistence', { token: adminToken });
+    check('persistence endpoint: file store, postgres off in test', r.status === 200 && r.json?.persistence === 'file' && r.json?.postgresConfigured === false, JSON.stringify(r.json));
 
     // --- 14. logout / refresh revocation ---------------------------------
     console.log('\n[logout]');
