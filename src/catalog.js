@@ -37,11 +37,34 @@ const TOURIST_URGENT_EXTRA = { usd: 20, eur: 15 };
 const EXTRA_LANGUAGE_BONUS = { usd: 15, eur: 15 };
 
 // Commission: provider keeps the total, app takes % only.
+// REVERSED (owner decision 26 Nov 2026 — "da awwal iqtirah ba'akkidlak
+// 'aleih"): the more a provider develops, the LOWER their commission.
+// Starter 15% / Pro 12% / Elite 8%. The old model (8/12/15) is abolished,
+// and so is the fixed Elite monthly bonus of 1,200 EGP — replaced by the
+// monthly volume bonus below (cash, paid with the Thursday settlement).
 const TIERS = {
-  Starter: { commission_pct: 8, monthly_bonus_egp: 0 },
+  Starter: { commission_pct: 15, monthly_bonus_egp: 0 },
   Pro: { commission_pct: 12, monthly_bonus_egp: 0 },
-  Elite: { commission_pct: 15, monthly_bonus_egp: 1200 },
+  Elite: { commission_pct: 8, monthly_bonus_egp: 0 },
 };
+
+// Monthly volume bonus (cash, from the app, paid with the Thursday
+// settlement). Highest tier reached ONLY — never cumulative.
+// Titles: 30 = "محترف موثّق", 60 = "الممرض الذهبي", 100 = "النجم المميز".
+const VOLUME_BONUS_TIERS = [
+  { minCases: 30, bonusEgp: 500, title: 'محترف موثّق', titleEn: 'Verified Professional' },
+  { minCases: 60, bonusEgp: 1000, title: 'الممرض الذهبي', titleEn: 'Golden Nurse' },
+  { minCases: 100, bonusEgp: 1500, title: 'النجم المميز', titleEn: 'Star Performer' },
+];
+
+// Patient loyalty vouchers (owner decision 26 Nov 2026): after every 4
+// completed PAID visits, the patient auto-receives a 50 EGP voucher for
+// the next visit. The app funds it in full — the provider's share is
+// always computed on the FULL pre-discount price.
+const VOUCHER_AMOUNT_EGP = 50;
+const VOUCHER_MIN_BOOKING_EGP = 300;
+const VOUCHER_VALID_DAYS = 60;
+const VOUCHER_EVERY_N_VISITS = 4;
 
 // ---------------------------------------------------------------- distance fee
 // El Quseir bands (EGP), per SPEC §4. distance_km is a client-supplied
@@ -274,7 +297,7 @@ const TERMS_AR = `الشروط والأحكام — شفاء كير (الإصد�
 - طرق الدفع الحالية: كاش بإيصال عند الزيارة، أو InstaPay. الحساب البنكي والبوابات الإلكترونية قادمة لاحقًا.
 - رسوم المسافة: 0–6 كم بدون إضافة، 6–10 كم +100 جنيه، 10–20 كم +200، 20–35 كم +350، عند 35 كم +500، وأكثر من 35 كم تعاقد خاص فقط. إن وفّر العميل مواصلة ذهاب وعودة لمقدم الخدمة فلا رسم مسافة.
 - التسوية الأسبوعية كل يوم خميس: يُعرض دفتر حساب يوضح ما للتطبيق وما لمقدم الخدمة، وحتى لو تحصّل مقدم الخدمة كاش بيده يظهر عليه ما للتطبيق ويدفعه في التسوية.
-- عمولة التطبيق: يأخذ مقدم الخدمة الإجمالي، والتطبيق يأخذ نسبته فقط: Starter 8%، Pro 12%، Elite 15%. مكافأة Elite الشهرية (1,200 جنيه) ونسب العمولات تفاصيل داخلية لا تظهر في إعلانات المرضى.
+- عمولة التطبيق: يأخذ مقدم الخدمة الإجمالي، والتطبيق يأخذ نسبته فقط: Starter 15%، Pro 12%، Elite 8% (معكوسة: كلما تطوّر مقدم الخدمة قلّت عمولته) + بونص حجم شهري نقدي: 500 جنيه عند 30 حالة مكتملة، 1,000 جنيه عند 60 حالة، 1,500 جنيه عند 100 حالة (أعلى شريحة فقط، وليست تراكمية)، يُصرف مع التسوية الأسبوعية. وفي شهور العروض الترويجية (بحد أقصى شهرين في السنة، تُعلن مسبقًا) قد تُخفَّض العمولة أو تُلغى تمامًا (0%)، ويتوقف البونص النقدي مؤقتًا في شهور العمولة صفر بينما تستمر الألقاب. وقسائم ولاء المرضى: بعد كل 4 زيارات مكتملة مدفوعة يحصل المريض تلقائيًا على قسيمة خصم 50 جنيهًا لزيارته التالية (صالحة 60 يومًا، لحد أدنى للحجز 300 جنيه، قسيمة واحدة لكل حجز)، يموّلها التطبيق بالكامل، ويأخذ مقدم الخدمة سعره كاملًا (العمولة تُحسب على السعر الكامل قبل الخصم). نسب العمولات والبونص تفاصيل داخلية لا تظهر في إعلانات المرضى.
 
 5) ميثاق الاحترام
 - يعامل كل طرف الآخر باحترام كامل: لا إهانة لفظية أو تحرش أو تهديد، والالتزام بموعد الزيارة وتجهيز المكان.
@@ -317,7 +340,7 @@ const TERMS_EN = `Terms & Conditions — Shifa Care (Version 1.0, 25 November 20
 1) Shifa Care is an independent home-nursing platform in El Quseir, Red Sea, connecting patients with verified providers (nurse, nursing assistant, doctor). It is not a hospital or clinic. In any emergency call the ambulance on 123 immediately.
 2) Register with a real Egyptian phone number and true data. Forged documents mean a permanent ban. Your professional category is set from your certificates with human review.
 3) No circumvention: all bookings, payments and communication happen inside the app only. Exchanging personal phone numbers, agreeing visits or prices outside the app, or taking cash outside the app is forbidden. In-app chat closes 24 hours after the visit; messages containing phone numbers are rejected automatically.
-4) Fixed published prices, no bargaining. Payment is held in escrow and released to the provider only after completion, patient confirmation and review (or one hour after confirmation with no review and no complaint), and stays held for the 24-hour complaint window before final payout. Weekly settlement every Thursday. App commission: Starter 8%, Pro 12%, Elite 15%.
+4) Fixed published prices, no bargaining. Payment is held in escrow and released to the provider only after completion, patient confirmation and review (or one hour after confirmation with no review and no complaint), and stays held for the 24-hour complaint window before final payout. Weekly settlement every Thursday. App commission (reversed: the more a provider develops, the lower their commission): Starter 15%, Pro 12%, Elite 8% + monthly volume bonus: 500 EGP at 30 completed cases, 1,000 EGP at 60, 1,500 EGP at 100 (highest tier only), paid with the Thursday settlement. In promo months (max 2 per year, announced in advance) the commission may be reduced or set to 0%; cash volume bonuses pause in 0%-commission months while titles continue. Patient loyalty vouchers: after every 4 completed paid visits the patient automatically receives a 50 EGP voucher for the next visit (valid 60 days, minimum booking 300 EGP, one voucher per booking), fully funded by the app; the provider's share is always computed on the full pre-discount price.
 5) Respect Charter: full respect both ways, no abuse or threats, keep appointments. Violations mean a warning, then suspension.
 6) Cancellation only within 15 minutes of booking creation (full refund). Complaint window: 24 hours after completion; an accepted complaint is refunded in full.
 7) Safety and privacy: never photograph or share patient data outside the app. Infection control and vital-signs documentation are mandatory. In emergencies call 123. SOS button alerts admin during dangerous visits.
@@ -336,7 +359,9 @@ const DANGER_SIGNS = [
 
 module.exports = {
   SERVICES, TOURIST_SERVICES, TOURIST_URGENT_EXTRA, EXTRA_LANGUAGE_BONUS,
-  TIERS, HOTELS, MCQ, ENGLISH_CHECK, DANGER_SIGNS,
+  TIERS, VOLUME_BONUS_TIERS, VOUCHER_AMOUNT_EGP, VOUCHER_MIN_BOOKING_EGP,
+  VOUCHER_VALID_DAYS, VOUCHER_EVERY_N_VISITS,
+  HOTELS, MCQ, ENGLISH_CHECK, DANGER_SIGNS,
   TERMS_VERSION, TERMS_UPDATED_AT, TERMS_AR, TERMS_EN,
   distanceFee, servicePriceEgp,
 };

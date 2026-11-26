@@ -56,6 +56,11 @@ function seed() {
     // and circumvention reports from patient reviews / admin flags.
     messages: {},
     circumventionReports: [],
+    // v2.0.9 — reversed commissions + volume bonus + promo months +
+    // patient loyalty vouchers (owner decision 26 Nov 2026).
+    vouchers: [], // {id, patientPhone, amountEgp, issuedAt, expiresAt, minBookingEgp, status, sourceBookingId, usedBookingId, usedAt}
+    promo: null, // {commissionPct, until, setAt, setBy} — live admin override; null = tier rates
+    promoMonths: {}, // 'YYYY-MM' -> true — promo months used (max 2 per calendar year)
     adminPin: {
       // No PIN configured => hash a random value so NO pin can ever match.
       // Admin login is disabled until ADMIN_PIN is set and the service restarts.
@@ -84,6 +89,9 @@ class Store {
         // on load so an older data.json never breaks the new routes.
         if (!this.data.messages) this.data.messages = {};
         if (!this.data.circumventionReports) this.data.circumventionReports = [];
+        if (!this.data.vouchers) this.data.vouchers = [];
+        if (!this.data.promoMonths) this.data.promoMonths = {};
+        if (!('promo' in this.data)) this.data.promo = null;
         this.syncAdminPinFromEnv();
         return;
       }
@@ -150,6 +158,7 @@ class Store {
     };
     if (opts.admin || opts.self) out.phone = p.phone;
     if (opts.admin) out.warnings = p.warnings || [];
+    if (opts.admin) out.volumeBonus = p.volumeBonus || null; // v2.0.9 snapshot (wallet recomputes live)
     return out;
   }
   // v2.0.8 — minimal radar item. The radar shows ONLY what a provider

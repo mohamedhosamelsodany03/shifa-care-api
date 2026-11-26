@@ -77,7 +77,9 @@ Health check: `GET /health`.
 | `POST /bookings/:id/accept` | Locks commission % at accept time. |
 | `POST /bookings/:id/vitals` | BP, pulse, glucose, oxygen, temp — all mandatory before completion. |
 | `POST /bookings/:id/complete-provider` | Provider confirms before leaving. |
-| `GET /providers/wallet` | Per-booking ledger (app share vs provider share), next-Thursday settlement, cash-collected debt entries. |
+| `GET /providers/wallet` | Per-booking ledger (app share vs provider share), next-Thursday settlement, cash-collected debt entries. Monthly volume bonus (500/1,000/1,500 EGP at 30/60/100 completed cases) + active promo. |
+| `GET /me/vouchers` | Patient loyalty vouchers: 50 EGP after every 4 completed paid visits (60 days, min booking 300 EGP, one per booking), auto-applied at booking. |
+| `POST /admin/promo` | Promo months (admin PIN): set/clear the live commission override (0–100%, null clears). Max 2 promo months per calendar year; 0% pauses the cash volume bonus (titles continue). |
 | `POST /jobs/sweep` | Admin. Auto-releases patient-confirmed bookings after 1 h with no review/complaint; flags visits open >120 min. Also runs on a 5-min in-process interval. |
 | `GET /hotels`, `GET /hotels/:id` | All 30 Quseir hotels. `contracted` only for Mövenpick + Swissôtel (ex Radisson Blu). |
 | `POST /tourist-bookings` | USD/EUR pricing, urgent surcharge, hotel distance, language bonus (+$15/€15, only if the assigned provider is certified in that language). |
@@ -85,7 +87,7 @@ Health check: `GET /health`.
 | `POST /npwt/calculate` | Rental 750/week or 1000/15 d, visit 600, kit 250–350, 5 dressings/14 d; canister separate only when full; written doctor order required. |
 | `POST /postop` | Post-operative care plan booking (1,400 EGP + distance). |
 | `POST /admin/pin/verify` | bcrypt-hashed PIN (env `ADMIN_PIN` — set a strong 6-digit PIN in the host dashboard; no default is seeded), 5 attempts then 15-min lock, audit-logged, 30-min admin JWT. |
-| `GET /admin/providers`, `POST /admin/providers/:id/tier`, `POST /admin/providers/:id/verify` | Tier Starter 8% / Pro 12% / Elite 15%. |
+| `GET /admin/providers`, `POST /admin/providers/:id/tier`, `POST /admin/providers/:id/verify` | Tier Starter 15% / Pro 12% / Elite 8% (reversed: the more a provider develops, the lower their commission). |
 | `GET /admin/sos`, `GET /admin/audit` | SOS + overdue visits + safety reports; audit log. |
 | `GET /admin/mock-otp` | Dev only, gated by `MOCK_OTP=true` (default OFF in production). |
 
@@ -99,7 +101,7 @@ held → accepted → provider_confirmed → patient_confirmed → reviewed → 
 Provider confirm and patient confirm are separate endpoints. A review
 releases the held amount at once; otherwise the sweep auto-releases after
 exactly 1 hour. Commission: provider keeps the total, the app takes only
-its % (Starter 8% / Pro 12% / Elite 15%), computed server-side.
+its % (Starter 15% / Pro 12% / Elite 8% — reversed), computed server-side.
 
 ## Distance fee (El Quseir, server-side)
 

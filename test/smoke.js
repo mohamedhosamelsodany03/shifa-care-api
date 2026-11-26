@@ -42,7 +42,7 @@ async function main() {
     ...process.env, PORT: String(PORT), NODE_ENV: 'test',
     DATA_FILE, MOCK_OTP: 'true', JWT_SECRET: 'smoke-test-secret', ADMIN_PIN: TEST_ADMIN_PIN,
     AUTO_RELEASE_MS: '1000', // shorten the 1h auto-release window for the test only
-    BOOKING_LIMIT_MAX: '500', // v2.0.8: one run now makes >60 booking-route calls
+    BOOKING_LIMIT_MAX: '1000', // v2.0.9: volume-bonus cycles make ~200 booking-route calls
     CANCEL_WINDOW_MS: '5000', // shorten the 15-min cancel window for the test only
   };
   const child = spawn('node', [path.join(__dirname, '..', 'server.js')], { env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -222,7 +222,7 @@ async function main() {
     // Provider 1 (passed) accepts.
     r = await req('POST', `/api/bookings/${bkId}/accept`, { token: provToken });
     check('provider accepts -> accepted, payment number now shown', r.status === 200 && r.json?.status === 'accepted' && JSON.stringify(r.json).indexOf('01008629060') !== -1, JSON.stringify(r.json));
-    check('commission locked at accept (Starter 8%)', r.json?.commissionPct === 8);
+    check('commission locked at accept (Starter 15% — reversed rates, v2.0.9)', r.json?.commissionPct === 15);
     // Another patient cannot see it.
     const other = await req('POST', '/api/otp/request', { body: { phone: '01099999999', channel: 'sms' } });
     const mm = out.match(/\[MOCK OTP\] channel=sms phone=01099999999 code=(\d{6})/);
@@ -245,19 +245,19 @@ async function main() {
     r = await req('POST', `/api/bookings/${bkId}/confirm-patient`, { token: patientToken2 });
     check('patient confirms -> patient_confirmed', r.status === 200 && r.json?.status === 'patient_confirmed', JSON.stringify(r.json));
     r = await req('POST', `/api/bookings/${bkId}/review`, { token: patientToken2, body: { rating: 5, comment: 'Great, professional nurse.' } });
-    check('review -> released, app 8% of 375 = 30, provider 345', r.status === 200 && r.json?.status === 'released' && r.json?.appShareEgp === 30 && r.json?.providerShareEgp === 345, JSON.stringify(r.json));
+    check('review -> released, app 15% of 375 = 56, provider 319', r.status === 200 && r.json?.status === 'released' && r.json?.appShareEgp === 56 && r.json?.providerShareEgp === 319, JSON.stringify(r.json));
     // Wallet ledger reflects it.
     r = await req('GET', '/api/providers/wallet', { token: provToken });
     const entry = r.json?.ledger?.find((l) => l.bookingId === bkId);
     // v2.0.1: released but inside the 24h complaint window -> held, not settleable yet.
-    check('wallet ledger: released amount held for complaint window (345)', r.status === 200 && entry?.direction === 'complaint_hold' && entry?.amountEgp === 345 && r.json?.totals?.complaintHoldEgp === 345, JSON.stringify(r.json?.totals));
+    check('wallet ledger: released amount held for complaint window (319)', r.status === 200 && entry?.direction === 'complaint_hold' && entry?.amountEgp === 319 && r.json?.totals?.complaintHoldEgp === 319, JSON.stringify(r.json?.totals));
     check('wallet has next Thursday settlement', !!r.json?.nextSettlementThursday);
     // Cash-collected creates a debt entry.
     r = await req('POST', `/api/bookings/${bkId}/cash-collected`, { token: provToken });
     check('cash-collected marks booking', r.status === 200 && r.json?.cashCollectedByProvider === true, JSON.stringify(r.json));
     r = await req('GET', '/api/providers/wallet', { token: provToken });
     const entry2 = r.json?.ledger?.find((l) => l.bookingId === bkId);
-    check('wallet after cash: app share held for complaint window (30)', entry2?.direction === 'complaint_hold' && entry2?.amountEgp === 30, JSON.stringify(entry2));
+    check('wallet after cash: app share held for complaint window (56)', entry2?.direction === 'complaint_hold' && entry2?.amountEgp === 56, JSON.stringify(entry2));
 
     // --- 8. auto-release sweep ------------------------------------------
     console.log('\n[auto-release]');
@@ -383,7 +383,7 @@ async function main() {
     check('admin rejects complaint -> booking complaintStatus rejected', r.status === 200 && r.json?.booking?.complaintStatus === 'rejected', JSON.stringify(r.json));
     r = await req('GET', `/api/providers/wallet`, { token: provToken });
     const entry3 = r.json?.ledger?.find((l) => l.bookingId === bkId);
-    check('after rejection: provider owes app 30 (cash, now settleable)', entry3?.direction === 'provider_owes_app' && entry3?.amountEgp === 30, JSON.stringify(entry3));
+    check('after rejection: provider owes app 56 (cash, now settleable)', entry3?.direction === 'provider_owes_app' && entry3?.amountEgp === 56, JSON.stringify(entry3));
     // Refund path: complaint on the auto-released booking, admin accepts.
     r = await req('POST', `/api/bookings/${bk2}/safety-report`, { token: patientToken2, body: { type: 'complaint', description: 'Service was not satisfactory, request refund.' } });
     check('complaint on auto-released booking -> 201', r.status === 201, JSON.stringify(r.json));
@@ -489,7 +489,7 @@ async function main() {
     r = await req('POST', '/api/admin/providers/prov_demo_starter/warn', { token: adminToken, body: { reason: 'Test warning: asked a patient to deal outside the app.' } });
     check('admin warn -> 200, warningCount 1', r.status === 200 && r.json?.warningCount === 1, JSON.stringify(r.json));
     r = await req('GET', '/api/providers/wallet', { token: provToken });
-    check('provider wallet shows the warning + tier/commission/next Thursday', r.status === 200 && Array.isArray(r.json?.warnings) && r.json.warnings.length === 1 && r.json?.commissionPct === 8 && !!r.json?.nextSettlementThursday, JSON.stringify(r.json)?.slice(0, 300));
+    check('provider wallet shows the warning + tier/commission/next Thursday', r.status === 200 && Array.isArray(r.json?.warnings) && r.json.warnings.length === 1 && r.json?.commissionPct === 15 && !!r.json?.nextSettlementThursday, JSON.stringify(r.json)?.slice(0, 300));
     r = await req('POST', '/api/admin/providers/prov_demo_starter/suspend', { token: adminToken, body: { reason: 'Test suspension.' } });
     check('admin suspend -> 200, suspended true', r.status === 200 && r.json?.suspended === true, JSON.stringify(r.json));
     r = await req('GET', '/api/providers/radar', { token: provToken });
@@ -510,6 +510,182 @@ async function main() {
     check('admin permanent ban -> 200, permanentBan true', r.status === 200 && r.json?.permanentBan === true, JSON.stringify(r.json));
     r = await req('GET', '/api/providers/me', { token: prov2Token });
     check('banned provider sees permanentBan in /providers/me', r.status === 200 && r.json?.permanentBan === true, JSON.stringify(r.json));
+
+    // --- 17. v2.0.9: reversed commissions + volume bonus + promo months + loyalty vouchers ---
+    console.log('\n[v2.0.9 reversed commissions + volume bonus + promo + vouchers]');
+    // Terms text carries the new commission line (version stays 1.0 — no
+    // forced re-acceptance for a rates change).
+    r = await req('GET', '/api/terms');
+    check('terms text has reversed rates 15/12/8, no Elite 1,200 bonus', r.status === 200 && r.json?.textAr?.includes('Starter 15%') && r.json?.textAr?.includes('Elite 8%') && !r.json?.textAr?.includes('1,200') && r.json?.version === '1.0', JSON.stringify(r.json)?.slice(0, 200));
+    // Full visit cycle helper (create -> accept -> vitals -> complete ->
+    // patient confirm -> review -> released).
+    const completeVisit = async (patientTok, km) => {
+      const c = await req('POST', '/api/bookings', { token: patientTok, body: { ...TERMS,
+        patientName: 'Cycle Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+        distanceKm: km, respectCharterAccepted: true, triage: { dangerSigns: [] },
+      } });
+      if (c.status !== 201) return { ok: false, step: 'create', res: c };
+      const id = c.json.id;
+      const a = await req('POST', `/api/bookings/${id}/accept`, { token: provToken });
+      if (a.status !== 200) return { ok: false, step: 'accept', res: a };
+      const v = await req('POST', `/api/bookings/${id}/vitals`, { token: provToken, body: { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 } });
+      if (v.status !== 200) return { ok: false, step: 'vitals', res: v };
+      const cp = await req('POST', `/api/bookings/${id}/complete-provider`, { token: provToken });
+      if (cp.status !== 200) return { ok: false, step: 'complete-provider', res: cp };
+      const cf = await req('POST', `/api/bookings/${id}/confirm-patient`, { token: patientTok });
+      if (cf.status !== 200) return { ok: false, step: 'confirm-patient', res: cf };
+      const rv = await req('POST', `/api/bookings/${id}/review`, { token: patientTok, body: { rating: 5, comment: 'Good.' } });
+      if (rv.status !== 200 || rv.json?.status !== 'released') return { ok: false, step: 'review', res: rv };
+      return { ok: true, id, created: c.json, released: rv.json };
+    };
+    // --- 17a. tier rates at accept: Starter 15 / Pro 12 / Elite 8 -------
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Tier Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    const bkTier1 = r.json?.id;
+    r = await req('POST', `/api/bookings/${bkTier1}/accept`, { token: provToken });
+    check('Starter accepts at 15%', r.status === 200 && r.json?.commissionPct === 15 && r.json?.commissionTier === 'Starter', JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/providers/prov_demo_starter/tier', { token: adminToken, body: { tier: 'Pro' } });
+    check('admin changes tier to Pro', r.status === 200 && r.json?.tier === 'Pro', JSON.stringify(r.json));
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Tier Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    const bkTier2 = r.json?.id;
+    r = await req('POST', `/api/bookings/${bkTier2}/accept`, { token: provToken });
+    check('Pro accepts at 12%', r.status === 200 && r.json?.commissionPct === 12 && r.json?.commissionTier === 'Pro', JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/providers/prov_demo_starter/tier', { token: adminToken, body: { tier: 'Elite' } });
+    check('admin changes tier to Elite', r.status === 200 && r.json?.tier === 'Elite', JSON.stringify(r.json));
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Tier Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    const bkTier3 = r.json?.id;
+    r = await req('POST', `/api/bookings/${bkTier3}/accept`, { token: provToken });
+    check('Elite accepts at 8%', r.status === 200 && r.json?.commissionPct === 8 && r.json?.commissionTier === 'Elite', JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/providers/prov_demo_starter/tier', { token: adminToken, body: { tier: 'Starter' } });
+    check('admin restores tier to Starter', r.status === 200 && r.json?.tier === 'Starter', JSON.stringify(r.json));
+    r = await req('GET', `/api/bookings/${bkTier1}`, { token: patientToken2 });
+    check('earlier accepted booking keeps locked 15% after tier change', r.json?.commissionPct === 15, JSON.stringify(r.json)?.slice(0, 200));
+    // --- 17b. volume bonus: 30 cases -> 500, title, next target ---------
+    const volLogin = await req('POST', '/api/auth/login-phone', { body: { phone: '01022222222' } });
+    const volToken = volLogin.json?.accessToken;
+    check('volume-test patient login', volLogin.status === 200 && !!volToken, JSON.stringify(volLogin.json));
+    // Provider already has 1 released case this month (bkId); 29 more -> 30.
+    let volOk = true; let volFailStep = '';
+    for (let i = 0; i < 29; i++) {
+      const cyc = await completeVisit(volToken, 2);
+      if (!cyc.ok) { volOk = false; volFailStep = `${cyc.step} ${JSON.stringify(cyc.res?.json || cyc.res)}`; break; }
+    }
+    check('29 volume cycles complete + release', volOk, volFailStep.slice(0, 300));
+    r = await req('GET', '/api/providers/wallet', { token: provToken });
+    check('wallet: 30 cases this month, bonus 500, title محترف موثّق', r.status === 200 && r.json?.monthlyCases === 30 && r.json?.volumeBonusEgp === 500 && r.json?.volumeBonus?.title === 'محترف موثّق' && r.json?.volumeBonus?.nextBonusAt === 60 && r.json?.volumeBonus?.casesToNextBonus === 30, JSON.stringify(r.json?.volumeBonus));
+    check('wallet totals carry the 500 bonus into what app owes provider', r.json?.totals?.volumeBonusEgp === 500 && r.json?.totals?.appOwesProviderEgp === 500, JSON.stringify(r.json?.totals));
+    r = await req('GET', '/api/me/vouchers', { token: volToken });
+    check('volume patient earned vouchers (29 visits -> 7, next after 3 more)', r.status === 200 && r.json?.vouchers?.length === 7 && r.json?.completedPaidVisits === 29 && r.json?.visitsToNextVoucher === 3, JSON.stringify(r.json)?.slice(0, 300));
+    // --- 17c. promo months ------------------------------------------------
+    r = await req('POST', '/api/admin/promo', { token: adminToken, body: { commissionPct: 101 } });
+    check('promo 101% -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/promo', { token: adminToken, body: { commissionPct: -1 } });
+    check('promo -1% -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/promo', { token: adminToken, body: { commissionPct: 0, until: new Date(Date.now() - 1000).toISOString() } });
+    check('promo with past until -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/promo', { token: patientToken2, body: { commissionPct: 0 } });
+    check('promo by non-admin -> 403', r.status === 403, JSON.stringify(r.json));
+    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    r = await req('POST', '/api/admin/promo', { token: adminToken, body: { commissionPct: 0, until: tomorrow } });
+    check('admin sets 0% promo -> 200 active', r.status === 200 && r.json?.promo?.active === true && r.json?.promo?.commissionPct === 0, JSON.stringify(r.json));
+    r = await req('GET', '/api/bootstrap');
+    check('bootstrap shows promo active 0%', r.json?.promo?.active === true && r.json?.promo?.commissionPct === 0, JSON.stringify(r.json?.promo));
+    r = await req('GET', '/api/admin/dashboard', { token: adminToken });
+    check('admin dashboard shows promo active 0%', r.json?.promo?.active === true && r.json?.promo?.commissionPct === 0, JSON.stringify(r.json?.promo)?.slice(0, 200));
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Promo Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    const bkPromo = r.json?.id;
+    r = await req('POST', `/api/bookings/${bkPromo}/accept`, { token: provToken });
+    check('accept under 0% promo locks commissionPct 0', r.status === 200 && r.json?.commissionPct === 0 && r.json?.promoCommissionPct === 0, JSON.stringify(r.json));
+    r = await req('GET', '/api/providers/wallet', { token: provToken });
+    check('wallet under 0% promo: bonus paused, title kept', r.json?.volumeBonus?.paused === true && r.json?.volumeBonusEgp === 0 && r.json?.volumeBonus?.title === 'محترف موثّق' && r.json?.totals?.appOwesProviderEgp === 0, JSON.stringify(r.json?.volumeBonus));
+    check('wallet shows promo 0%', r.json?.promo?.active === true && r.json?.promo?.commissionPct === 0, JSON.stringify(r.json?.promo));
+    r = await req('POST', '/api/admin/promo', { token: adminToken, body: { commissionPct: null } });
+    check('admin clears promo -> inactive', r.status === 200 && r.json?.promo?.active === false, JSON.stringify(r.json));
+    r = await req('GET', '/api/bootstrap');
+    check('bootstrap promo inactive after clear', r.json?.promo?.active === false, JSON.stringify(r.json?.promo));
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Post Promo', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    const bkPostPromo = r.json?.id;
+    r = await req('POST', `/api/bookings/${bkPostPromo}/accept`, { token: provToken });
+    check('accept after promo cleared locks Starter 15% again', r.status === 200 && r.json?.commissionPct === 15, JSON.stringify(r.json));
+    // Promo-month cap (max 2 per calendar year): this year already used 1
+    // month (the 0% promo above). A 5% promo until +40d covers Nov+Dec
+    // 2026 and Jan 2027 — 2026 then uses 2, 2027 uses 1 — allowed.
+    const in40d = new Date(Date.now() + 40 * 24 * 60 * 60 * 1000).toISOString();
+    r = await req('POST', '/api/admin/promo', { token: adminToken, body: { commissionPct: 5, until: in40d } });
+    check('promo to +40d fits the 2-per-year cap -> 200', r.status === 200 && r.json?.promo?.active === true && r.json?.promo?.commissionPct === 5, JSON.stringify(r.json));
+    // But a promo until +100d would make 2027 use 3 months (Jan+Feb+Mar).
+    const in100d = new Date(Date.now() + 100 * 24 * 60 * 60 * 1000).toISOString();
+    r = await req('POST', '/api/admin/promo', { token: adminToken, body: { commissionPct: 5, until: in100d } });
+    check('promo that would make a year use 3 months -> 409 cap', r.status === 409 && r.json?.error === 'promo_months_exceeded', JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/promo', { token: adminToken, body: { commissionPct: null } });
+    check('admin clears the cap-test promo -> inactive', r.status === 200 && r.json?.promo?.active === false, JSON.stringify(r.json));
+    // --- 17d. patient loyalty vouchers ------------------------------------
+    const vouLogin = await req('POST', '/api/auth/login-phone', { body: { phone: '01033333333' } });
+    const vouToken = vouLogin.json?.accessToken;
+    check('voucher-test patient login', vouLogin.status === 200 && !!vouToken, JSON.stringify(vouLogin.json));
+    r = await req('GET', '/api/me/vouchers', { token: vouToken });
+    check('new patient has no vouchers, 4 visits to first', r.status === 200 && r.json?.vouchers?.length === 0 && r.json?.completedPaidVisits === 0 && r.json?.visitsToNextVoucher === 4, JSON.stringify(r.json));
+    let vouOk = true; let vouFailStep = '';
+    for (let i = 0; i < 4; i++) {
+      const cyc = await completeVisit(vouToken, 8); // 250 + 100 = 350 (>= 300 min)
+      if (!cyc.ok) { vouOk = false; vouFailStep = cyc.step; break; }
+    }
+    check('4 voucher cycles complete + release', vouOk, vouFailStep);
+    r = await req('GET', '/api/me/vouchers', { token: vouToken });
+    const vou1 = r.json?.vouchers?.[0];
+    const expDays = vou1 ? (new Date(vou1.expiresAt).getTime() - Date.now()) / (24 * 60 * 60 * 1000) : -1;
+    check('4 completions -> 1 active 50 EGP voucher, 60-day expiry, min 300', r.status === 200 && r.json?.vouchers?.length === 1 && vou1?.amountEgp === 50 && vou1?.minBookingEgp === 300 && expDays > 59 && expDays < 61 && r.json?.completedPaidVisits === 4 && r.json?.visitsToNextVoucher === 4, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', '/api/bookings', { token: vouToken, body: { ...TERMS,
+      patientName: 'Voucher Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    check('250 booking does not apply the voucher (min 300)', r.status === 201 && r.json?.amountEgp === 250 && r.json?.amountPayableEgp === 250 && r.json?.voucherId == null, JSON.stringify(r.json));
+    r = await req('POST', '/api/bookings', { token: vouToken, body: { ...TERMS,
+      patientName: 'Voucher Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 8, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    const bkVou = r.json?.id;
+    check('350 booking auto-applies voucher: payable 300, discount 50', r.status === 201 && r.json?.amountEgp === 350 && r.json?.amountPayableEgp === 300 && r.json?.voucherDiscountEgp === 50 && !!r.json?.voucherId, JSON.stringify(r.json));
+    await req('POST', `/api/bookings/${bkVou}/accept`, { token: provToken });
+    await req('POST', `/api/bookings/${bkVou}/vitals`, { token: provToken, body: { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 } });
+    await req('POST', `/api/bookings/${bkVou}/complete-provider`, { token: provToken });
+    await req('POST', `/api/bookings/${bkVou}/confirm-patient`, { token: vouToken });
+    r = await req('POST', `/api/bookings/${bkVou}/review`, { token: vouToken, body: { rating: 5, comment: 'Used my voucher.' } });
+    check('voucher visit released: provider 297 on full price, app 3', r.status === 200 && r.json?.status === 'released' && r.json?.providerShareEgp === 297 && r.json?.appShareEgp === 3, JSON.stringify(r.json));
+    r = await req('GET', '/api/me/vouchers', { token: vouToken });
+    check('voucher now used, none active', r.status === 200 && r.json?.vouchers?.length === 0 && r.json?.used?.length === 1 && r.json?.used?.[0]?.usedBookingId === bkVou, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', '/api/bookings', { token: vouToken, body: { ...TERMS,
+      patientName: 'Voucher Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 8, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    check('no voucher left -> 350 booking pays in full', r.status === 201 && r.json?.amountPayableEgp === 350 && r.json?.voucherId == null, JSON.stringify(r.json));
+    let vouOk2 = true;
+    for (let i = 0; i < 3; i++) {
+      const cyc = await completeVisit(vouToken, 8);
+      if (!cyc.ok) { vouOk2 = false; break; }
+    }
+    check('3 more cycles -> 8 completed visits', vouOk2);
+    r = await req('GET', '/api/me/vouchers', { token: vouToken });
+    check('8 completions -> second voucher issued', r.status === 200 && r.json?.vouchers?.length === 1 && r.json?.completedPaidVisits === 8, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/tourist-bookings', { token: vouToken, body: { ...TERMS,
+      patientName: 'Tourist Voucher', serviceCode: 'tourist_doctor', currency: 'usd', hotelId: 'h10',
+      urgent: false, paymentMethod: 'cash_receipt', respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    check('tourist booking applies voucher in USD: 55 - 1.04 = 53.96', r.status === 201 && r.json?.amountForeign === 53.96 && r.json?.voucherDiscountEgp === 50 && r.json?.voucherDiscountForeign === 1.04 && r.json?.amountPayableEgp === 2590, JSON.stringify(r.json));
 
     // --- 14. logout / refresh revocation ---------------------------------
     console.log('\n[logout]');

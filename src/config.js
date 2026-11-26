@@ -74,6 +74,18 @@ const config = {
   interviewMinutes: 20,
   interviewPassTotal: 12,
   interviewPassEthics: 3,
+  // Promo-month commission override (owner decision 26 Nov 2026): when
+  // set (e.g. PROMO_COMMISSION_PCT=0), it OVERRIDES the tier rate for
+  // bookings accepted while it is active. Unset = tier rates apply.
+  // Range 0–100; out-of-range values are ignored (treated as unset).
+  promoCommissionPct: (() => {
+    const v = envInt('PROMO_COMMISSION_PCT', null);
+    if (v == null || v < 0 || v > 100) {
+      if (process.env.PROMO_COMMISSION_PCT) console.warn('[WARN] PROMO_COMMISSION_PCT out of range 0–100 — ignored.');
+      return null;
+    }
+    return v;
+  })(),
   // v2.0.8 — Terms & Conditions version. Registration and booking
   // creation require acceptedTerms=true AND termsVersion to match this
   // value; bumping it forces every user to re-accept (see /api/me/terms).

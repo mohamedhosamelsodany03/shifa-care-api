@@ -132,6 +132,133 @@ function circumventionFlags() {
     .filter((f) => f.reasons.length > 0 || f.suspended || f.permanentBan)
     .sort((a, b) => (b.circumventionReports - a.circumventionReports) || (b.oneTimeClients - a.oneTimeClients));
 }
+// ---------------------------------------------------------------- v2.0.9 — reversed commissions + volume bonus + promo months + loyalty vouchers
+// Owner decision 26 Nov 2026 ("da awwal iqtirah ba'akkidlak 'aleih"):
+//   TIERS reversed: Starter 15% / Pro 12% / Elite 8% — the more a provider
+//   develops, the LOWER their commission. The fixed Elite 1,200 EGP/month
+//   bonus is ABOLISHED, replaced by the monthly volume bonus.
+//   Volume bonus (cash, from the app, paid with the Thursday settlement):
+//   30 completed cases/month -> 500 EGP, 60 -> 1,000, 100 -> 1,500
+//   (highest tier reached ONLY, never cumulative). Titles continue even
+//   when the cash bonus is paused.
+//   Promo months (max 2 per calendar year, announced in advance): admin
+//   may lower the commission or set it to 0% for a month. In a
+//   0%-commission month the cash volume bonus PAUSES (titles continue).
+//   Patient loyalty vouchers: after every 4 completed PAID visits the
+//   patient auto-receives a 50 EGP voucher (60 days, min booking 300 EGP,
+//   one per booking), fully funded by the app — the provider's share is
+//   always computed on the FULL pre-discount price.
+function monthKey(d = new Date()) { return d.toISOString().slice(0, 7); } // 'YYYY-MM'
+
+// The live promo override: admin-set (store.data.promo) wins; otherwise
+// the PROMO_COMMISSION_PCT env var; otherwise no promo (tier rates).
+// An expired admin promo is inactive (the sweep clears it).
+function activePromo() {
+  const stored = store.data.promo;
+  if (stored && stored.commissionPct != null) {
+    if (!stored.until || new Date(stored.until).getTime() > Date.now()) {
+      return { commissionPct: stored.commissionPct, until: stored.until || null, source: 'admin' };
+    }
+    return null; // expired — the sweep clears it
+  }
+  if (config.promoCommissionPct != null) {
+    return { commissionPct: config.promoCommissionPct, until: null, source: 'env' };
+  }
+  return null;
+}
+function effectiveCommissionPct(tier) {
+  const promo = activePromo();
+  if (promo) return promo.commissionPct;
+  return cat.TIERS[tier].commission_pct;
+}
+
+// Completed cases in a calendar month for one provider: bookings that
+// reached the released state (the same completion signal the Thursday
+// settlement uses). Refunded bookings drop out (status becomes 'refunded').
+function monthlyCases(providerId, key) {
+  return Object.values(store.data.bookings).filter((b) =>
+    b.providerId === providerId
+    && (b.status === 'released' || b.status === 'auto_released')
+    && b.releasedAt && b.releasedAt.slice(0, 7) === key
+  ).length;
+}
+function volumeBonusFor(providerId, key) {
+  const cases = monthlyCases(providerId, key);
+  const promo = activePromo();
+  const paused = !!promo && promo.commissionPct === 0;
+  const reached = cat.VOLUME_BONUS_TIERS.filter((t) => cases >= t.minCases).sort((a, b) => b.minCases - a.minCases)[0] || null;
+  const next = cat.VOLUME_BONUS_TIERS.filter((t) => cases < t.minCases).sort((a, b) => a.minCases - b.minCases)[0] || null;
+  return {
+    month: key, cases,
+    bonusEgp: paused ? 0 : (reached ? reached.bonusEgp : 0),
+    title: reached ? reached.title : null,
+    titleEn: reached ? reached.titleEn : null,
+    nextBonusAt: next ? next.minCases : null,
+    nextBonusEgp: next ? next.bonusEgp : null,
+    casesToNextBonus: next ? next.minCases - cases : null,
+    paused,
+    note: paused ? 'Cash volume bonus is paused during a 0%-commission promo month — titles still apply.' : null,
+  };
+}
+
+// Loyalty vouchers -------------------------------------------------------
+// Expire vouchers past their date (called by the sweep and on read).
+function expireVouchers() {
+  const now = Date.now();
+  let changed = false;
+  for (const v of store.data.vouchers || []) {
+    if (v.status === 'active' && new Date(v.expiresAt).getTime() <= now) {
+      v.status = 'expired'; changed = true;
+    }
+  }
+  if (changed) store.save();
+  return changed;
+}
+// Completed PAID visits for a patient = released bookings (refunded ones
+// drop out by status).
+function completedPaidVisits(patientPhone) {
+  return Object.values(store.data.bookings).filter((b) =>
+    b.patientPhone === patientPhone && (b.status === 'released' || b.status === 'auto_released')
+  ).length;
+}
+// Every 4th completed paid visit issues one 50 EGP voucher.
+function maybeIssueVouchers(patientPhone) {
+  const completed = completedPaidVisits(patientPhone);
+  const earned = Math.floor(completed / cat.VOUCHER_EVERY_N_VISITS);
+  const issued = (store.data.vouchers || []).filter((v) => v.patientPhone === patientPhone).length;
+  const toIssue = earned - issued;
+  if (toIssue <= 0) return [];
+  const now = new Date();
+  const made = [];
+  for (let i = 0; i < toIssue; i++) {
+    const v = {
+      id: newId('vou'), patientPhone, amountEgp: cat.VOUCHER_AMOUNT_EGP,
+      issuedAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + cat.VOUCHER_VALID_DAYS * 24 * 60 * 60 * 1000).toISOString(),
+      minBookingEgp: cat.VOUCHER_MIN_BOOKING_EGP, status: 'active',
+      sourceBookingId: null, usedBookingId: null, usedAt: null,
+    };
+    store.data.vouchers.push(v);
+    made.push(v);
+  }
+  store.audit('voucher.issued', patientPhone, { count: made.length, completedPaidVisits: completed, voucherIds: made.map((v) => v.id) });
+  return made;
+}
+// Find one usable voucher for this patient/amount (does NOT mark it used —
+// the caller marks it used only after the booking is created).
+function findVoucher(patientPhone, amountEgp) {
+  expireVouchers();
+  if (amountEgp < cat.VOUCHER_MIN_BOOKING_EGP) return null;
+  return (store.data.vouchers || []).find((x) =>
+    x.patientPhone === patientPhone && x.status === 'active'
+    && new Date(x.expiresAt).getTime() > Date.now()
+    && amountEgp >= (x.minBookingEgp || cat.VOUCHER_MIN_BOOKING_EGP)) || null;
+}
+// What the patient actually paid (after any voucher discount) — this is
+// the amount a refund returns, never more than the patient paid.
+function refundAmount(b) {
+  return b.amountPayableEgp != null ? b.amountPayableEgp : b.amountEgp;
+}
 // ---------------------------------------------------------------- escrow
 // v2.0.1 — TWO-STAGE ESCROW (settled decision, 24 Nov 2026):
 //   Stage 1 (provisional release): the held amount is released to the
@@ -159,23 +286,52 @@ function circumventionFlags() {
 function releaseBooking(b, mode) {
   const total = b.amountEgp;
   const pct = b.commissionPct ?? 0;
-  b.appShareEgp = Math.round(total * (pct / 100));
-  b.providerShareEgp = total - b.appShareEgp;
+  const grossAppShare = Math.round(total * (pct / 100));
+  // v2.0.9 — the app funds any loyalty-voucher discount in full: the
+  // provider's share is computed on the FULL pre-discount price; the
+  // discount comes out of the app's share (floored at 0 — any shortfall
+  // is the app's cost of the voucher).
+  b.appShareEgp = Math.max(0, grossAppShare - (b.voucherDiscountEgp || 0));
+  b.providerShareEgp = total - grossAppShare;
+  const p = b.providerId ? store.data.providers[b.providerId] : null;
+  // Volume-bonus threshold detection: count BEFORE this release, so the
+  // crossing is detected (and audited) exactly once.
+  const key = monthKey();
+  const prevCases = p ? monthlyCases(p.id, key) : 0;
   b.status = mode === 'auto' ? 'auto_released' : 'released';
   b.releasedAt = nowIso();
   b.releaseMode = mode;
   // Final settlement only after the 24h complaint window (set at patient
   // confirmation) — see the two-stage escrow comment above.
   b.settleableAt = b.complaintDeadline || null;
-  const p = b.providerId ? store.data.providers[b.providerId] : null;
-  if (p) p.completedVisits = (p.completedVisits || 0) + 1;
-  store.audit('escrow.released', b.providerId || 'system', { bookingId: b.id, mode, totalEgp: total, appShareEgp: b.appShareEgp, providerShareEgp: b.providerShareEgp });
+  if (p) {
+    p.completedVisits = (p.completedVisits || 0) + 1;
+    // Volume bonus snapshot on the provider record (the wallet recomputes
+    // live from bookings; this is the audit trail / admin view).
+    const vb = volumeBonusFor(p.id, key);
+    p.volumeBonus = { month: key, cases: vb.cases, bonusEgp: vb.bonusEgp, title: vb.title, paused: vb.paused };
+    const prevTier = cat.VOLUME_BONUS_TIERS.filter((t) => prevCases >= t.minCases).sort((a, b) => b.minCases - a.minCases)[0] || null;
+    const newTier = cat.VOLUME_BONUS_TIERS.filter((t) => vb.cases >= t.minCases).sort((a, b) => b.minCases - a.minCases)[0] || null;
+    if (newTier && (!prevTier || newTier.minCases !== prevTier.minCases)) {
+      store.audit('bonus.earned', p.id, { bookingId: b.id, month: key, cases: vb.cases, bonusEgp: vb.bonusEgp, title: vb.title, paused: vb.paused });
+    }
+  }
+  store.audit('escrow.released', b.providerId || 'system', { bookingId: b.id, mode, totalEgp: total, appShareEgp: b.appShareEgp, providerShareEgp: b.providerShareEgp, voucherDiscountEgp: b.voucherDiscountEgp || 0 });
+  // Loyalty voucher: every 4th completed paid visit issues one.
+  if (b.patientPhone) maybeIssueVouchers(b.patientPhone);
   store.save();
 }
 function sweepAutoRelease() {
   const now = Date.now();
   const released = [];
   const overdue = [];
+  // v2.0.9 — expire loyalty vouchers past their date; clear an expired
+  // admin promo so tier rates resume.
+  expireVouchers();
+  if (store.data.promo && store.data.promo.until && new Date(store.data.promo.until).getTime() <= now) {
+    store.data.promo = null;
+    store.audit('promo.expired', 'system', {});
+  }
   for (const b of Object.values(store.data.bookings)) {
     if (b.status === 'patient_confirmed' && b.patientConfirmedAt && !b.review && !b.complaint) {
       // v2.0.8: a circumvention hold pauses auto-release just like a complaint.
@@ -235,6 +391,8 @@ router.get('/bootstrap', (req, res) => {
     mockMode: config.mockOtp,
     ambulance: '123',
     termsVersion: config.termsVersion,
+    // v2.0.9 — active promo-month override (commission %, no secrets).
+    promo: (() => { const pr = activePromo(); return pr ? { active: true, commissionPct: pr.commissionPct, until: pr.until || null } : { active: false, commissionPct: null, until: null }; })(),
     note: 'Prices are fixed and announced in advance. No bargaining inside the app.',
   });
 });
@@ -273,6 +431,30 @@ router.post('/me/terms', requireAuth, (req, res) => {
   store.audit('terms.accepted', req.user.phone, { version: config.termsVersion, role: req.user.role });
   store.save();
   res.json({ ok: true, version: config.termsVersion, acceptedAt: nowIso() });
+});
+
+// ---------------------------------------------------------------- v2.0.9 — patient loyalty vouchers
+// After every 4 completed paid visits the patient auto-receives a 50 EGP
+// voucher (valid 60 days, min booking 300 EGP, one per booking), fully
+// funded by the app. This endpoint exposes the patient's active vouchers
+// and progress toward the next one.
+router.get('/me/vouchers', requireAuth, (req, res) => {
+  expireVouchers();
+  const phone = req.user.phone;
+  const list = (store.data.vouchers || []).filter((v) => v.patientPhone === phone);
+  const completed = completedPaidVisits(phone);
+  const pub = (v) => ({ id: v.id, amountEgp: v.amountEgp, issuedAt: v.issuedAt, expiresAt: v.expiresAt, minBookingEgp: v.minBookingEgp, status: v.status, usedBookingId: v.usedBookingId || null, usedAt: v.usedAt || null });
+  res.json({
+    vouchers: list.filter((v) => v.status === 'active').map(pub),
+    used: list.filter((v) => v.status === 'used').map(pub),
+    expiredCount: list.filter((v) => v.status === 'expired').length,
+    completedPaidVisits: completed,
+    visitsToNextVoucher: cat.VOUCHER_EVERY_N_VISITS - (completed % cat.VOUCHER_EVERY_N_VISITS),
+    vouchersEarned: Math.floor(completed / cat.VOUCHER_EVERY_N_VISITS),
+    voucherAmountEgp: cat.VOUCHER_AMOUNT_EGP,
+    voucherValidDays: cat.VOUCHER_VALID_DAYS,
+    voucherMinBookingEgp: cat.VOUCHER_MIN_BOOKING_EGP,
+  });
 });
 
 // ---------------------------------------------------------------- OTP
@@ -476,11 +658,17 @@ router.post('/bookings', requireAuth, (req, res) => {
     return res.status(422).json({ error: 'contract_required', ...priced });
   }
   const id = newId('bk');
+  // v2.0.9 — auto-apply one loyalty voucher when the booking is >= 300 EGP.
+  // The provider's share is computed on the FULL price at release; the
+  // app funds the 50 EGP discount (see releaseBooking).
+  const vou = findVoucher(req.user.phone, priced.totalEgp);
   const booking = {
     id, kind: 'standard', patientPhone: req.user.phone, patientName: b.patientName,
     serviceCode: b.serviceCode, serviceName: cat.SERVICES[b.serviceCode].name_en,
     status: 'held', // escrow: money held in-app from booking
     amountEgp: priced.totalEgp, baseEgp: priced.baseEgp, distanceFeeEgp: priced.distanceFeeEgp,
+    voucherId: vou ? vou.id : null, voucherDiscountEgp: vou ? vou.amountEgp : 0,
+    amountPayableEgp: vou ? priced.totalEgp - vou.amountEgp : priced.totalEgp,
     distanceKm: priced.distanceKm, distanceBand: priced.band, distanceEstimate: true,
     transport: b.transport || 'none', hotelId: b.hotelId || null,
     currency: 'EGP', amountForeign: null, fxRate: null,
@@ -499,7 +687,8 @@ router.post('/bookings', requireAuth, (req, res) => {
     patientConfirmedAt: null, reviewedAt: null, releasedAt: null, releaseMode: null,
   };
   store.data.bookings[id] = booking;
-  store.audit('booking.created', req.user.phone, { bookingId: id, serviceCode: b.serviceCode, totalEgp: booking.amountEgp });
+  if (vou) { vou.status = 'used'; vou.usedAt = nowIso(); vou.usedBookingId = id; }
+  store.audit('booking.created', req.user.phone, { bookingId: id, serviceCode: b.serviceCode, totalEgp: booking.amountEgp, voucherId: booking.voucherId, voucherDiscountEgp: booking.voucherDiscountEgp });
   recordTermsAcceptance(req.user.phone);
   store.save();
   // Payment number is shown only AFTER the booking is confirmed (accepted),
@@ -541,7 +730,7 @@ router.post('/bookings/:id/cancel', requireAuth, requireRole('patient'), (req, r
   }
   b.status = 'cancelled';
   b.cancelledAt = nowIso();
-  b.refundEgp = b.amountEgp; // full refund of the held amount
+  b.refundEgp = refundAmount(b); // full refund of what the patient actually paid (after any voucher discount)
   b.refundedAt = nowIso();
   store.audit('booking.cancelled', req.user.phone, { bookingId: b.id, refundEgp: b.refundEgp, wasAccepted: !!b.providerId });
   store.save();
@@ -815,10 +1004,17 @@ router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, 
   if (blocked) return res.status(403).json({ error: 'forbidden', message: blocked });
   if (b.status !== 'held' || b.providerId) return bad(res, 409, `Booking cannot be accepted while status is ${b.status}.`);
   b.providerId = p.id;
-  b.commissionPct = cat.TIERS[p.tier].commission_pct; // locked at accept time
+  // v2.0.9 — commission is locked at accept time. An active promo month
+  // overrides the tier rate (e.g. 0%); otherwise the REVERSED tier rates
+  // apply (Starter 15% / Pro 12% / Elite 8%). Already-accepted bookings
+  // keep the commissionPct they locked in.
+  const promoNow = activePromo();
+  b.commissionPct = promoNow ? promoNow.commissionPct : cat.TIERS[p.tier].commission_pct;
+  b.promoCommissionPct = promoNow ? promoNow.commissionPct : null;
+  b.commissionTier = p.tier;
   b.status = 'accepted';
   b.acceptedAt = nowIso();
-  store.audit('booking.accepted', req.user.phone, { bookingId: b.id, providerId: p.id, commissionPct: b.commissionPct });
+  store.audit('booking.accepted', req.user.phone, { bookingId: b.id, providerId: p.id, commissionPct: b.commissionPct, promoApplied: !!promoNow });
   store.save();
   res.json(pubBooking(req, b, { includePaymentNumber: true }));
 });
@@ -916,8 +1112,23 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
     complaintHoldEgp: ledger.filter((l) => l.direction === 'complaint_hold').reduce((s, l) => s + l.amountEgp, 0),
     forfeitedEgp: ledger.filter((l) => l.direction === 'forfeited').reduce((s, l) => s + (l.providerShareEgp || 0), 0),
   };
+  // v2.0.9 — monthly volume bonus: paid with the Thursday settlement, so
+  // it is added to what the app owes the provider for this month.
+  // During a 0%-commission promo month the cash bonus is PAUSED (titles
+  // still awarded) — volumeBonus.paused says so, with bonusEgp 0.
+  const volumeBonus = volumeBonusFor(p.id, monthKey());
+  // A permanent ban forfeits pending settlement — including the bonus.
+  if (p.permanentBan) { volumeBonus.bonusEgp = 0; volumeBonus.note = 'Volume bonus forfeited (permanent ban).'; }
+  totals.volumeBonusEgp = volumeBonus.bonusEgp;
+  totals.appOwesProviderEgp += volumeBonus.bonusEgp;
+  const promoNow = activePromo();
   res.json({
-    providerId: p.id, tier: p.tier, commissionPct: cat.TIERS[p.tier].commission_pct,
+    providerId: p.id, tier: p.tier, commissionPct: effectiveCommissionPct(p.tier),
+    commissionPctTier: cat.TIERS[p.tier].commission_pct,
+    promo: promoNow ? { active: true, commissionPct: promoNow.commissionPct, until: promoNow.until || null } : { active: false, commissionPct: null, until: null },
+    monthlyCases: volumeBonus.cases, volumeBonusEgp: volumeBonus.bonusEgp,
+    nextBonusAt: volumeBonus.nextBonusAt,
+    volumeBonus,
     nextSettlementThursday: nextThursday(),
     // v2.0.8 — discipline state, so the provider sees warnings/suspension
     // in their own wallet screen (and why their radar is closed).
@@ -1117,13 +1328,22 @@ router.post('/tourist-bookings', requireAuth, (req, res) => {
   const amountEgp = Math.round(amountForeign * fx);
   const language = b.language ? String(b.language).toLowerCase() : 'en';
   const id = newId('bk');
+  // v2.0.9 — loyalty voucher (50 EGP, converted at this booking's fx rate).
+  // Provider share is computed on the FULL pre-discount price at release.
+  const vou = findVoucher(req.user.phone, amountEgp);
+  const voucherDiscountForeign = vou ? Math.round((vou.amountEgp / fx) * 100) / 100 : 0;
   const booking = {
     id, kind: 'tourist', patientPhone: req.user.phone, patientName: b.patientName,
     serviceCode: b.serviceCode, serviceName: svc.name_en, status: 'held',
     amountEgp, baseEgp: Math.round(base * fx), distanceFeeEgp: fee.fee_egp,
+    voucherId: vou ? vou.id : null, voucherDiscountEgp: vou ? vou.amountEgp : 0,
+    voucherDiscountForeign, amountPayableEgp: vou ? amountEgp - vou.amountEgp : amountEgp,
     distanceKm, distanceBand: fee.band, distanceEstimate: true,
     transport: b.transport || 'none', hotelId: b.hotelId || null,
-    currency: currency.toUpperCase(), amountForeign, fxRate: fx, fxNote: 'Approximate rate — override via USD_EGP / EUR_EGP env.',
+    currency: currency.toUpperCase(),
+    // amountForeign is what the patient actually pays (after any voucher).
+    amountForeign: Math.round((amountForeign - voucherDiscountForeign) * 100) / 100,
+    fxRate: fx, fxNote: 'Approximate rate — override via USD_EGP / EUR_EGP env.',
     urgent: b.urgent === true, language,
     languageBonus: language !== 'en'
       ? { amount: cat.EXTRA_LANGUAGE_BONUS[currency], currency: currency.toUpperCase(), appliesIf: 'Assigned provider holds a certificate for this language (non-English only). Added at release, not at booking.' }
@@ -1144,7 +1364,8 @@ router.post('/tourist-bookings', requireAuth, (req, res) => {
     patientConfirmedAt: null, reviewedAt: null, releasedAt: null, releaseMode: null,
   };
   store.data.bookings[id] = booking;
-  store.audit('tourist_booking.created', req.user.phone, { bookingId: id, serviceCode: b.serviceCode, amountForeign, currency });
+  if (vou) { vou.status = 'used'; vou.usedAt = nowIso(); vou.usedBookingId = id; }
+  store.audit('tourist_booking.created', req.user.phone, { bookingId: id, serviceCode: b.serviceCode, amountForeign: booking.amountForeign, currency, voucherId: booking.voucherId, voucherDiscountEgp: booking.voucherDiscountEgp });
   recordTermsAcceptance(req.user.phone);
   store.save();
   res.status(201).json(pubBooking(req, booking));
@@ -1165,6 +1386,10 @@ router.get('/bookings/:id/insurance-report', requireAuth, (req, res) => {
     { item: lang === 'de' ? 'Entfernungspauschale' : 'Distance fee', amount: b.currency === 'EGP' ? b.distanceFeeEgp : Math.round((b.distanceFeeEgp / (b.fxRate || 1)) * 100) / 100, currency: cur },
   ];
   if (b.urgent) items.push({ item: lang === 'de' ? 'Dringlichkeitszuschlag' : 'Urgent surcharge', amount: cat.TOURIST_URGENT_EXTRA[cur.toLowerCase()] || 0, currency: cur });
+  // v2.0.9 — loyalty-voucher discount (funded by the app; the provider's
+  // share was computed on the full pre-discount price).
+  if (b.voucherDiscountForeign) items.push({ item: lang === 'de' ? 'Treuegutschein' : 'Loyalty voucher discount', amount: -b.voucherDiscountForeign, currency: cur });
+  else if (b.voucherDiscountEgp) items.push({ item: lang === 'de' ? 'Treuegutschein' : 'Loyalty voucher discount', amount: -b.voucherDiscountEgp, currency: cur });
   const report = {
     reportId: `INS-${b.id}`,
     language: lang,
@@ -1241,10 +1466,14 @@ router.post('/postop', requireAuth, (req, res) => {
   if (priced.error) return bad(res, 400, priced.error);
   if (priced.contract_required) return res.status(422).json({ error: 'contract_required', ...priced });
   const id = newId('bk');
+  // v2.0.9 — loyalty voucher (same rule as standard bookings).
+  const vou = findVoucher(req.user.phone, priced.totalEgp);
   const booking = {
     id, kind: 'postop', patientPhone: req.user.phone, patientName: b.patientName,
     serviceCode: 'postop', serviceName: cat.SERVICES.postop.name_en, status: 'held',
     amountEgp: priced.totalEgp, baseEgp: priced.baseEgp, distanceFeeEgp: priced.distanceFeeEgp,
+    voucherId: vou ? vou.id : null, voucherDiscountEgp: vou ? vou.amountEgp : 0,
+    amountPayableEgp: vou ? priced.totalEgp - vou.amountEgp : priced.totalEgp,
     distanceKm: priced.distanceKm, distanceBand: priced.band, distanceEstimate: true,
     transport: b.transport || 'none', hotelId: b.hotelId || null,
     currency: 'EGP', amountForeign: null, fxRate: null,
@@ -1264,7 +1493,8 @@ router.post('/postop', requireAuth, (req, res) => {
     patientConfirmedAt: null, reviewedAt: null, releasedAt: null, releaseMode: null,
   };
   store.data.bookings[id] = booking;
-  store.audit('postop.created', req.user.phone, { bookingId: id, surgeryType: b.surgeryType, totalEgp: booking.amountEgp });
+  if (vou) { vou.status = 'used'; vou.usedAt = nowIso(); vou.usedBookingId = id; }
+  store.audit('postop.created', req.user.phone, { bookingId: id, surgeryType: b.surgeryType, totalEgp: booking.amountEgp, voucherId: booking.voucherId, voucherDiscountEgp: booking.voucherDiscountEgp });
   recordTermsAcceptance(req.user.phone);
   store.save();
   res.status(201).json(pubBooking(req, booking));
@@ -1315,7 +1545,12 @@ router.get('/admin/dashboard', requireAuth, requireRole('admin'), (req, res) => 
   // v2.0.8 — circumvention reports ("تقرير التفاف") + pattern flags,
   // shown in the admin dashboard next to SOS / complaints.
   const circumventionReports = (store.data.circumventionReports || []).slice().reverse().map((r) => ({ ...r, createdAt: r.at }));
-  res.json({ providers, sosAlerts, lateVisits: overdue, bookings, auditLog, circumventionReports, circumventionFlags: circumventionFlags() });
+  // v2.0.9 — active promo-month override + promo months used this year.
+  const promoNow = activePromo();
+  res.json({ providers, sosAlerts, lateVisits: overdue, bookings, auditLog, circumventionReports, circumventionFlags: circumventionFlags(),
+    promo: promoNow ? { active: true, commissionPct: promoNow.commissionPct, until: promoNow.until || null, source: promoNow.source } : { active: false, commissionPct: null, until: null },
+    promoMonthsUsed: store.data.promoMonths || {},
+  });
 });
 
 router.get('/admin/providers', requireAuth, requireRole('admin'), (req, res) => {
@@ -1345,6 +1580,59 @@ router.post('/admin/providers/:id/verify', requireAuth, requireRole('admin'), (r
   store.audit('admin.provider_verified', 'admin', { providerId: p.id, verifiedCertificates: p.verifiedCertificates });
   store.save();
   res.json(store.publicProvider(p, { admin: true }));
+});
+
+// ---------------------------------------------------------------- v2.0.9 — promo months (admin)
+// Promo months (owner decision 26 Nov 2026): at most 2 months per
+// calendar year, announced in advance; the admin may lower the app
+// commission for new bookings or set it to 0% for a month. The override
+// applies ONLY to bookings accepted while it is active — already-accepted
+// bookings keep their locked commissionPct. While a 0% promo is active,
+// the cash volume bonus is PAUSED (titles still awarded).
+// Set:  POST /api/admin/promo { commissionPct: 0–100, until?: ISO date }
+// Clear: POST /api/admin/promo { commissionPct: null }
+router.post('/admin/promo', requireAuth, requireRole('admin'), (req, res) => {
+  const pct = req.body?.commissionPct;
+  // Clear the live override — tier rates resume immediately.
+  if (pct === null || pct === undefined) {
+    const was = store.data.promo;
+    store.data.promo = null;
+    store.audit('admin.promo_cleared', 'admin', { was: was ? { commissionPct: was.commissionPct, until: was.until } : null });
+    store.save();
+    return res.json({ ok: true, promo: { active: false, commissionPct: null, until: null } });
+  }
+  const n = Number(pct);
+  if (!Number.isInteger(n) || n < 0 || n > 100) return bad(res, 400, 'commissionPct must be an integer 0–100, or null to clear the promo.');
+  let until = null;
+  if (req.body?.until != null) {
+    const t = new Date(req.body.until).getTime();
+    if (!Number.isFinite(t) || t <= Date.now()) return bad(res, 400, 'until must be a future ISO date.');
+    until = new Date(t).toISOString();
+  }
+  // Promo-month cap (SPEC §4): at most 2 promo months per calendar year.
+  const start = new Date();
+  const end = until ? new Date(until) : start;
+  const covered = [];
+  const cur = new Date(start.getFullYear(), start.getMonth(), 1);
+  const last = new Date(end.getFullYear(), end.getMonth(), 1);
+  while (cur <= last) {
+    covered.push(`${cur.getFullYear()}-${String(cur.getMonth() + 1).padStart(2, '0')}`);
+    cur.setMonth(cur.getMonth() + 1);
+  }
+  const used = store.data.promoMonths || {};
+  for (const y of [...new Set(covered.map((m) => m.slice(0, 4)))]) {
+    const already = Object.keys(used).filter((m) => m.startsWith(y + '-')).length;
+    const fresh = covered.filter((m) => m.startsWith(y + '-') && !used[m]).length;
+    if (already + fresh > 2) {
+      return res.status(409).json({ error: 'promo_months_exceeded', message: `Promo months are capped at 2 per calendar year (year ${y} already uses ${already}).`, year: y, usedMonths: already });
+    }
+  }
+  for (const m of covered) used[m] = true;
+  store.data.promoMonths = used;
+  store.data.promo = { commissionPct: n, until, setAt: nowIso(), setBy: 'admin' };
+  store.audit('admin.promo_set', 'admin', { commissionPct: n, until, monthsCovered: covered });
+  store.save();
+  res.json({ ok: true, promo: { active: true, commissionPct: n, until, monthsCovered: covered } });
 });
 
 // ---------------------------------------------------------------- v2.0.8 — graduated discipline (warn / suspend / unsuspend)
@@ -1416,7 +1704,7 @@ router.post('/admin/circumvention/:reportId/resolve', requireAuth, requireRole('
   if (b && b.circumventionReportId === report.id) {
     b.circumventionHold = false;
     if (decision === 'confirmed') {
-      b.refundEgp = b.amountEgp;
+      b.refundEgp = refundAmount(b); // what the patient actually paid (after any voucher discount)
       b.refundedAt = nowIso();
       b.refundedShares = { appShareEgp: b.appShareEgp || 0, providerShareEgp: b.providerShareEgp || 0 };
       b.appShareEgp = 0;
@@ -1457,7 +1745,7 @@ router.post('/admin/complaints/:reportId/resolve', requireAuth, requireRole('adm
     b.complaintStatus = 'accepted_refund';
     b.complaintResolvedAt = nowIso();
     b.complaint = false;
-    b.refundEgp = b.amountEgp; // full refund to the patient
+    b.refundEgp = refundAmount(b); // full refund of what the patient actually paid (after any voucher discount)
     b.refundedAt = nowIso();
     b.refundedShares = { appShareEgp: b.appShareEgp || 0, providerShareEgp: b.providerShareEgp || 0 };
     b.appShareEgp = 0;

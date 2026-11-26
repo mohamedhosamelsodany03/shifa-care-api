@@ -148,6 +148,63 @@ const server = app.listen(PORT, async () => {
     // 9. phone-only access still rejected
     r = await call('GET', '/api/bookings/mine');
     check('bookings/mine without token -> 401', r.status === 401);
+
+    // 10. v2.0.9: reversed commissions + volume bonus thresholds + voucher expiry
+    // (in-process: seed released bookings / vouchers directly into the
+    // shared store — the smoke test already drives the same logic over
+    // HTTP end-to-end for the 30-case threshold.)
+    const { store } = require('../src/store');
+    const seedNow = new Date().toISOString();
+    function seedReleased(n, prefix) {
+      for (let i = 0; i < n; i++) {
+        const id = `${prefix}${i}`;
+        store.data.bookings[id] = {
+          id, kind: 'standard', patientPhone: '01099999999', patientName: 'Seed Patient',
+          serviceCode: 'standard', serviceName: 'Standard visit', status: 'released',
+          amountEgp: 250, baseEgp: 250, distanceFeeEgp: 0,
+          providerId: 'prov_demo_starter', commissionPct: 15,
+          providerShareEgp: 212, appShareEgp: 38,
+          releasedAt: seedNow, createdAt: seedNow, acceptedAt: seedNow,
+          complaintDeadline: null, complaintStatus: null, circumventionHold: false,
+          cashCollectedByProvider: false, voucherDiscountEgp: 0,
+        };
+      }
+    }
+    r = await call('GET', '/api/terms');
+    check('terms v1.0 carries reversed rates 15/12/8, no 1,200 bonus', r.status === 200 && r.body.version === '1.0' && r.body.textAr.includes('Starter 15%') && r.body.textAr.includes('Elite 8%') && !r.body.textAr.includes('1,200'), JSON.stringify(r.body).slice(0, 200));
+    r = await call('GET', '/api/bootstrap');
+    check('bootstrap has promo field, inactive', r.status === 200 && r.body.promo && r.body.promo.active === false, JSON.stringify(r.body.promo));
+    // Volume bonus: 60 cases -> 1,000 (highest only), title Golden Nurse.
+    seedReleased(60, 'seed60-');
+    r = await call('GET', '/api/providers/wallet', null, provToken);
+    check('60 cases -> bonus 1000, title الممرض الذهبي, next 100', r.status === 200 && r.body.monthlyCases === 60 && r.body.volumeBonusEgp === 1000 && r.body.volumeBonus.title === 'الممرض الذهبي' && r.body.volumeBonus.nextBonusAt === 100 && r.body.volumeBonus.casesToNextBonus === 40, JSON.stringify(r.body.volumeBonus));
+    check('wallet totals: 60x212 + 1000 bonus = 13720 owed', r.body.totals.volumeBonusEgp === 1000 && r.body.totals.appOwesProviderEgp === 13720, JSON.stringify(r.body.totals));
+    // 100 cases -> 1,500 (highest only, NOT 500+1000+1500), title Star.
+    seedReleased(40, 'seed100-');
+    r = await call('GET', '/api/providers/wallet', null, provToken);
+    check('100 cases -> bonus 1500 (highest only), title النجم المميز, no next', r.status === 200 && r.body.monthlyCases === 100 && r.body.volumeBonusEgp === 1500 && r.body.volumeBonus.title === 'النجم المميز' && r.body.volumeBonus.nextBonusAt === null && r.body.volumeBonus.casesToNextBonus === null, JSON.stringify(r.body.volumeBonus));
+    check('wallet totals: 100x212 + 1500 bonus = 22700 owed', r.body.totals.volumeBonusEgp === 1500 && r.body.totals.appOwesProviderEgp === 22700, JSON.stringify(r.body.totals));
+    // Voucher expiry: an expired voucher is not listed as active and is
+    // never applied at booking; an active one applies.
+    const patLogin = await call('POST', '/api/auth/login-phone', { phone: '01099999999' });
+    const patToken = patLogin.body.token;
+    check('patient login for voucher checks', patLogin.status === 200 && !!patToken, JSON.stringify(patLogin.body).slice(0, 150));
+    const past = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const future = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
+    store.data.vouchers.push({ id: 'vou-expired', patientPhone: '01099999999', amountEgp: 50, issuedAt: past, expiresAt: past, minBookingEgp: 300, status: 'active', sourceBookingId: null, usedBookingId: null, usedAt: null });
+    r = await call('GET', '/api/me/vouchers', null, patToken);
+    check('expired voucher is expired on read, not active', r.status === 200 && r.body.vouchers.length === 0 && r.body.expiredCount === 1, JSON.stringify(r.body));
+    r = await call('POST', '/api/bookings', { ...TERMS,
+      patientName: 'Expiry Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 8, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    }, patToken);
+    check('expired voucher never applies at booking', r.status === 201 && r.body.amountEgp === 350 && r.body.amountPayableEgp === 350 && r.body.voucherId == null, JSON.stringify(r.body).slice(0, 200));
+    store.data.vouchers.push({ id: 'vou-active', patientPhone: '01099999999', amountEgp: 50, issuedAt: new Date().toISOString(), expiresAt: future, minBookingEgp: 300, status: 'active', sourceBookingId: null, usedBookingId: null, usedAt: null });
+    r = await call('POST', '/api/bookings', { ...TERMS,
+      patientName: 'Expiry Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 8, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    }, patToken);
+    check('active voucher applies at booking (payable 300)', r.status === 201 && r.body.amountEgp === 350 && r.body.amountPayableEgp === 300 && r.body.voucherId === 'vou-active', JSON.stringify(r.body).slice(0, 200));
   } catch (e) {
     fail++;
     results.push(`  FAIL exception: ${e && e.stack || e}`);
