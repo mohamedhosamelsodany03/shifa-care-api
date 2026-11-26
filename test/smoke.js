@@ -2222,8 +2222,8 @@ async function main() {
       check('§28 update: no latestApp -> no update', ua(null) === false);
       check('§28 update: code 0 / empty URL -> no update', ua({ code: 0, apkUrl: '' }) === false);
       check('§28 update: same code -> no update', ua({ code: 21, apkUrl: 'https://x/app.apk' }) === false);
-      check('§28 update: newer code + URL -> update', ua({ code: 23, apkUrl: 'https://x/app.apk' }) === true);
-      check('§28 update: newer code but no URL -> no update', ua({ code: 23, apkUrl: '' }) === false);
+      check('§28 update: newer code + URL -> update', ua({ code: 24, apkUrl: 'https://x/app.apk' }) === true);
+      check('§28 update: newer code but no URL -> no update', ua({ code: 24, apkUrl: '' }) === false);
       const dc = (obj) => run(`__out = updateDialogConfig(${JSON.stringify(obj)});`);
       check('§28 update dialog: optional update can be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: false }).hideCancel === false);
       check('§28 update dialog: forced update cannot be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: true }).hideCancel === true);
@@ -2324,7 +2324,7 @@ async function main() {
     check('§28 terms page shows a prominent scroll-to-accept hint', webJs.includes('termsScrollMust') && webJs.includes('termsScrollHintBox'), 'no prominent terms hint');
     check('§28 last-screen restore is wired (save on navigate, restore at boot)', webJs.includes('saveLastScreen(hash)') && webJs.includes('restoreLastScreen'), 'last-screen restore not wired');
     check('§28 update checker runs after bootstrap on launch', webJs.includes('await loadBootstrap(); checkForAppUpdate();'), 'update check not wired');
-    check('§28 version header is v2.1.8 code 22', webJs.includes('v2.1.8, code 22'), 'header not bumped');
+    check('§28 version header is v2.1.9 code 23', webJs.includes('v2.1.9, code 23'), 'header not bumped');
   }
 
   // --- §29. v2.1.8: password-gated login + push de-automation + responsive layout ---
@@ -2484,8 +2484,8 @@ async function main() {
   // 29f. Version header + responsive layout (360–430px audit).
   {
     const webJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
-    check('§29 version header is v2.1.8 code 22', webJs.includes('v2.1.8, code 22'), 'header not bumped');
-    check('§29 APP_VERSION_CODE is 22 / NAME is 2.1.8', webJs.includes('const APP_VERSION_CODE = 22;') && webJs.includes('const APP_VERSION_NAME = "2.1.8";'), 'version constants not bumped');
+    check('§29 version header is v2.1.9 code 23', webJs.includes('v2.1.9, code 23'), 'header not bumped');
+    check('§29 APP_VERSION_CODE is 23 / NAME is 2.1.9', webJs.includes('const APP_VERSION_CODE = 23;') && webJs.includes('const APP_VERSION_NAME = "2.1.9";'), 'version constants not bumped');
     check('§29 footer shows the installed version in-app', webJs.includes('v${APP_VERSION_NAME} (${APP_VERSION_CODE})'), 'footer has no version');
     const css = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'style.css'), 'utf8');
     check('§29 CSS: no horizontal page scroll (overflow-x clip safety net)', css.includes('overflow-x: clip'), 'no overflow-x guard');
@@ -2537,6 +2537,81 @@ async function main() {
     check('§29 api() generic failure carries .status + .serverMessage', webJs.includes('e.status = res.status;') && webJs.includes('e.serverMessage = data.message;'), 'generic throw has no status');
     check('§29 resetUserPassword branches on e.status === 404', webJs.includes('e.status === 404 || e.message === "404"'), 'reset 404 check missing');
     check('§29 registerAccount branches on e.status === 409', webJs.includes('e.status === 409 || e.message === "409"'), 'register 409 check missing');
+  }
+
+  // --- §30. v2.1.9: in-app option sheets + safe-area topbar + native-dialog audit ---
+  console.log('\n[§30 v2.1.9]');
+  {
+    const webJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
+    const css = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'style.css'), 'utf8');
+    // 30a. Native-dialog audit (the v2.1.8 complaint-dropdown kill):
+    // ZERO <select> elements may remain — the last one (#tqComplaint)
+    // was replaced by the owner-approved in-app complaint sheet.
+    const selectEls = (webJs.match(/<select\s/g) || []).length;
+    check('§30 zero <select> elements remain in the app', selectEls === 0, `found ${selectEls}`);
+    check('§30 no native prompt() anywhere', !webJs.includes('prompt('), 'prompt( present');
+    check('§30 no native confirm() anywhere', !webJs.includes('confirm('), 'confirm( present');
+    check('§30 no native date inputs', !webJs.includes('type="date"'), 'type="date" present');
+    check('§30 no native time inputs', !webJs.includes('type="time"'), 'type="time" present');
+    // 30a2. The complaint sheet itself (owner-approved 26 Nov 2026):
+    // 12 large tappable rows + an "other" row that reveals free text.
+    check('§30 complaintOptions lists all 12 complaints incl. other', webJs.includes('function complaintOptions()') && ['"chest"', '"breath"', '"fever"', '"wound"', '"abdominal"', '"dizzy"', '"pain"', '"catheter"', '"iv"', '"postop"', '"vomit"', '"other"'].every((v) => webJs.includes(v)), 'complaint list incomplete');
+    check('§30 complaint sheet uses large rows + no search box', webJs.includes('large: true, searchable: false'), 'complaint sheet flags missing');
+    check('§30 other-complaint free-text field exists (maxlength 200)', webJs.includes('id="tqComplaintOther"') && webJs.includes('maxlength="200"'), 'other text field missing');
+    check('§30 onTriageComplaintSelect toggles the free-text field', webJs.includes('window.onTriageComplaintSelect') && webJs.includes('tqComplaintOtherWrap'), 'other toggle missing');
+    check('§30 triageComplaintValue returns the typed text for other', webJs.includes('function triageComplaintValue()') && webJs.includes('c.value === "other"'), 'complaint value helper missing');
+    check('§30 readTriageAnswers uses triageComplaintValue', webJs.includes('complaint: triageComplaintValue()'), 'triage still reads the raw select value');
+    check('§30 complaint i18n exists in both languages', webJs.includes('tq1_chest: "ألم في الصدر"') && webJs.includes('tq1_chest: "Chest pain"') && webJs.includes('tq1_other_text'), 'complaint i18n missing');
+    // 30b. The sheet component itself is present and wired.
+    check('§30 appSelectField + openAppSelect + setAppSelectValue exist', webJs.includes('function appSelectField') && webJs.includes('window.openAppSelect') && webJs.includes('function setAppSelectValue'), 'sheet component missing');
+    check('§30 hotel sheets use the shared 30-hotel list', webJs.includes('hotelOptionsList()') && (webJs.match(/hotelOptionsList\(\)/g) || []).length >= 4, 'hotel sheets missing');
+    check('§30 sheet search strings exist (ar + en)', webJs.includes('sheetSearch') && webJs.includes('sheetNoResults'), 'sheet i18n missing');
+    check('§30 date/time normalizers are wired into every submit', webJs.includes('normalizeAllDateTimeFields()') && (webJs.match(/normalizeAllDateTimeFields\(\);/g) || []).length >= 7, 'submit normalization missing');
+    check('§30 pickService keeps the sheet label in sync', webJs.includes('setAppSelectValue("bkService", id)'), 'pickService still sets the raw select value');
+    // 30c. File inputs: the 9 receipt/certificate uploads remain — the
+    // system chooser is a full activity, not a WebView popup, and there
+    // is no in-app replacement without the Capacitor Camera plugin.
+    const fileIds = ['bkReceipt', 'trackReceipt', 'tuReceipt', 'npReceipt', 'poReceipt', 'prCerts', 'docFile'];
+    check('§30 all 9 file inputs are the known receipt/certificate uploads', fileIds.every((id) => webJs.includes(`id="${id}"`)) && (webJs.match(/type="file"/g) || []).length === 9, `file inputs: ${(webJs.match(/type="file"/g) || []).length}`);
+    // 30d. Safe-area topbar + sheet styles in CSS.
+    check('§30 CSS: topbar respects the Android safe area', css.includes('env(safe-area-inset-top'), 'no safe-area rule');
+    check('§30 CSS: option-sheet field + list styles exist', css.includes('.app-select') && css.includes('.opt-item') && css.includes('.opt-search'), 'sheet styles missing');
+    check('§30 CSS: large complaint rows exist', css.includes('.opt-list.opt-large .opt-item'), 'large-row styles missing');
+    // 30e. Version header.
+    check('§30 version header is v2.1.9 code 23', webJs.includes('v2.1.9, code 23') && webJs.includes('const APP_VERSION_CODE = 23;') && webJs.includes('const APP_VERSION_NAME = "2.1.9";'), 'header not bumped');
+    // 30g. The v2.1.9 interview SyntaxError (found by the zero-defect
+    // tap-through): three radios embedded JSON.stringify (double
+    // quotes) inside a DOUBLE-quoted inline handler — the attribute
+    // ended early, the handler compiled to `ivAnswer(` and every tap
+    // threw "Unexpected end of input" with no stack, recording no
+    // answer. The fix is single-quoted handler attributes. This check
+    // fails the build if the pattern ever returns.
+    check('§30 no JSON.stringify inside a double-quoted inline handler', !/on\w+="[^"]*JSON\.stringify/.test(webJs), 'inline handler embeds JSON.stringify in double quotes');
+    check('§30 interview + language-test handlers use single-quoted attributes', webJs.includes("onchange='ivAnswer(") && webJs.includes("onchange='ivEnglish(") && webJs.includes("onchange='ltAnswer("), 'handler quotes reverted');
+    const vm = require('vm');
+    const BEGIN9 = '/* v2.1.9 — testable helpers (BEGIN';
+    const END9 = '/* v2.1.9 — testable helpers (END) */';
+    const bi9 = webJs.indexOf(BEGIN9);
+    const ei9 = webJs.indexOf(END9, bi9);
+    check('§30 v2.1.9 helpers block is extractable from web/app.js', bi9 !== -1 && ei9 !== -1 && ei9 > bi9, `${bi9}/${ei9}`);
+    if (bi9 !== -1 && ei9 !== -1) {
+      const ctx9 = vm.createContext({ console });
+      vm.runInContext(webJs.slice(bi9, ei9), ctx9);
+      const d = (x) => vm.runInContext(`normalizeDateValue(${JSON.stringify(x)});`, ctx9);
+      const tt = (x) => vm.runInContext(`normalizeTimeValue(${JSON.stringify(x)});`, ctx9);
+      check('§30 normalizeDateValue keeps ISO dates', d('2026-11-26') === '2026-11-26', d('2026-11-26'));
+      check('§30 normalizeDateValue pads single digits', d('2026-1-5') === '2026-01-05', d('2026-1-5'));
+      check('§30 normalizeDateValue accepts DD/MM/YYYY', d('26/11/2026') === '2026-11-26', d('26/11/2026'));
+      check('§30 normalizeDateValue accepts DD-MM-YY', d('26-11-26') === '2026-11-26', d('26-11-26'));
+      check('§30 normalizeDateValue rejects Feb 30', d('2026-02-30') === '', d('2026-02-30'));
+      check('§30 normalizeDateValue rejects month 13', d('2026-13-01') === '', d('2026-13-01'));
+      check('§30 normalizeDateValue rejects garbage', d('hello') === '' && d('') === '', d('hello'));
+      check('§30 normalizeTimeValue keeps HH:MM', tt('10:00') === '10:00', tt('10:00'));
+      check('§30 normalizeTimeValue pads single-digit hour', tt('9:05') === '09:05', tt('9:05'));
+      check('§30 normalizeTimeValue accepts 4-digit HHMM', tt('1000') === '10:00', tt('1000'));
+      check('§30 normalizeTimeValue rejects hour 25', tt('25:00') === '', tt('25:00'));
+      check('§30 normalizeTimeValue rejects garbage', tt('noon') === '' && tt('') === '', tt('noon'));
+    }
   }
 
   // --- 14. logout / refresh revocation ---------------------------------
