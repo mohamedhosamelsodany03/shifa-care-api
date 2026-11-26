@@ -112,6 +112,11 @@ function seed() {
     // POST /api/client-report) + their per-IP rate-limit buckets.
     clientReports: [], // capped at 200, newest last; tokens/PINs never stored
     clientReportLimits: {}, // ip -> {requests: [ts...]} (10/hour)
+    // v2.1.8 — password gate: failed password-login attempts per phone
+    // (timestamps, for the 5-failures/15-min lockout). bcrypt hashes live
+    // on the user record (passwordHash) — never plaintext, never in the
+    // audit log.
+    loginFailures: {}, // phone -> {failures: [ts...]}
     doctors: [], // {id, name, specialty, phone, clinic, address, workingHours, notes, active, createdAt}
     settlementNotifiedOn: null, // 'YYYY-MM-DD' (Africa/Cairo) of the last Thursday-settlement notification pass
     // v2.1.1 — weekly settlement records (audit #5): one per provider per
@@ -210,6 +215,8 @@ class Store {
     // v2.1.7 — client reports + rate-limit buckets.
     if (!Array.isArray(this.data.clientReports)) this.data.clientReports = [];
     if (!this.data.clientReportLimits) this.data.clientReportLimits = {};
+    // v2.1.8 — password-gate lockout buckets.
+    if (!this.data.loginFailures) this.data.loginFailures = {};
     if (!this.data.doctors) this.data.doctors = [];
     if (!('settlementNotifiedOn' in this.data)) this.data.settlementNotifiedOn = null;
     if (!Array.isArray(this.data.settlements)) this.data.settlements = [];

@@ -83,6 +83,11 @@ function createApp() {
   app.use('/api/otp/request', otpLimiter);
   app.use('/api/otp/verify', otpVerifyLimiter);
   app.use('/api/auth/login-phone', phoneLoginLimiter);
+  // v2.1.8 — password gate: the register + set-password endpoints get a
+  // light per-IP limit (the per-phone caps live in routes.js). The admin
+  // password-reset is behind the admin JWT already.
+  app.use('/api/auth/register', genericLimiter(20, 'Too many registration attempts from this IP.'));
+  app.use('/api/auth/set-password', genericLimiter(20, 'Too many password changes from this IP.'));
   app.use('/api/auth/refresh', genericLimiter(30, 'Too many token refresh attempts from this IP.'));
   app.use('/api/auth/logout', genericLimiter(30, 'Too many logout attempts from this IP.'));
   app.use('/api/admin/pin/verify', pinLimiter);

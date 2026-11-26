@@ -31,11 +31,15 @@ function check(name, cond, extra = '') {
   if (cond) { pass++; console.log(`  PASS ${name}`); }
   else { fail++; failures.push(name); console.log(`  FAIL ${name} ${extra}`); }
 }
-async function req(method, p, { token, body, admin, origin, monitorToken } = {}) {
+async function req(method, p, { token, body, admin, origin, monitorToken, xff } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (origin) headers.Origin = origin;
   if (monitorToken) headers['X-Monitor-Token'] = monitorToken;
+  // v2.1.8 (§29): the login-phone IP bucket is exhausted by the earlier
+  // sections (~23 calls vs 20/15min), so §29 auth tests use a distinct
+  // X-Forwarded-For per group (the server trusts 1 proxy hop).
+  if (xff) headers['X-Forwarded-For'] = xff;
   const r = await fetch(BASE + p, { method, headers, body: body ? JSON.stringify(body) : undefined });
   let json = null;
   try { json = await r.json(); } catch { /* html responses */ }
@@ -2218,8 +2222,8 @@ async function main() {
       check('§28 update: no latestApp -> no update', ua(null) === false);
       check('§28 update: code 0 / empty URL -> no update', ua({ code: 0, apkUrl: '' }) === false);
       check('§28 update: same code -> no update', ua({ code: 21, apkUrl: 'https://x/app.apk' }) === false);
-      check('§28 update: newer code + URL -> update', ua({ code: 22, apkUrl: 'https://x/app.apk' }) === true);
-      check('§28 update: newer code but no URL -> no update', ua({ code: 22, apkUrl: '' }) === false);
+      check('§28 update: newer code + URL -> update', ua({ code: 23, apkUrl: 'https://x/app.apk' }) === true);
+      check('§28 update: newer code but no URL -> no update', ua({ code: 23, apkUrl: '' }) === false);
       const dc = (obj) => run(`__out = updateDialogConfig(${JSON.stringify(obj)});`);
       check('§28 update dialog: optional update can be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: false }).hideCancel === false);
       check('§28 update dialog: forced update cannot be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: true }).hideCancel === true);
@@ -2320,7 +2324,219 @@ async function main() {
     check('§28 terms page shows a prominent scroll-to-accept hint', webJs.includes('termsScrollMust') && webJs.includes('termsScrollHintBox'), 'no prominent terms hint');
     check('§28 last-screen restore is wired (save on navigate, restore at boot)', webJs.includes('saveLastScreen(hash)') && webJs.includes('restoreLastScreen'), 'last-screen restore not wired');
     check('§28 update checker runs after bootstrap on launch', webJs.includes('await loadBootstrap(); checkForAppUpdate();'), 'update check not wired');
-    check('§28 version header is v2.1.7 code 21', webJs.includes('v2.1.7, code 21'), 'header not bumped');
+    check('§28 version header is v2.1.8 code 22', webJs.includes('v2.1.8, code 22'), 'header not bumped');
+  }
+
+  // --- §29. v2.1.8: password-gated login + push de-automation + responsive layout ---
+  console.log('\n[§29 v2.1.8]');
+  // 29a. Registration validation + bcrypt.
+  {
+    const xff = '10.29.1.1';
+    r = await req('POST', '/api/auth/register', { xff, body: { phone: '01029100001', password: 'short', terms: TERMS } });
+    check('§29 register with a <6-char password -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/register', { xff, body: { phone: '123', password: 'secret1', terms: TERMS } });
+    check('§29 register with an invalid phone -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/register', { xff, body: { phone: '01029100001', password: 'secret1', terms: { acceptedTerms: false, termsVersion: '1.0' } } });
+    check('§29 register without terms acceptance -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/register', { xff, body: { phone: '01029100001', password: 'secret1', terms: TERMS } });
+    check('§29 register valid -> 201 + password tokens, no password gate', r.status === 201 && !!r.json?.token && !!r.json?.refreshToken && r.json?.authMethod === 'password' && r.json?.requiresPassword === false, JSON.stringify(r.json));
+    const regToken = r.json?.token;
+    r = await req('POST', '/api/auth/register', { xff, body: { phone: '01029100001', password: 'other12', terms: TERMS } });
+    check('§29 re-registering the same phone -> 409', r.status === 409, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: '01029100001', password: 'secret1' } });
+    check('§29 login with the right password -> 200 + authMethod password', r.status === 200 && r.json?.authMethod === 'password' && r.json?.requiresPassword === false, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: '01029100001', password: 'wrongpw' } });
+    check('§29 login with the wrong password -> generic 401 (never reveals which field)', r.status === 401 && r.json?.message === 'رقم الهاتف أو كلمة المرور غير صحيحة', JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: '01029100001' } });
+    check('§29 login with no password on a password account -> 401', r.status === 401, JSON.stringify(r.json));
+    // The stored record holds ONLY a bcrypt hash (cost 10) — and the
+    // plaintext password appears nowhere in the data file or the audit.
+    const dataText = fs.readFileSync(DATA_FILE, 'utf8');
+    const data = JSON.parse(dataText);
+    const rec = data.users && data.users['01029100001'];
+    check('§29 stored password is a bcrypt hash (cost 10), never plaintext', !!rec?.passwordHash && typeof rec.passwordHash === 'string' && /^\$2[ab]\$10\$/.test(rec.passwordHash) && rec.passwordHash !== 'secret1', String(rec?.passwordHash || '').slice(0, 12));
+    check('§29 plaintext password appears nowhere in the data file', !dataText.includes('secret1'), 'secret1 found in data file');
+    check('§29 wrong-password audit exists, without a password value', (data.audit || []).some((a) => a.action === 'auth.login_wrong_password' && a.actor === '01029100001') && !dataText.includes('wrongpw'), 'audit missing or leaks password');
+    void regToken;
+  }
+  // 29b. Rate-limit lockout: 5 failures in 15 minutes lock the phone.
+  {
+    const xff = '10.29.2.2';
+    r = await req('POST', '/api/auth/register', { xff: '10.29.2.1', body: { phone: '01029100002', password: 'lockme1', terms: TERMS } });
+    check('§29 lockout setup: register -> 201', r.status === 201, JSON.stringify(r.json));
+    let fails = 0;
+    for (let i = 0; i < 5; i++) {
+      r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: '01029100002', password: 'badpass' } });
+      if (r.status === 401) fails++;
+    }
+    check('§29 5 wrong passwords -> 5x generic 401', fails === 5, String(fails));
+    r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: '01029100002', password: 'lockme1' } });
+    check('§29 6th attempt (even with the RIGHT password) -> 429 lockout', r.status === 429, JSON.stringify(r.json));
+    const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    check('§29 lockout is audited (auth.login_locked_out)', (data.audit || []).some((a) => a.action === 'auth.login_locked_out' && a.actor === '01029100002'), 'no lockout audit');
+  }
+  // 29c. Migration: a legacy phone-only account logs in once, sets a
+  // password, and after that password login is mandatory.
+  {
+    const xff = '10.29.3.1';
+    r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: '01029100003' } });
+    check('§29 legacy account logs in phone-only once -> 200 + requiresPassword', r.status === 200 && r.json?.requiresPassword === true && r.json?.authMethod === 'phone-only', JSON.stringify(r.json));
+    const legacyToken = r.json?.token;
+    r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: '01029100003', password: 'anything' } });
+    check('§29 legacy account ignores a sent password, still requires one', r.status === 200 && r.json?.requiresPassword === true, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/set-password', { token: legacyToken, body: { password: 'short' } });
+    check('§29 set-password rejects <6 chars -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/set-password', { token: legacyToken, body: { password: 'legacy1' } });
+    check('§29 legacy account sets its own password -> 200', r.status === 200 && r.json?.requiresPassword === false, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: '01029100003', password: 'legacy1' } });
+    check('§29 after migration, password login works -> 200, no gate', r.status === 200 && r.json?.requiresPassword === false && r.json?.authMethod === 'password', JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: '01029100003' } });
+    check('§29 after migration, phone-only login is refused -> 401', r.status === 401, JSON.stringify(r.json));
+    const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    check('§29 password_set is audited', (data.audit || []).some((a) => a.action === 'auth.password_set' && a.actor === '01029100003'), 'no password_set audit');
+  }
+  // 29d. Admin password reset (no OTP exists): temp password, sessions
+  // revoked, old password dead, temp login forces a new password.
+  {
+    const xffReg = '10.29.4.1', xffLogin = '10.29.4.2';
+    r = await req('POST', '/api/auth/register', { xff: xffReg, body: { phone: '01029100004', password: 'resetme', terms: TERMS } });
+    check('§29 reset setup: register -> 201', r.status === 201, JSON.stringify(r.json));
+    const oldRefresh = r.json?.refreshToken;
+    r = await req('POST', '/api/admin/password-reset', { token: adminToken, body: { phone: '01029100009' } });
+    check('§29 reset for an unknown phone -> 404', r.status === 404, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/password-reset', { token: adminToken, body: { phone: '01029100004' } });
+    check('§29 admin reset -> 200 + 8-char temp password + hadPassword', r.status === 200 && typeof r.json?.tempPassword === 'string' && r.json.tempPassword.length === 8 && r.json?.hadPassword === true && (r.json?.sessionsRevoked || 0) >= 1, JSON.stringify({ ...r.json, tempPassword: r.json?.tempPassword ? '<hidden>' : null }));
+    const tempPassword = r.json?.tempPassword;
+    r = await req('POST', '/api/auth/refresh', { body: { refreshToken: oldRefresh } });
+    check('§29 reset revokes the old session (refresh -> 401)', r.status === 401, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/login-phone', { xff: xffLogin, body: { phone: '01029100004', password: 'resetme' } });
+    check('§29 old password is dead after reset -> 401', r.status === 401, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/login-phone', { xff: xffLogin, body: { phone: '01029100004', password: tempPassword } });
+    check('§29 temp password logs in -> 200 + must change it', r.status === 200 && r.json?.requiresPasswordChange === true, JSON.stringify(r.json));
+    const tempToken = r.json?.token;
+    r = await req('POST', '/api/auth/set-password', { token: tempToken, body: { password: 'newpass1' } });
+    check('§29 temp login sets a new own password -> 200', r.status === 200, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/login-phone', { xff: xffLogin, body: { phone: '01029100004', password: 'newpass1' } });
+    check('§29 new password works, no more gate -> 200', r.status === 200 && r.json?.requiresPasswordChange === false && r.json?.requiresPassword === false, JSON.stringify(r.json));
+    const dataText = fs.readFileSync(DATA_FILE, 'utf8');
+    const data = JSON.parse(dataText);
+    check('§29 reset is audited (admin.password_reset, phone only)', (data.audit || []).some((a) => a.action === 'admin.password_reset' && a.actor === 'admin' && a.details?.phone === '01029100004'), 'no reset audit');
+    check('§29 temp password value appears nowhere in the data file', !dataText.includes(tempPassword), 'temp password leaked into data file');
+  }
+  // 29e. Push de-automation + death-step markers (the 2.1.7 login kill).
+  {
+    const webJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
+    const noComments = webJs.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+    check('§29 no automatic push registration remains (registerPushToken is gone)', !noComments.includes('registerPushToken'), 'registerPushToken still present');
+    const clStart = webJs.indexOf('async function completeLogin');
+    const clEnd = webJs.indexOf('\n}\n', clStart);
+    const clBody = clStart !== -1 && clEnd !== -1 ? webJs.slice(clStart, clEnd) : '';
+    check('§29 completeLogin shows only the DOM explain card, no native push', clBody.includes('maybeShowPushExplainCard();') && !clBody.includes('getPushPlugin') && !clBody.includes('PushNotifications') && !clBody.includes('registerPushToken'), 'completeLogin still touches push');
+    check('§29 getPushPlugin is called only from requestPushPermission', (webJs.match(/getPushPlugin\(\)/g) || []).length === 2, `getPushPlugin() occurrences: ${(webJs.match(/getPushPlugin\(\)/g) || []).length}`);
+    check('§29 no silent permission check on the login path (checkPermissions gone)', !noComments.includes('checkPermissions'), 'checkPermissions still present');
+    check('§29 native push.register() lives only in requestPushPermission', (webJs.match(/push\.register\(\)/g) || []).length === 1 && webJs.includes('async function requestPushPermission()'), 'push.register() outside requestPushPermission');
+    check('§29 explicit-tap entry points exist (card Allow + notifications button)', webJs.includes('await requestPushPermission();') && webJs.includes('requestPushPermission();'), 'explicit-tap entry missing');
+    check('§29 death-step markers wrap every native push call', webJs.includes('setDeathStep("push:requestPermissions")') && webJs.includes('setDeathStep("push:register")') && webJs.includes('setDeathStep("push:addListener")') && webJs.includes('clearDeathStep()'), 'step markers missing');
+    const ruStart = webJs.indexOf('async function refreshUnreadCount');
+    const ruEnd = webJs.indexOf('\n}\n', ruStart);
+    const ruBody = ruStart !== -1 && ruEnd !== -1 ? webJs.slice(ruStart, ruEnd) : '';
+    const vnStart = webJs.indexOf('function viewNotifications');
+    const vnEnd = webJs.indexOf('\n}\n', vnStart);
+    const vnBody = vnStart !== -1 && vnEnd !== -1 ? webJs.slice(vnStart, vnEnd) : '';
+    check('§29 in-app notification centre never touches native push', ruBody.includes('api("/api/me/notifications")') && !ruBody.includes('getPushPlugin') && !ruBody.includes('push.register(') && !ruBody.includes('push.requestPermissions(') && !vnBody.includes('getPushPlugin') && !vnBody.includes('push.register(') && !vnBody.includes('push.requestPermissions(') && !vnBody.includes('push.checkPermissions(') && !vnBody.includes('push.addListener('), 'centre depends on push');
+    check('§29 first-launch gate: home without a token opens the login gate', webJs.includes('html = store.token ? viewHome() : viewLogin("patient")'), 'home gate missing');
+    check('§29 boot forces the login gate when logged out, set-password when gated', webJs.includes('history.replaceState(null, "", "#/login?role=patient")') && webJs.includes('history.replaceState(null, "", "#/set-password")'), 'boot gate missing');
+    check('§29 set-password route exists and is token-guarded', webJs.includes('path === "set-password"') && webJs.includes('store.token ? viewSetPassword() : viewLogin("patient")'), 'set-password route missing');
+    check('§29 admin passwords tab exists (reset UI)', webJs.includes('"passwords"') && webJs.includes('resetUserPassword') && webJs.includes('/api/admin/password-reset'), 'passwords tab missing');
+    check('§29 forgot-password link points at the support WhatsApp', webJs.includes('toggleForgotPassword()') && webJs.includes('wa.me/201008629060'), 'forgot-password link missing');
+    // Death-step helpers (v2.1.8 block, extracted verbatim) + the
+    // unclean_exit report carrying lastStep (v2.1.7 block, §28 style).
+    const vm = require('vm');
+    const appJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
+    const BEGIN8 = '/* v2.1.8 — testable helpers (BEGIN';
+    const END8 = '/* v2.1.8 — testable helpers (END) */';
+    const bi8 = appJs.indexOf(BEGIN8);
+    const ei8 = appJs.indexOf(END8, bi8);
+    check('§29 v2.1.8 helpers block is extractable from web/app.js', bi8 !== -1 && ei8 !== -1 && ei8 > bi8, `${bi8}/${ei8}`);
+    if (bi8 !== -1 && ei8 !== -1) {
+      const code8 = appJs.slice(bi8, ei8);
+      const m8 = new Map();
+      const ls8 = { getItem: (k) => (m8.has(k) ? m8.get(k) : null), setItem: (k, v) => m8.set(k, String(v)), removeItem: (k) => m8.delete(k) };
+      const ctx8 = vm.createContext({ localStorage: ls8, console });
+      vm.runInContext(code8, ctx8);
+      vm.runInContext('setDeathStep("push:register");', ctx8);
+      check('§29 setDeathStep persists the step in localStorage', ls8.getItem('shifa_death_step') === 'push:register', String(ls8.getItem('shifa_death_step')));
+      const step = vm.runInContext('getDeathStep();', ctx8);
+      check('§29 getDeathStep reads the step back', step === 'push:register', String(step));
+      vm.runInContext('clearDeathStep();', ctx8);
+      check('§29 clearDeathStep removes the step', ls8.getItem('shifa_death_step') === null, String(ls8.getItem('shifa_death_step')));
+      check('§29 getDeathStep is null when no step is set', vm.runInContext('getDeathStep();', ctx8) === null, '');
+    }
+    // The unclean_exit report carries the step that survived the kill.
+    // (The §28a client-report bucket is full on the default IP, so this
+    // report uses a distinct X-Forwarded-For.)
+    r = await req('POST', '/api/client-report', { xff: '10.29.9.9', body: { kind: 'unclean_exit', lastScreen: '#/login', lastHeartbeat: 1234567890, lastStep: 'push:register', screen: '#/login', appVersion: '2.1.8 (22)' } });
+    check('§29 client-report accepts lastStep -> 200', r.status === 200 && typeof r.json?.id === 'string', JSON.stringify(r.json));
+    r = await req('GET', '/api/admin/client-reports', { token: adminToken });
+    const withStep = (r.json || []).find((x) => x.lastStep === 'push:register');
+    check('§29 stored unclean_exit report keeps lastStep', !!withStep && withStep.appVersion === '2.1.8 (22)', JSON.stringify(withStep));
+  }
+  // 29f. Version header + responsive layout (360–430px audit).
+  {
+    const webJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
+    check('§29 version header is v2.1.8 code 22', webJs.includes('v2.1.8, code 22'), 'header not bumped');
+    check('§29 APP_VERSION_CODE is 22 / NAME is 2.1.8', webJs.includes('const APP_VERSION_CODE = 22;') && webJs.includes('const APP_VERSION_NAME = "2.1.8";'), 'version constants not bumped');
+    check('§29 footer shows the installed version in-app', webJs.includes('v${APP_VERSION_NAME} (${APP_VERSION_CODE})'), 'footer has no version');
+    const css = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'style.css'), 'utf8');
+    check('§29 CSS: no horizontal page scroll (overflow-x clip safety net)', css.includes('overflow-x: clip'), 'no overflow-x guard');
+    check('§29 CSS: topbar compacts at <=520px (smaller logo, tagline hidden)', css.includes('.topbar .brand small { display: none; }') && css.includes('.topbar .logo { width: 36px;'), 'topbar not compacted');
+    check('§29 CSS: OTP boxes shrink at <=400px (fit a 360px card)', css.includes('.otp-box input { width: 40px; height: 48px;'), 'OTP boxes not shrunk');
+    check('§29 CSS: role/service grids use two columns on phones', css.includes('minmax(150px, 1fr)') && css.includes('minmax(160px, 1fr)'), 'grids still single-column');
+    check('§29 CSS: long tables scroll inside themselves', css.includes('table.tbl') && css.includes('display: block; overflow-x: auto;'), 'tables can overflow');
+  }
+
+  // 29g. Dual-role login (v2.1.8 fix found by the Playwright viewport
+  // test): a phone that is BOTH a patient and a provider must get the
+  // token role it asked for. Before the fix, login-phone ignored the
+  // requested role and forced 'provider' whenever a provider record
+  // existed, so a nurse booking care for a family member got a
+  // provider token and every patient call (favourites, booking,
+  // complaint) 403'd.
+  {
+    const xff = '10.29.9.5';
+    const dualPhone = '01029100005';
+    r = await req('POST', '/api/auth/register', { xff, body: { phone: dualPhone, password: 'dualpass1', terms: { acceptedTerms: true, termsVersion: '1.0' } } });
+    check('§29 dual-role setup: patient registration -> 201', r.status === 201, JSON.stringify(r.json));
+    const dualPatientToken = r.json?.accessToken;
+    r = await req('POST', '/api/providers/register', { xff, token: dualPatientToken, body: { ...TERMS, name: 'Dual Role Nurse', providerType: 'nurse', role: 'nurse', nationalId: '12345678901234', licenseNo: 'LIC-DUAL1', certificates: [] } });
+    check('§29 dual-role setup: same phone registers as a provider -> 201', r.status === 201, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: dualPhone, password: 'dualpass1', role: 'patient' } });
+    check('§29 dual-role login as patient returns a PATIENT token', r.status === 200 && r.json?.role === 'patient', JSON.stringify(r.json)?.slice(0, 200));
+    const dualAsPatient = r.json?.accessToken;
+    r = await req('GET', '/api/me/favorites', { token: dualAsPatient });
+    check('§29 dual-role patient token can call patient endpoints (favourites 200)', r.status === 200, JSON.stringify(r.json)?.slice(0, 120));
+    r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: dualPhone, password: 'dualpass1', role: 'provider' } });
+    check('§29 dual-role login as provider returns a PROVIDER token', r.status === 200 && r.json?.role === 'provider' && typeof r.json?.providerId === 'string', JSON.stringify(r.json)?.slice(0, 200));
+    const dualAsProvider = r.json?.accessToken;
+    r = await req('GET', '/api/providers/me', { token: dualAsProvider });
+    check('§29 dual-role provider token can call provider endpoints (me 200)', r.status === 200 && r.json?.phone === dualPhone, JSON.stringify(r.json)?.slice(0, 120));
+    r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: dualPhone, password: 'dualpass1' } });
+    check('§29 dual-role login with no role defaults to patient', r.status === 200 && r.json?.role === 'patient', JSON.stringify(r.json)?.slice(0, 200));
+  }
+
+  // 29h. Client error-status fix (v2.1.8, found by the Playwright
+  // viewport test): api()'s generic failure path threw the server text
+  // with no .status, so `e.message === "404"` in resetUserPassword
+  // and `e.message === "409"` in registerAccount never matched and the
+  // admin/patient saw the raw English server message instead of the
+  // Arabic one. The generic path now attaches .status + .serverMessage
+  // while keeping e.message as the server text (the chat handler and
+  // apiErrorMessage rely on that).
+  {
+    const webJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
+    check('§29 api() generic failure carries .status + .serverMessage', webJs.includes('e.status = res.status;') && webJs.includes('e.serverMessage = data.message;'), 'generic throw has no status');
+    check('§29 resetUserPassword branches on e.status === 404', webJs.includes('e.status === 404 || e.message === "404"'), 'reset 404 check missing');
+    check('§29 registerAccount branches on e.status === 409', webJs.includes('e.status === 409 || e.message === "409"'), 'register 409 check missing');
   }
 
   // --- 14. logout / refresh revocation ---------------------------------

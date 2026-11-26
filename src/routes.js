@@ -1757,6 +1757,10 @@ router.post('/client-report', (req, res) => {
     id: newId('crep'), kind,
     lastScreen: str(b.lastScreen, 200),
     lastHeartbeat: typeof b.lastHeartbeat === 'number' ? b.lastHeartbeat : null,
+    // v2.1.8 — the last native step the client marked before it died
+    // (e.g. "push:register"): set around native calls that a JS
+    // try/catch cannot catch, so the next report pinpoints the kill.
+    lastStep: str(b.lastStep, 100),
     message: str(b.message, 2000),
     stack: str(b.stack, 2000),
     screen: str(b.screen, 200),
@@ -1987,6 +1991,131 @@ router.post('/otp/verify', (req, res) => {
 //     a patient; a user record is created on first use (patients only).
 //   Rate limit: same per-phone cap as OTP requests (5/hour) + an IP
 //     limiter in app.js. Every login is audit-logged.
+//   v2.1.8 — password gate: { phone, password?, role? }. Accounts with
+//     a passwordHash REQUIRE the matching password (wrong password ->
+//     generic 401, never revealing which field is wrong; 5 failures in
+//     15 minutes -> 429 lockout). Accounts without one (legacy, or a
+//     brand-new phone) log in phone-only ONCE and the client forces
+//     set-password immediately (response: requiresPassword: true); a
+//     temp password from an admin reset forces it too
+//     (requiresPasswordChange: true).
+
+// ---------------------------------------------------------------- v2.1.8
+// Password-gated login (owner decision 26 Nov 2026): phone-only login
+// was the security review's C1 — anyone who knew a number could take
+// over the account. Login is now phone + a password the user chooses
+// themselves; the server stores ONLY a bcrypt hash (cost 10), never
+// plaintext, never in logs or audit entries. Full OTP stays deferred
+// until full launch, so the legacy phone-only path is kept ONLY as a
+// one-time migration step: an account without a passwordHash logs in
+// once and the client immediately forces set-password, after which
+// password login is mandatory.
+// Migration shape: user records carry passwordHash (string | undefined),
+// passwordSetAt (ISO | undefined), mustChangePassword (bool).
+const PASSWORD_MIN_LENGTH = 6;
+const PASSWORD_MAX_LENGTH = 128;
+const PASSWORD_LOCKOUT_MAX = 5; // failed attempts in the window -> 429
+const PASSWORD_LOCKOUT_WINDOW_MS = 15 * 60 * 1000;
+function validPassword(pw) {
+  return typeof pw === 'string' && pw.length >= PASSWORD_MIN_LENGTH && pw.length <= PASSWORD_MAX_LENGTH;
+}
+function hashPassword(pw) { return bcrypt.hashSync(pw, 10); }
+function passwordMatches(pw, hash) {
+  if (typeof pw !== 'string' || typeof hash !== 'string' || !hash) return false;
+  try { return bcrypt.compareSync(pw, hash); } catch (e) { return false; }
+}
+function recentLoginFailures(phone) {
+  const bucket = (store.data.loginFailures || {})[phone];
+  if (!bucket || !Array.isArray(bucket.failures)) return [];
+  const since = Date.now() - PASSWORD_LOCKOUT_WINDOW_MS;
+  return bucket.failures.filter((t) => typeof t === 'number' && t > since);
+}
+function recordLoginFailure(phone) {
+  const failures = store.data.loginFailures || (store.data.loginFailures = {});
+  const bucket = failures[phone] || (failures[phone] = { failures: [] });
+  bucket.failures = recentLoginFailures(phone);
+  bucket.failures.push(Date.now());
+  store.save();
+}
+function clearLoginFailures(phone) {
+  if (store.data.loginFailures && store.data.loginFailures[phone]) {
+    delete store.data.loginFailures[phone];
+    store.save();
+  }
+}
+// Revoke every live refresh token for a phone (used after an admin
+// password reset so a stolen session cannot outlive the reset).
+function revokeUserRefreshTokens(phone) {
+  let revoked = 0;
+  for (const rec of Object.values(store.data.refreshTokens || {})) {
+    if (rec && rec.phone === phone && !rec.revoked) { rec.revoked = true; revoked++; }
+  }
+  if (revoked) store.save();
+  return revoked;
+}
+// Temporary password for admin resets: 8 chars from an unambiguous
+// alphabet (no 0/O/1/l/I) — the admin reads it to the user once; the
+// user must choose their own password on next login.
+function generateTempPassword() {
+  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+  let out = '';
+  for (const b of crypto.randomBytes(8)) out += chars[b % chars.length];
+  return out;
+}
+// The authMethod + refresh TTL of the phone's most recent live refresh
+// token — used when a route issues fresh tokens for an already
+// authenticated phone (provider registration). Password and phone-only
+// sessions keep the 24h refresh; OTP sessions keep the configured TTL.
+function authMethodForPhone(phone) {
+  let latest = null;
+  for (const rec of Object.values(store.data.refreshTokens || {})) {
+    if (rec && rec.phone === phone && !rec.revoked && (!latest || (rec.createdAt || 0) > (latest.createdAt || 0))) latest = rec;
+  }
+  if (!latest) return { refreshTtlDays: 1, authMethod: 'phone-only' };
+  if (latest.authMethod === 'phone-only' || latest.authMethod === 'password') return { refreshTtlDays: 1, authMethod: latest.authMethod };
+  return { refreshTtlDays: config.refreshTtlDays, authMethod: latest.authMethod || null };
+}
+// Per-phone attempt cap shared by login-phone and register (5/hour,
+// same bucket as OTP requests). Returns true when the cap is hit.
+// Register uses its OWN bucket (phoneRegisterLogins): a registration
+// must not consume the login attempts of the same phone (or a fresh
+// registration would eat the lockout test's 5 login attempts).
+function phoneRateLimitExceeded(phone, bucketKey) {
+  const key = bucketKey || 'phoneLogins';
+  const logins = store.data[key] || (store.data[key] = {});
+  const rec = logins[phone] || { requests: [] };
+  const hourAgo = Date.now() - 60 * 60 * 1000;
+  rec.requests = (rec.requests || []).filter((t) => t > hourAgo);
+  if (rec.requests.length >= config.otpMaxRequestsPerHour) return true;
+  rec.requests.push(Date.now());
+  logins[phone] = rec;
+  return false;
+}
+// New-device bookkeeping shared by login-phone and register (v2.1.6 C1
+// interim): records the device on the user record and returns whether
+// it is unseen. Audit + the new-device warning are the caller's job.
+function recordDevice(userRec, req) {
+  userRec.devices = userRec.devices || [];
+  const rawDeviceId = typeof req.body?.deviceId === 'string' ? req.body.deviceId.trim().slice(0, 128) : '';
+  const deviceId = rawDeviceId || `ua:${sha256(req.headers['user-agent'] || 'unknown').slice(0, 12)}`;
+  const known = userRec.devices.find((d) => d.id === deviceId);
+  const isNewDevice = !known;
+  if (known) known.lastSeenAt = nowIso();
+  else userRec.devices.push({ id: deviceId, firstSeenAt: nowIso(), lastSeenAt: nowIso(), userAgent: String(req.headers['user-agent'] || '').slice(0, 200) });
+  return { isNewDevice, deviceId };
+}
+// Best-effort in-app + push warning when a login comes from a device
+// that is not the account's first — if it was not the owner, they can
+// contact the admin. A failed notification never blocks login.
+function warnNewDevice(phone, userRec, isNewDevice) {
+  if (!isNewDevice || userRec.devices.length <= 1) return;
+  notify.notifyUser(phone, {
+    type: 'security', titleAr: 'دخول من جهاز جديد', titleEn: 'Login from a new device',
+    bodyAr: 'تم الدخول إلى حسابك من جهاز لم نره من قبل. إذا لم يكن هذا أنت، تواصل مع إدارة التطبيق فورًا.',
+    bodyEn: 'Your account was signed in from a device we have not seen before. If this was not you, contact the app admin right away.',
+    data: { type: 'new_device' }, critical: false,
+  }).catch(() => {});
+}
 router.post('/auth/login-phone', (req, res) => {
   const phone = normalizePhone(req.body?.phone);
   if (!phone) return bad(res, 400, 'Valid Egyptian phone number required (01xxxxxxxxx).');
@@ -2003,21 +2132,54 @@ router.post('/auth/login-phone', (req, res) => {
   if (req.body?.role === 'provider' && !provider) {
     return res.status(403).json({ error: 'forbidden', message: 'This phone is not registered as a provider. Register as a provider first.' });
   }
-  const logins = store.data.phoneLogins || (store.data.phoneLogins = {});
-  const rec = logins[phone] || { requests: [] };
-  const hourAgo = Date.now() - 60 * 60 * 1000;
-  rec.requests = (rec.requests || []).filter((t) => t > hourAgo);
-  if (rec.requests.length >= config.otpMaxRequestsPerHour) {
+  // v2.1.8 — honour the requested role. A phone can be BOTH a patient
+  // and a provider (a nurse booking care for a family member), so the
+  // token role must be the role the user asked to log in as. The 403
+  // above already rejects role=provider for a phone with no provider
+  // record. (Previously the provider record forced a provider token
+  // even for role=patient, so dual-role users could never use the
+  // patient side — favourites, booking and complaint all 403'd.
+  // Found by the v2.1.8 Playwright viewport test.)
+  const role = req.body?.role === 'provider' ? 'provider' : 'patient';
+  // v2.1.8 — lockout FIRST: a password account with 5 failed attempts
+  // in 15 minutes is locked out (429 + audit) before the hourly cap is
+  // consulted, so the lockout is observable and audited on its own
+  // (both caps are 5, so the hourly cap would otherwise mask it).
+  const existingUser = store.data.users[phone];
+  if (existingUser && typeof existingUser.passwordHash === 'string' && existingUser.passwordHash && recentLoginFailures(phone).length >= PASSWORD_LOCKOUT_MAX) {
+    store.audit('auth.login_locked_out', phone, { role });
+    return res.status(429).json({ error: 'rate_limited', message: 'Too many failed login attempts for this number. Try again in 15 minutes.' });
+  }
+  if (phoneRateLimitExceeded(phone)) {
     return res.status(429).json({ error: 'rate_limited', message: 'Too many login attempts for this number. Try again later.' });
   }
-  rec.requests.push(Date.now());
-  logins[phone] = rec;
   if (!store.data.users[phone]) store.data.users[phone] = { phone, createdAt: nowIso() };
-  const role = provider ? 'provider' : 'patient';
-  // v2.1.6 (C1 interim): phone-only logins get a SHORT refresh token
-  // (24h instead of 7 days) because no OTP verified the caller — a
-  // stolen session from a known phone number dies within a day.
-  const tokens = issueTokens({ phone, role, providerId: provider ? provider.id : null }, undefined, { refreshTtlDays: 1, authMethod: 'phone-only' });
+  const userRec = store.data.users[phone];
+  // v2.1.8 — password gate (see the helpers above). A password account
+  // requires its password; a legacy account logs in phone-only ONCE
+  // and the client forces set-password (requiresPassword: true).
+  const hasPassword = typeof userRec.passwordHash === 'string' && !!userRec.passwordHash;
+  let authMethod = 'phone-only';
+  let requiresPassword = false;
+  let requiresPasswordChange = false;
+  if (hasPassword) {
+    if (!passwordMatches(req.body?.password, userRec.passwordHash)) {
+      // Generic 401 — never reveal whether the phone or the password
+      // was wrong. No password value is logged or audited.
+      recordLoginFailure(phone);
+      store.audit('auth.login_wrong_password', phone, { role });
+      return res.status(401).json({ error: 'unauthorized', message: 'رقم الهاتف أو كلمة المرور غير صحيحة' });
+    }
+    clearLoginFailures(phone);
+    authMethod = 'password';
+    if (userRec.mustChangePassword) requiresPasswordChange = true;
+  } else {
+    requiresPassword = true;
+  }
+  // v2.1.6 (C1 interim): phone-only AND password logins get a SHORT
+  // refresh token (24h instead of 7 days) — a stolen session from a
+  // known phone number dies within a day.
+  const tokens = issueTokens({ phone, role, providerId: provider ? provider.id : null }, undefined, { refreshTtlDays: 1, authMethod });
   // v2.1.6 (C1 interim): REAL new-device detection. The app sends a
   // persistent deviceId (web: localStorage; see web/app.js); when it is
   // absent the fingerprint falls back to a hash of the User-Agent.
@@ -2025,29 +2187,58 @@ router.post('/auth/login-phone', (req, res) => {
   // audited + listed in the admin dashboard. (The old check only
   // flagged the FIRST login ever — it compared the request count
   // after pushing the current request.)
-  const userRec = store.data.users[phone];
-  userRec.devices = userRec.devices || [];
-  const rawDeviceId = typeof req.body?.deviceId === 'string' ? req.body.deviceId.trim().slice(0, 128) : '';
-  const deviceId = rawDeviceId || `ua:${sha256(req.headers['user-agent'] || 'unknown').slice(0, 12)}`;
-  const known = userRec.devices.find((d) => d.id === deviceId);
-  const isNewDevice = !known;
-  if (known) known.lastSeenAt = nowIso();
-  else userRec.devices.push({ id: deviceId, firstSeenAt: nowIso(), lastSeenAt: nowIso(), userAgent: String(req.headers['user-agent'] || '').slice(0, 200) });
-  store.audit(isNewDevice ? 'auth.phone_login_new_device' : 'auth.phone_login', phone, { role, authMethod: 'phone-only-fallback', newDevice: isNewDevice, deviceId: deviceId.slice(0, 24) });
-  if (isNewDevice && userRec.devices.length > 1) {
-    // Not the account's first login: warn the owner in-app (and by
-    // push if registered) — if it was not them, they can contact the
-    // admin. Best-effort: a failed notification never blocks login.
-    notify.notifyUser(phone, {
-      type: 'security', titleAr: 'دخول من جهاز جديد', titleEn: 'Login from a new device',
-      bodyAr: 'تم الدخول إلى حسابك من جهاز لم نره من قبل. إذا لم يكن هذا أنت، تواصل مع إدارة التطبيق فورًا.',
-      bodyEn: 'Your account was signed in from a device we have not seen before. If this was not you, contact the app admin right away.',
-      data: { type: 'new_device' }, critical: false,
-    }).catch(() => {});
-  }
+  const { isNewDevice, deviceId } = recordDevice(userRec, req);
+  store.audit(isNewDevice ? 'auth.phone_login_new_device' : 'auth.phone_login', phone, { role, authMethod: hasPassword ? 'password' : 'phone-only-fallback', newDevice: isNewDevice, deviceId: deviceId.slice(0, 24) });
+  warnNewDevice(phone, userRec, isNewDevice);
   store.save();
   // `token` is the field the web frontend reads (alias of accessToken).
-  res.json({ ...tokens, token: tokens.accessToken, role, providerId: provider ? provider.id : null, phone, authMethod: 'phone-only', newDevice: isNewDevice });
+  res.json({ ...tokens, token: tokens.accessToken, role, providerId: provider ? provider.id : null, phone, authMethod, newDevice: isNewDevice, requiresPassword, requiresPasswordChange });
+});
+
+// ---------------------------------------------------------------- v2.1.8
+// POST /api/auth/register { phone, password, terms, deviceId? } — a new
+// user registers with a phone + a password OF THEIR OWN choosing (min 6
+// chars). The server stores ONLY the bcrypt hash, never plaintext, and
+// issues the same tokens as login (15-min access, 24h refresh). The
+// terms scroll-to-accept is server-enforced, like provider registration.
+// Registering an already-registered phone is a 409 (sign in instead).
+router.post('/auth/register', (req, res) => {
+  const phone = normalizePhone(req.body?.phone);
+  if (!phone) return bad(res, 400, 'Valid Egyptian phone number required (01xxxxxxxxx).');
+  const password = req.body?.password;
+  if (!validPassword(password)) return bad(res, 400, `Password must be at least ${PASSWORD_MIN_LENGTH} characters.`);
+  if (!termsAccepted(req.body?.terms)) return termsError(res);
+  if (store.data.users[phone]) return res.status(409).json({ error: 'conflict', message: 'This phone number is already registered. Sign in instead.' });
+  if (phoneRateLimitExceeded(phone, 'phoneRegisterLogins')) {
+    return res.status(429).json({ error: 'rate_limited', message: 'Too many registration attempts for this number. Try again later.' });
+  }
+  const userRec = { phone, createdAt: nowIso(), passwordHash: hashPassword(password), passwordSetAt: nowIso(), mustChangePassword: false, devices: [] };
+  store.data.users[phone] = userRec;
+  recordTermsAcceptance(phone);
+  const tokens = issueTokens({ phone, role: 'patient', providerId: null }, undefined, { refreshTtlDays: 1, authMethod: 'password' });
+  const { isNewDevice, deviceId } = recordDevice(userRec, req);
+  store.audit('auth.registered', phone, { role: 'patient', authMethod: 'password', newDevice: isNewDevice, deviceId: deviceId.slice(0, 24) });
+  warnNewDevice(phone, userRec, isNewDevice);
+  store.save();
+  res.status(201).json({ ...tokens, token: tokens.accessToken, role: 'patient', providerId: null, phone, authMethod: 'password', newDevice: isNewDevice, requiresPassword: false, requiresPasswordChange: false });
+});
+
+// POST /api/auth/set-password { password } — the logged-in user chooses
+// (or changes) their own password. Used by the migration gate (legacy
+// accounts on first login) and after an admin reset (temp password).
+// The password value is never logged or audited — only the fact that a
+// password was set, and whether it was a temp-password change.
+router.post('/auth/set-password', requireAuth, (req, res) => {
+  const password = req.body?.password;
+  if (!validPassword(password)) return bad(res, 400, `Password must be at least ${PASSWORD_MIN_LENGTH} characters.`);
+  const userRec = store.data.users[req.user.phone] || (store.data.users[req.user.phone] = { phone: req.user.phone, createdAt: nowIso() });
+  const wasTemp = userRec.mustChangePassword === true;
+  userRec.passwordHash = hashPassword(password);
+  userRec.passwordSetAt = nowIso();
+  userRec.mustChangePassword = false;
+  store.audit('auth.password_set', req.user.phone, { via: wasTemp ? 'temp' : 'self' });
+  store.save();
+  res.json({ ok: true, requiresPassword: false, requiresPasswordChange: false });
 });
 
 // ---------------------------------------------------------------- auth
@@ -2064,8 +2255,11 @@ router.post('/auth/refresh', (req, res) => {
   // Rotate within the SAME family; revoke the old token.
   // v2.1.6 (C1 interim): a phone-only family keeps its short 24h
   // refresh lifetime on rotation; OTP families keep 7 days.
+  // v2.1.8: password families keep 24h too — a password login is
+  // stronger than phone-only, but the short refresh stays the policy
+  // until OTP lands (same tokens as today: 15-min access, 24h refresh).
   const tokens = issueTokens({ phone: rec.phone, role: rec.role, providerId: rec.providerId }, rec.familyId,
-    rec.authMethod === 'phone-only' ? { refreshTtlDays: 1, authMethod: 'phone-only' } : { authMethod: rec.authMethod || null });
+    rec.authMethod === 'phone-only' || rec.authMethod === 'password' ? { refreshTtlDays: 1, authMethod: rec.authMethod } : { authMethod: rec.authMethod || null });
   rec.revoked = true;
   store.save();
   store.audit('auth.refresh_used', rec.phone, { familyId: rec.familyId });
@@ -3072,7 +3266,13 @@ router.post('/providers/register', requireAuth, (req, res) => {
   refreshCvEvaluation(p);
   store.audit('provider.registered', req.user.phone, { providerId: id, role: providerType, providerType });
   store.save();
-  res.status(201).json({ ...store.publicProvider(p, { self: true, points: p.points }), next: 'Take the 36-question interview: POST /api/providers/interview/start' });
+  // v2.1.8 — return fresh provider-role tokens with the response, so
+  // the client switches to the provider role WITHOUT re-logging in
+  // (re-login would need the password the client does not store).
+  // The new tokens keep the phone's current authMethod + refresh TTL.
+  const { refreshTtlDays, authMethod } = authMethodForPhone(req.user.phone);
+  const tokens = issueTokens({ phone: req.user.phone, role: 'provider', providerId: id }, undefined, { refreshTtlDays, authMethod });
+  res.status(201).json({ ...store.publicProvider(p, { self: true, points: p.points }), next: 'Take the 36-question interview: POST /api/providers/interview/start', tokens: { ...tokens, token: tokens.accessToken, role: 'provider', providerId: id, phone: req.user.phone, authMethod } });
 });
 
 router.get('/providers/me', requireAuth, requireRole('provider'), (req, res) => {
@@ -4369,6 +4569,31 @@ router.post('/admin/broadcast', requireAdmin, async (req, res) => {
   }
   store.audit('admin.broadcast', 'admin', { title, devices: deviceCount, users: phones.size, sent, failed });
   res.json({ ok: true, dryRun: false, devices: deviceCount, users: phones.size, sent, failed });
+});
+
+// ---------------------------------------------------------------- v2.1.8
+// POST /api/admin/password-reset { phone } — admin-only reset for users
+// who forgot their password (no OTP channel exists yet, so there is no
+// self-service reset). The admin tells the user the temporary password
+// once (by phone/WhatsApp); the user MUST choose their own password on
+// next login (mustChangePassword) and all of the account's live
+// sessions are revoked. The temp password is returned ONLY in this one
+// response — it is NEVER stored (only its bcrypt hash) and NEVER
+// appears in the audit log (audit: admin.password_reset, phone only).
+router.post('/admin/password-reset', requireAdmin, (req, res) => {
+  const phone = normalizePhone(req.body?.phone);
+  if (!phone) return bad(res, 400, 'Valid Egyptian phone number required (01xxxxxxxxx).');
+  const userRec = store.data.users[phone];
+  if (!userRec) return res.status(404).json({ error: 'not_found', message: 'No account with this phone number.' });
+  const hadPassword = typeof userRec.passwordHash === 'string' && !!userRec.passwordHash;
+  const tempPassword = generateTempPassword();
+  userRec.passwordHash = hashPassword(tempPassword);
+  userRec.passwordSetAt = nowIso();
+  userRec.mustChangePassword = true;
+  const sessionsRevoked = revokeUserRefreshTokens(phone);
+  store.audit('admin.password_reset', 'admin', { phone, hadPassword, sessionsRevoked });
+  store.save();
+  res.json({ ok: true, phone, tempPassword, hadPassword, sessionsRevoked, mustChangePassword: true });
 });
 
 // v2.1.0 — persistence status (admin only): which backend holds the data
