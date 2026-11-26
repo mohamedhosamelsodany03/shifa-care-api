@@ -26,6 +26,8 @@ const config = {
   // (fail-closed: the seeded hash is random and unguessable) until a PIN is
   // set and the service restarts. Never fall back to a guessable default.
   adminPin: process.env.ADMIN_PIN || null,
+  // Admin PIN lockout is PER-IP: 5 wrong guesses lock that IP for 15 min
+  // (HTTP 423); the counter lives in data.json, so a redeploy clears it.
   adminPinMaxAttempts: 5,
   adminPinLockMinutes: 15,
   otpLength: 6,
