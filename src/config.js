@@ -16,7 +16,7 @@ const config = {
   jwtSecret: process.env.JWT_SECRET || 'dev-secret-CHANGE-ME-in-production',
   jwtAccessTtl: '15m', // 15 minutes
   refreshTtlDays: 7,
-  adminSessionTtl: '30m', // admin PIN session
+  adminSessionTtl: '12h', // admin PIN session (v2.1.10: 30m was unusable — the owner lives in the admin panel)
   dataFile: process.env.DATA_FILE || path.join(__dirname, '..', 'data.json'),
   // Mock OTP is a DEV convenience only. Default ON in dev, OFF in production.
   mockOtp: process.env.MOCK_OTP

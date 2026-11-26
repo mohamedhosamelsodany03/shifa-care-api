@@ -25,7 +25,10 @@ function issueTokens(user, familyId, opts = {}) {
   // user: { phone, role, providerId? }
   // opts.refreshTtlDays: v2.1.6 (C1 interim) — phone-only logins get a
   // SHORT refresh lifetime (24h) because no OTP verified the caller;
-  // OTP-verified logins keep the normal 7 days. opts.authMethod is
+  // OTP-verified logins keep the normal 7 days. v2.1.10: password
+  // logins get 30 days — the bcrypt password verifies the caller, so
+  // the C1 interim rationale no longer applies to them (a 24h refresh
+  // forced a fresh login after every app exit). opts.authMethod is
   // stored on the refresh record so rotation keeps the same TTL.
   const refreshTtlDays = Number.isFinite(opts.refreshTtlDays) && opts.refreshTtlDays > 0 ? opts.refreshTtlDays : config.refreshTtlDays;
   const authMethod = opts.authMethod || null;

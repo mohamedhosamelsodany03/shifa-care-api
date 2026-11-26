@@ -2064,15 +2064,17 @@ function generateTempPassword() {
 }
 // The authMethod + refresh TTL of the phone's most recent live refresh
 // token — used when a route issues fresh tokens for an already
-// authenticated phone (provider registration). Password and phone-only
-// sessions keep the 24h refresh; OTP sessions keep the configured TTL.
+// authenticated phone (provider registration). Phone-only sessions keep
+// the 24h refresh; password sessions keep 30 days (v2.1.10); OTP
+// sessions keep the configured TTL.
 function authMethodForPhone(phone) {
   let latest = null;
   for (const rec of Object.values(store.data.refreshTokens || {})) {
     if (rec && rec.phone === phone && !rec.revoked && (!latest || (rec.createdAt || 0) > (latest.createdAt || 0))) latest = rec;
   }
   if (!latest) return { refreshTtlDays: 1, authMethod: 'phone-only' };
-  if (latest.authMethod === 'phone-only' || latest.authMethod === 'password') return { refreshTtlDays: 1, authMethod: latest.authMethod };
+  if (latest.authMethod === 'phone-only') return { refreshTtlDays: 1, authMethod: 'phone-only' };
+  if (latest.authMethod === 'password') return { refreshTtlDays: 30, authMethod: 'password' };
   return { refreshTtlDays: config.refreshTtlDays, authMethod: latest.authMethod || null };
 }
 // Per-phone attempt cap shared by login-phone and register (5/hour,
@@ -2176,10 +2178,11 @@ router.post('/auth/login-phone', (req, res) => {
   } else {
     requiresPassword = true;
   }
-  // v2.1.6 (C1 interim): phone-only AND password logins get a SHORT
-  // refresh token (24h instead of 7 days) — a stolen session from a
-  // known phone number dies within a day.
-  const tokens = issueTokens({ phone, role, providerId: provider ? provider.id : null }, undefined, { refreshTtlDays: 1, authMethod });
+  // v2.1.10: password logins get a 30-day refresh (the password
+  // verifies the caller, so the v2.1.6 C1 interim no longer applies);
+  // legacy phone-only logins keep the SHORT 24h refresh until OTP
+  // lands — a stolen session from a known phone number dies in a day.
+  const tokens = issueTokens({ phone, role, providerId: provider ? provider.id : null }, undefined, { refreshTtlDays: authMethod === 'password' ? 30 : 1, authMethod });
   // v2.1.6 (C1 interim): REAL new-device detection. The app sends a
   // persistent deviceId (web: localStorage; see web/app.js); when it is
   // absent the fingerprint falls back to a hash of the User-Agent.
@@ -2199,7 +2202,8 @@ router.post('/auth/login-phone', (req, res) => {
 // POST /api/auth/register { phone, password, terms, deviceId? } — a new
 // user registers with a phone + a password OF THEIR OWN choosing (min 6
 // chars). The server stores ONLY the bcrypt hash, never plaintext, and
-// issues the same tokens as login (15-min access, 24h refresh). The
+// issues the same tokens as login (15-min access, 30-day refresh —
+// v2.1.10: the password verifies the caller). The
 // terms scroll-to-accept is server-enforced, like provider registration.
 // Registering an already-registered phone is a 409 (sign in instead).
 router.post('/auth/register', (req, res) => {
@@ -2215,7 +2219,7 @@ router.post('/auth/register', (req, res) => {
   const userRec = { phone, createdAt: nowIso(), passwordHash: hashPassword(password), passwordSetAt: nowIso(), mustChangePassword: false, devices: [] };
   store.data.users[phone] = userRec;
   recordTermsAcceptance(phone);
-  const tokens = issueTokens({ phone, role: 'patient', providerId: null }, undefined, { refreshTtlDays: 1, authMethod: 'password' });
+  const tokens = issueTokens({ phone, role: 'patient', providerId: null }, undefined, { refreshTtlDays: 30, authMethod: 'password' });
   const { isNewDevice, deviceId } = recordDevice(userRec, req);
   store.audit('auth.registered', phone, { role: 'patient', authMethod: 'password', newDevice: isNewDevice, deviceId: deviceId.slice(0, 24) });
   warnNewDevice(phone, userRec, isNewDevice);
@@ -2255,11 +2259,12 @@ router.post('/auth/refresh', (req, res) => {
   // Rotate within the SAME family; revoke the old token.
   // v2.1.6 (C1 interim): a phone-only family keeps its short 24h
   // refresh lifetime on rotation; OTP families keep 7 days.
-  // v2.1.8: password families keep 24h too — a password login is
-  // stronger than phone-only, but the short refresh stays the policy
-  // until OTP lands (same tokens as today: 15-min access, 24h refresh).
+  // v2.1.10: password families keep 30 days on rotation — the password
+  // verifies the caller, so the C1 interim no longer applies to them.
   const tokens = issueTokens({ phone: rec.phone, role: rec.role, providerId: rec.providerId }, rec.familyId,
-    rec.authMethod === 'phone-only' || rec.authMethod === 'password' ? { refreshTtlDays: 1, authMethod: rec.authMethod } : { authMethod: rec.authMethod || null });
+    rec.authMethod === 'phone-only' ? { refreshTtlDays: 1, authMethod: rec.authMethod }
+    : rec.authMethod === 'password' ? { refreshTtlDays: 30, authMethod: rec.authMethod }
+    : { authMethod: rec.authMethod || null });
   rec.revoked = true;
   store.save();
   store.audit('auth.refresh_used', rec.phone, { familyId: rec.familyId });

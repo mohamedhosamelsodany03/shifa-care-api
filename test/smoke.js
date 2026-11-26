@@ -2701,6 +2701,61 @@ async function main() {
     }
   }
 
+  // --- §32. v2.1.10 (follow-up): login persists — password sessions get
+  // a 30-day refresh; legacy phone-only sessions stay at 24h; the admin
+  // session is 12h. (Owner report 26 Nov 2026 ~23:32: every app exit
+  // forced a fresh login, because the 15-min access token died and the
+  // 24h refresh record died with the next deploy's data.json wipe.)
+  console.log('\n[§32 v2.1.10]');
+  {
+    const jwtPayload = (t) => JSON.parse(Buffer.from(String(t).split('.')[1], 'base64url').toString('utf8'));
+    const refreshRec = (tok) => {
+      const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      return (d.refreshTokens || {})[String(tok).split('.')[0]] || null;
+    };
+    const daysOut = (rec) => rec ? (new Date(rec.expiresAt).getTime() - Date.now()) / 86400000 : -1;
+    const routesSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'routes.js'), 'utf8');
+    // 32a. Register with a password -> 201; the refresh record lives ~30 days.
+    const xff32 = '10.32.1.1';
+    r = await req('POST', '/api/auth/register', { xff: xff32, body: { phone: '01029200001', password: 'persist1', terms: TERMS } });
+    check('§32 register with a password -> 201 + refresh token', r.status === 201 && !!r.json?.refreshToken && r.json?.authMethod === 'password', JSON.stringify(r.json));
+    const regRec = refreshRec(r.json?.refreshToken);
+    check('§32 register refresh record expires ~30 days out (not 24h)', !!regRec && regRec.authMethod === 'password' && daysOut(regRec) > 29 && daysOut(regRec) < 31, `daysOut=${daysOut(regRec).toFixed(2)}`);
+    // 32b. Password login -> 200; refresh ~30 days; access token still 15 min.
+    r = await req('POST', '/api/auth/login-phone', { xff: xff32, body: { phone: '01029200001', password: 'persist1' } });
+    check('§32 password login -> 200 + authMethod password', r.status === 200 && r.json?.authMethod === 'password', JSON.stringify(r.json));
+    const loginRec = refreshRec(r.json?.refreshToken);
+    check('§32 password-login refresh record expires ~30 days out', !!loginRec && daysOut(loginRec) > 29 && daysOut(loginRec) < 31, `daysOut=${daysOut(loginRec).toFixed(2)}`);
+    const accessPayload = jwtPayload(r.json?.token);
+    check('§32 access token still lives 15 minutes (exp - iat = 900s)', (accessPayload.exp - accessPayload.iat) === 900, `exp-iat=${accessPayload.exp - accessPayload.iat}`);
+    // 32c. Refresh flow: the refresh token works after the (short) access
+    // token lifetime, rotation keeps the 30-day TTL, and the old token
+    // is revoked (rotation + reuse detection untouched).
+    const oldRefresh = r.json?.refreshToken;
+    r = await req('POST', '/api/auth/refresh', { body: { refreshToken: oldRefresh } });
+    check('§32 refresh with the password refresh token -> 200 + new tokens', r.status === 200 && !!r.json?.accessToken && !!r.json?.refreshToken, JSON.stringify(r.json));
+    const rotatedRec = refreshRec(r.json?.refreshToken);
+    check('§32 rotated refresh record still expires ~30 days out', !!rotatedRec && daysOut(rotatedRec) > 29 && daysOut(rotatedRec) < 31, `daysOut=${daysOut(rotatedRec).toFixed(2)}`);
+    const oldRec = refreshRec(oldRefresh);
+    check('§32 the pre-rotation refresh record is revoked', !!oldRec && oldRec.revoked === true, JSON.stringify(oldRec)?.slice(0, 120));
+    // 32d. Legacy phone-only session (no password set yet) stays at 24h.
+    r = await req('POST', '/api/auth/login-phone', { xff: '10.32.2.1', body: { phone: '01029200002' } });
+    check('§32 legacy phone-only login -> 200 + requiresPassword', r.status === 200 && r.json?.requiresPassword === true && r.json?.authMethod === 'phone-only', JSON.stringify(r.json));
+    const legacyRec = refreshRec(r.json?.refreshToken);
+    check('§32 legacy phone-only refresh record expires ~24h out', !!legacyRec && legacyRec.authMethod === 'phone-only' && daysOut(legacyRec) > 0.9 && daysOut(legacyRec) < 1.1, `daysOut=${daysOut(legacyRec).toFixed(2)}`);
+    // 32e. Admin session: 12h (was 30m — unusable for an owner who lives
+    // in the admin panel). Decoded from the live admin token; the config
+    // value is checked statically too.
+    const adminPayload = jwtPayload(adminToken);
+    check('§32 admin token lives ~12h (exp - iat = 43200s)', (adminPayload.exp - adminPayload.iat) === 43200, `exp-iat=${adminPayload.exp - adminPayload.iat}`);
+    check('§32 config.adminSessionTtl is 12h', require('../src/config').adminSessionTtl === '12h', String(require('../src/config').adminSessionTtl));
+    // 32f. Static: the password paths carry 30 days in the source.
+    check('§32 login-phone gives password sessions 30 days', routesSrc.includes("refreshTtlDays: authMethod === 'password' ? 30 : 1"), 'login-phone TTL wrong');
+    check('§32 register gives password sessions 30 days', routesSrc.includes("refreshTtlDays: 30, authMethod: 'password'"), 'register TTL wrong');
+    check('§32 authMethodForPhone gives password sessions 30 days', routesSrc.includes("if (latest.authMethod === 'password') return { refreshTtlDays: 30, authMethod: 'password' };"), 'authMethodForPhone TTL wrong');
+    check('§32 rotation keeps 30 days for password families', routesSrc.includes("rec.authMethod === 'password' ? { refreshTtlDays: 30, authMethod: rec.authMethod }"), 'rotation TTL wrong');
+  }
+
   // --- 14. logout / refresh revocation ---------------------------------
     console.log('\n[logout]');
     r = await req('POST', '/api/auth/logout', { token: patientToken2, body: { refreshToken } });
