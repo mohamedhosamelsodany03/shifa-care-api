@@ -47,9 +47,15 @@ function createApp() {
 
   // CORS (audit #9): '*' NO LONGER means any origin. A configured '*'
   // is treated as the app-origin set only (the Capacitor app origin is
+  // https://localhost — androidScheme defaults to https — plus
   // http://localhost) and logs a boot warning. Allowed: the configured
-  // list + http://localhost + capacitor://localhost + ionic://localhost.
-  const APP_ORIGINS = ['http://localhost', 'capacitor://localhost', 'ionic://localhost'];
+  // list + https://localhost + http://localhost + capacitor://localhost
+  // + ionic://localhost.
+  // HOTFIX 2026-11-26: https://localhost was missing — every request
+  // from the installed app got 403 at the CORS middleware (before any
+  // handler/audit), so the app showed offline + "wrong PIN" and no
+  // attempt ever appeared in the audit log, while curl/Chrome worked.
+  const APP_ORIGINS = ['https://localhost', 'http://localhost', 'capacitor://localhost', 'ionic://localhost'];
   if (config.corsOrigins.includes('*')) {
     console.warn('[WARN] CORS_ORIGIN contains "*" — treated as the app-origin set only (http://localhost, capacitor://localhost, ionic://localhost), NOT any origin.');
   }
