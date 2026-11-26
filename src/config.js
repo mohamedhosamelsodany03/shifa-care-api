@@ -108,9 +108,26 @@ const config = {
   // (not 15 minutes before the scheduled time). After that the client
   // cannot cancel, and the server rejects the cancellation.
   cancelWindowMs: envInt('CANCEL_WINDOW_MS', 15 * 60 * 1000),
-  interviewMinutes: 20,
-  interviewPassTotal: 12,
-  interviewPassEthics: 3,
+  // v2.1.1 — expanded interview (36 questions, 30 minutes).
+  // Pass: total >= 24 AND medical >= 5 AND ethics >= 5 AND safety >= 4,
+  // with no red-flag answer. Manual review: total 21–23, or a mandatory
+  // minimum missed by exactly 1, or any dimension 0–1.
+  interviewMinutes: 30,
+  interviewPassTotal: 24,
+  interviewPassMedical: 5,
+  interviewPassEthics: 5,
+  interviewPassSafety: 4,
+  interviewManualReviewMin: 21,
+  interviewMaxAttempts: 3,
+  interviewRetakeDays: 7,
+  interviewRedFlagRetakeDays: 14,
+  // v2.1.1 — Muse monitor token (read-only admin-oversight endpoint).
+  // Set ONLY as an env var in the host dashboard; NEVER written to any
+  // file, log or commit. Empty = the monitor endpoint looks disabled.
+  museMonitorToken: process.env.MUSE_MONITOR_TOKEN || '',
+  // v2.1.1 — separate admin JWT secret (falls back to the user JWT
+  // secret when unset, so existing deployments keep working).
+  adminJwtSecret: process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET || 'dev-secret-CHANGE-ME-in-production',
   // Promo-month commission override (owner decision 26 Nov 2026): when
   // set (e.g. PROMO_COMMISSION_PCT=0), it OVERRIDES the tier rate for
   // bookings accepted while it is active. Unset = tier rates apply.

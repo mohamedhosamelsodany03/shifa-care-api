@@ -5,18 +5,44 @@
 // Real providers are stubs below, clearly marked TODO, gated by env vars.
 //
 // Channel order per spec: WhatsApp first, SMS as fallback.
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const config = require('./config');
 const { sha256 } = require('./store');
 
+// v2.1.1 (audit #15): CSPRNG — Math.random is NOT acceptable for OTP codes.
 function makeCode() {
-  return String(Math.floor(100000 + Math.random() * 900000));
+  return String(crypto.randomInt(100000, 1000000));
+}
+// v2.1.1 (M18): OTP codes are stored bcrypt-hashed (short-lived, no
+// migration needed — old sha256 records verify as a fallback once).
+function hashOtpCode(code) { return bcrypt.hashSync(String(code), 10); }
+function verifyOtpCode(code, rec) {
+  if (!rec) return false;
+  if (rec.codeHashBcrypt) {
+    try { return bcrypt.compareSync(String(code), rec.codeHashBcrypt); } catch { return false; }
+  }
+  if (rec.codeHash) return rec.codeHash === sha256(code); // legacy fallback
+  return false;
+}
+
+// In-memory mock codes (dev/test ONLY, never persisted, never logged):
+// the admin-only /admin/mock-otp endpoint is how tests read a code back.
+// The map lives in process memory only — a restart clears it.
+const mockCodes = new Map();
+function getMockCode(phone) {
+  if (!config.mockOtp) return null;
+  return mockCodes.get(phone) || null;
 }
 
 // --- Mock provider (dev only) -------------------------------------------
 const MockOtpProvider = {
   name: 'mock',
   async send({ phone, channel, code }) {
-    console.log(`[MOCK OTP] channel=${channel} phone=${phone} code=${code} (dev only — no real message sent)`);
+    mockCodes.set(phone, code);
+    // v2.1.1: the code is NEVER logged — not even in mock mode. Tests read
+    // the code from the store via the admin mock-otp endpoint instead.
+    console.log(`[MOCK OTP] channel=${channel} phone=${phone} (dev only — code not logged, no real message sent)`);
     return { ok: true, provider: 'mock', messageId: `mock-${Date.now()}` };
   },
 };
@@ -189,4 +215,4 @@ function normalizePhone(raw) {
   return p;
 }
 
-module.exports = { makeCode, pickProvider, normalizePhone, sha256, MockOtpProvider, WhatsAppOtpProvider, SmsOtpProvider, toE164WhatsApp };
+module.exports = { makeCode, hashOtpCode, verifyOtpCode, getMockCode, pickProvider, normalizePhone, sha256, MockOtpProvider, WhatsAppOtpProvider, SmsOtpProvider, toE164WhatsApp };

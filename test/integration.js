@@ -66,6 +66,7 @@ const server = app.listen(PORT, async () => {
     check('unknown provider phone with role=provider -> 403', r.status === 403, JSON.stringify(r.body).slice(0, 150));
     r = await call('POST', '/api/auth/login-phone', { phone: '01099999999' });
     check('phone login new patient -> 200 patient', r.status === 200 && r.body.role === 'patient' && typeof r.body.token === 'string', JSON.stringify(r.body).slice(0, 150));
+    const patTokenEarly = r.body.token; // bookings now require role patient
     const rlStatuses = [];
     for (let i = 0; i < 6; i++) {
       const rr = await call('POST', '/api/auth/login-phone', { phone: '01088888888' });
@@ -89,9 +90,12 @@ const server = app.listen(PORT, async () => {
     r = await call('GET', '/api/admin/mock-otp?phone=01000000001', null, adminToken);
     check('mock-otp returns code for demo phone', r.status === 200 && r.body.code === '123456', JSON.stringify(r.body).slice(0, 200));
 
-    // 5. interview via frontend GET questions + index answers + submit without attemptId
+    // 5. interview v2.1.1: 36 questions (30 common + 6 role), new shape
+    // {id, category, text, options:[{key, text}]}, dimensions + passRule,
+    // no correct answers / red-flag markers leaked to the client.
     r = await call('GET', '/api/providers/interview/questions', null, provToken);
-    check('GET interview/questions returns 20 frontend-shaped', r.status === 200 && Array.isArray(r.body.questions) && r.body.questions.length === 20 && r.body.questions[0].cat && r.body.questions[0].q && Array.isArray(r.body.questions[0].opts.ar), JSON.stringify(r.body).slice(0, 200));
+    check('GET interview/questions returns 36, 30min, dimensions, no leaks', r.status === 200 && Array.isArray(r.body.questions) && r.body.questions.length === 36 && r.body.minutes === 30 && Array.isArray(r.body.dimensions) && r.body.dimensions.length === 6 && r.body.passRule && !JSON.stringify(r.body).includes('correct') && !JSON.stringify(r.body).includes('redFlag'), JSON.stringify(r.body).slice(0, 300));
+    check('interview dimensions total 8/7/6/6/5/4', r.body.dimensions && r.body.dimensions.find((d) => d.key === 'medical')?.questions === 8 && r.body.dimensions.find((d) => d.key === 'ethics')?.questions === 7 && r.body.dimensions.find((d) => d.key === 'safety')?.questions === 6, JSON.stringify(r.body.dimensions));
     // Answer correctly, using the server catalog (test-only): map each
     // returned question's correct option text to its shuffled index.
     const { MCQ, ENGLISH_CHECK } = require('../src/catalog');
@@ -99,19 +103,33 @@ const server = app.listen(PORT, async () => {
     for (const q of r.body.questions) {
       const src = MCQ.find((x) => x.id === q.id);
       const correctText = src.options.find((o) => o.key === src.correct).text;
-      answers[q.id] = q.opts.ar.indexOf(correctText);
+      answers[q.id] = q.options.findIndex((o) => o.text === correctText);
     }
     const enAnswers = {};
-    // english check questions are not in this payload; submit without them is fine (0/3).
-    r = await call('POST', '/api/providers/interview/submit', { answers, english: enAnswers }, provToken);
-    check('interview submit without attemptId accepted', r.status === 200 && typeof r.body.total === 'number' && typeof r.body.ethics === 'number', JSON.stringify(r.body).slice(0, 300));
+    for (const q of r.body.englishCheck.questions) {
+      const src = ENGLISH_CHECK.find((x) => x.id === q.id);
+      const correctText = src.options.find((o) => o.key === src.correct).text;
+      enAnswers[q.id] = q.options.findIndex((o) => o.text === correctText);
+    }
+    r = await call('POST', '/api/providers/interview/submit', { answers, englishAnswers: enAnswers }, provToken);
+    check('interview submit all-correct -> passed 36/36', r.status === 200 && r.body.status === 'passed' && r.body.total === 36 && typeof r.body.scores?.ethics === 'number', JSON.stringify(r.body).slice(0, 300));
+    // Demo provider must be admin-verified before it can accept (v2.1.1
+    // seed is pending/not_started; radar/accept require status=verified).
+    r = await call('POST', '/api/admin/providers/prov_demo_starter/verify', { role: 'nurse' }, adminToken);
+    check('admin verifies demo starter as nurse', r.status === 200 && r.body.status === 'verified', JSON.stringify(r.body).slice(0, 200));
 
     // 6. booking with FRONTEND-shaped payload (name/service/km/paymentMethod cash/charterAccepted)
-    // Need a patient token: create one via OTP verify for a new phone using mock code from data file is not readable (hashed). Use provider token? Bookings require role patient — provider role is 'provider'; booking endpoint only requires auth, not role. Provider can create a booking in this test.
+    // v2.1.1: bookings require role 'patient' — the provider token is
+    // rejected (403); the patient token from 2b is used.
     r = await call('POST', '/api/bookings', { ...TERMS,
       name: 'Test Patient', phone: '01099999999', service: 'standard', date: '2026-11-25', time: '10:00',
       address: 'Test St', km: 8, transportProvided: false, paymentMethod: 'cash', charterAccepted: true,
     }, provToken);
+    check('provider-role booking -> 403 (patient role required)', r.status === 403, JSON.stringify(r.body).slice(0, 200));
+    r = await call('POST', '/api/bookings', { ...TERMS,
+      name: 'Test Patient', phone: '01099999999', service: 'standard', date: '2026-11-25', time: '10:00',
+      address: 'Test St', km: 8, transportProvided: false, paymentMethod: 'cash', charterAccepted: true,
+    }, patTokenEarly);
     check('frontend-shaped booking 201, fee +100 at 8km', r.status === 201 && r.body.total === 350 && r.body.amountEgp === 350, JSON.stringify(r.body).slice(0, 300));
     check('v2.0.1 booking shows canCancel + arrival progress', r.body.canCancel === true && r.body.arrival && typeof r.body.arrival.progressPct === 'number', JSON.stringify(r.body).slice(0, 200));
     const bkId = r.body.id;
@@ -120,18 +138,21 @@ const server = app.listen(PORT, async () => {
     // assistant band mapping
     r = await call('POST', '/api/bookings', { ...TERMS,
       name: 'Test Patient', service: 'asst_5_9', km: 2, paymentMethod: 'instapay', charterAccepted: true,
-    }, provToken);
+    }, patTokenEarly);
     check('assistant band asst_5_9 -> 235 EGP', r.status === 201 && r.body.total === 235, JSON.stringify(r.body).slice(0, 200));
 
-    // postop via /bookings with frontend postop payload (no km)
-    r = await call('POST', '/api/bookings', { ...TERMS, name: 'Postop', service: 'postop', operation: 'Appendectomy', paymentMethod: 'cash', charterAccepted: true }, provToken);
-    check('postop via bookings, default distance 0 -> 1400', r.status === 201 && r.body.total === 1400, JSON.stringify(r.body).slice(0, 200));
+    // postop via /bookings with frontend postop payload: v2.1.1 — no
+    // distanceKm and no hotel -> 400 distance_required (no silent 0 km).
+    r = await call('POST', '/api/bookings', { ...TERMS, name: 'Postop', service: 'postop', operation: 'Appendectomy', paymentMethod: 'cash', charterAccepted: true }, patTokenEarly);
+    check('postop via bookings without km -> 400 distance_required', r.status === 400 && r.body.error === 'distance_required', JSON.stringify(r.body).slice(0, 200));
+    r = await call('POST', '/api/bookings', { ...TERMS, name: 'Postop', service: 'postop', operation: 'Appendectomy', paymentMethod: 'cash', charterAccepted: true, distanceKm: 2 }, patTokenEarly);
+    check('postop via bookings with km 2 -> 201, 1400', r.status === 201 && r.body.total === 1400, JSON.stringify(r.body).slice(0, 200));
 
     // 7. legacy confirm paths
     r = await call('POST', `/api/bookings/${bkId}/cancel`, {}, provToken);
     check('v2.0.1 cancel requires patient role -> 403 for provider', r.status === 403, `got ${r.status}`);
     r = await call('POST', `/api/bookings/${bkId}/accept`, {}, provToken);
-    check('provider accept (demo provider already passed)', r.status === 200, JSON.stringify(r.body).slice(0, 200));
+    check('provider accept (interview passed + admin verified)', r.status === 200, JSON.stringify(r.body).slice(0, 200));
     r = await call('POST', `/api/bookings/${bkId}/vitals`, { bpSystolic: 120, bpDiastolic: 80, pulse: 72, glucose: 110, oxygen: 98, temp: 36.6 }, provToken);
     check('vitals recorded', r.status === 200, JSON.stringify(r.body).slice(0, 200));
     r = await call('POST', `/api/bookings/${bkId}/provider-complete`, {}, provToken);
@@ -174,21 +195,26 @@ const server = app.listen(PORT, async () => {
     check('terms v1.0 carries reversed rates 15/12/8, no 1,200 bonus', r.status === 200 && r.body.version === '1.0' && r.body.textAr.includes('Starter 15%') && r.body.textAr.includes('Elite 8%') && !r.body.textAr.includes('1,200'), JSON.stringify(r.body).slice(0, 200));
     r = await call('GET', '/api/bootstrap');
     check('bootstrap has promo field, inactive', r.status === 200 && r.body.promo && r.body.promo.active === false, JSON.stringify(r.body.promo));
-    // Volume bonus: 60 cases -> 1,000 (highest only), title Golden Nurse.
-    seedReleased(60, 'seed60-');
+    // Volume bonus v2.1.1 thresholds 15/30/60 (highest only).
+    // 30 cases -> 1,000, title Golden Nurse, next 60.
+    seedReleased(30, 'seed30-');
     r = await call('GET', '/api/providers/wallet', null, provToken);
-    check('60 cases -> bonus 1000, title الممرض الذهبي, next 100', r.status === 200 && r.body.monthlyCases === 60 && r.body.volumeBonusEgp === 1000 && r.body.volumeBonus.title === 'الممرض الذهبي' && r.body.volumeBonus.nextBonusAt === 100 && r.body.volumeBonus.casesToNextBonus === 40, JSON.stringify(r.body.volumeBonus));
-    check('wallet totals: 60x212 + 1000 bonus = 13720 owed', r.body.totals.volumeBonusEgp === 1000 && r.body.totals.appOwesProviderEgp === 13720, JSON.stringify(r.body.totals));
-    // 100 cases -> 1,500 (highest only, NOT 500+1000+1500), title Star.
+    check('30 cases -> bonus 1000, title الممرض الذهبي, next 60', r.status === 200 && r.body.monthlyCases === 30 && r.body.volumeBonusEgp === 1000 && r.body.volumeBonus.title === 'الممرض الذهبي' && r.body.volumeBonus.nextBonusAt === 60 && r.body.volumeBonus.casesToNextBonus === 30, JSON.stringify(r.body.volumeBonus));
+    check('wallet totals: 30x212 + 1000 bonus = 7360 owed', r.body.totals.volumeBonusEgp === 1000 && r.body.totals.appOwesProviderEgp === 7360, JSON.stringify(r.body.totals));
+    // 60 cases -> 1,500 (highest only), title Star, no next tier.
+    seedReleased(30, 'seed60-');
+    r = await call('GET', '/api/providers/wallet', null, provToken);
+    check('60 cases -> bonus 1500, title النجم المميز, no next', r.status === 200 && r.body.monthlyCases === 60 && r.body.volumeBonusEgp === 1500 && r.body.volumeBonus.title === 'النجم المميز' && r.body.volumeBonus.nextBonusAt === null && r.body.volumeBonus.casesToNextBonus === null, JSON.stringify(r.body.volumeBonus));
+    check('wallet totals: 60x212 + 1500 bonus = 14220 owed', r.body.totals.volumeBonusEgp === 1500 && r.body.totals.appOwesProviderEgp === 14220, JSON.stringify(r.body.totals));
+    // 100 cases -> still 1,500 (highest only, NOT stacked), title Star.
     seedReleased(40, 'seed100-');
     r = await call('GET', '/api/providers/wallet', null, provToken);
     check('100 cases -> bonus 1500 (highest only), title النجم المميز, no next', r.status === 200 && r.body.monthlyCases === 100 && r.body.volumeBonusEgp === 1500 && r.body.volumeBonus.title === 'النجم المميز' && r.body.volumeBonus.nextBonusAt === null && r.body.volumeBonus.casesToNextBonus === null, JSON.stringify(r.body.volumeBonus));
     check('wallet totals: 100x212 + 1500 bonus = 22700 owed', r.body.totals.volumeBonusEgp === 1500 && r.body.totals.appOwesProviderEgp === 22700, JSON.stringify(r.body.totals));
     // Voucher expiry: an expired voucher is not listed as active and is
     // never applied at booking; an active one applies.
-    const patLogin = await call('POST', '/api/auth/login-phone', { phone: '01099999999' });
-    const patToken = patLogin.body.token;
-    check('patient login for voucher checks', patLogin.status === 200 && !!patToken, JSON.stringify(patLogin.body).slice(0, 150));
+    const patToken = patTokenEarly;
+    check('patient token (from 2b) reused for voucher checks', !!patToken);
     const past = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const future = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
     store.data.vouchers.push({ id: 'vou-expired', patientPhone: '01099999999', amountEgp: 50, issuedAt: past, expiresAt: past, minBookingEgp: 300, status: 'active', sourceBookingId: null, usedBookingId: null, usedAt: null });

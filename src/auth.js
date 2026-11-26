@@ -4,22 +4,36 @@
 // Phone alone is never accepted as an Authorization credential: every
 // protected route still requires a valid JWT issued by OTP verify or by
 // the phone-only login endpoint.
+//
+// v2.1.1 hardening (audit #10, M9): tokens carry aud 'shifa-care' +
+// iss 'shifa-care' and are verified with algorithms ['HS256']; admin
+// tokens use the separate ADMIN_JWT_SECRET (config.adminJwtSecret).
+// Refresh tokens belong to a family (familyId): reusing a revoked or
+// unknown refresh token revokes the WHOLE family and audits
+// 'auth.refresh_reuse' — a stolen rotated token cannot keep working.
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const config = require('./config');
 const { store, sha256 } = require('./store');
 
-function issueTokens(user) {
+const AUD = 'shifa-care';
+const ISS = 'shifa-care';
+const SIGN_OPTS = { expiresIn: config.jwtAccessTtl, audience: AUD, issuer: ISS };
+const VERIFY_OPTS = { algorithms: ['HS256'], audience: AUD, issuer: ISS };
+
+function issueTokens(user, familyId) {
   // user: { phone, role, providerId? }
   const access = jwt.sign(
     { sub: user.phone, role: user.role, providerId: user.providerId || null },
     config.jwtSecret,
-    { expiresIn: config.jwtAccessTtl }
+    SIGN_OPTS
   );
   const refreshId = crypto.randomUUID();
   const refreshPlain = crypto.randomBytes(32).toString('hex');
+  const fam = familyId || crypto.randomUUID();
   store.data.refreshTokens[refreshId] = {
     id: refreshId,
+    familyId: fam,
     phone: user.phone,
     role: user.role,
     providerId: user.providerId || null,
@@ -29,7 +43,7 @@ function issueTokens(user) {
     createdAt: new Date().toISOString(),
   };
   store.save();
-  return { accessToken: access, refreshToken: `${refreshId}.${refreshPlain}`, expiresInSeconds: 15 * 60 };
+  return { accessToken: access, refreshToken: `${refreshId}.${refreshPlain}`, expiresInSeconds: 15 * 60, familyId: fam };
 }
 
 function verifyRefreshToken(token) {
@@ -41,6 +55,28 @@ function verifyRefreshToken(token) {
   if (new Date(rec.expiresAt).getTime() < Date.now()) return null;
   if (rec.hash !== sha256(plain)) return null;
   return rec;
+}
+
+// Reuse detection (M9): a presented token whose record is revoked,
+// expired-but-known, or hash-mismatched is a REUSE attempt — revoke the
+// whole family and audit it. Returns the familyId when reuse was detected.
+function detectRefreshReuse(token) {
+  if (typeof token !== 'string') return null;
+  const [id, plain] = token.split('.');
+  if (!id || !plain) return null;
+  const rec = store.data.refreshTokens[id];
+  if (!rec) return null; // unknown id: nothing to revoke, plain 401
+  const mismatch = rec.hash !== sha256(plain);
+  if (!rec.revoked && !mismatch && new Date(rec.expiresAt).getTime() >= Date.now()) return null;
+  // Revoked / expired / mismatched presentation of a known token = reuse.
+  const fam = rec.familyId;
+  let revokedCount = 0;
+  for (const r of Object.values(store.data.refreshTokens)) {
+    if (r.familyId === fam && !r.revoked) { r.revoked = true; revokedCount += 1; }
+  }
+  store.audit('auth.refresh_reuse', rec.phone, { familyId: fam, tokenId: id, revokedCount });
+  store.save();
+  return fam;
 }
 
 function revokeRefreshToken(token) {
@@ -58,7 +94,7 @@ function requireAuth(req, res, next) {
   const m = h.match(/^Bearer\s+(.+)$/);
   if (!m) return res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid Authorization header. Phone alone is never accepted.' });
   try {
-    const payload = jwt.verify(m[1], config.jwtSecret);
+    const payload = jwt.verify(m[1], config.jwtSecret, VERIFY_OPTS);
     req.user = { phone: payload.sub, role: payload.role, providerId: payload.providerId || null };
     return next();
   } catch {
@@ -76,8 +112,41 @@ function requireRole(...roles) {
 }
 
 // Admin JWT issued by POST /api/admin/pin/verify (30-min session).
+// v2.1.1: signed with the SEPARATE admin secret (config.adminJwtSecret)
+// so a leaked user secret cannot forge admin tokens, and vice versa.
 function issueAdminToken() {
-  return jwt.sign({ sub: 'admin', role: 'admin' }, config.jwtSecret, { expiresIn: config.adminSessionTtl });
+  return jwt.sign({ sub: 'admin', role: 'admin' }, config.adminJwtSecret, { expiresIn: config.adminSessionTtl, audience: AUD, issuer: ISS });
+}
+function verifyAdminToken(token) {
+  try {
+    const payload = jwt.verify(token, config.adminJwtSecret, VERIFY_OPTS);
+    if (payload.role !== 'admin') return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+// Admin auth middleware: accepts admin JWTs (verified with the admin
+// secret). requireAuth + requireRole('admin') already covers the normal
+// flow when the token was issued with the user secret; this middleware
+// is the v2.1.1-correct path and is used for admin routes.
+function requireAdmin(req, res, next) {
+  const h = req.headers.authorization || '';
+  const m = h.match(/^Bearer\s+(.+)$/);
+  if (!m) return res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid Authorization header.' });
+  const payload = verifyAdminToken(m[1]);
+  if (payload) {
+    req.user = { phone: 'admin', role: 'admin', providerId: null };
+    return next();
+  }
+  // A VALID user token (patient/provider) is a 403, not a 401 — the
+  // caller is authenticated but is not an admin.
+  try {
+    jwt.verify(m[1], config.jwtSecret, VERIFY_OPTS);
+    return res.status(403).json({ error: 'forbidden', message: 'Requires role: admin' });
+  } catch {
+    return res.status(401).json({ error: 'unauthorized', message: 'Invalid or expired admin token.' });
+  }
 }
 
-module.exports = { issueTokens, verifyRefreshToken, revokeRefreshToken, requireAuth, requireRole, issueAdminToken };
+module.exports = { issueTokens, verifyRefreshToken, detectRefreshReuse, revokeRefreshToken, requireAuth, requireRole, issueAdminToken, verifyAdminToken, requireAdmin, AUD, ISS };

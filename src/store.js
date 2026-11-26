@@ -10,30 +10,65 @@ const { HOTELS } = require('./catalog');
 function sha256(v) {
   return crypto.createHash('sha256').update(String(v)).digest('hex');
 }
+// v2.1.1 (M18): salted sha256 for low-entropy identifiers (national ID /
+// licence). NEW records store `s:<salt>$<hash>`; old plain-sha256 hashes
+// still verify as a fallback so existing records keep working.
+function saltedSha256(v) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  return `s:${salt}$${sha256(`${salt}:${v}`)}`;
+}
+function matchesSaltedHash(v, stored) {
+  if (!stored) return false;
+  if (stored.startsWith('s:')) {
+    const rest = stored.slice(2);
+    const i = rest.indexOf('$');
+    if (i < 0) return false;
+    const salt = rest.slice(0, i);
+    const hash = rest.slice(i + 1);
+    return sha256(`${salt}:${v}`) === hash;
+  }
+  return sha256(v) === stored; // legacy unsalted fallback
+}
 function newId(prefix) {
   return `${prefix}_${crypto.randomUUID().slice(0, 8)}${Date.now().toString(36).slice(-4)}`;
 }
 function nowIso() { return new Date().toISOString(); }
 
+// Night flag (SPEC §5): 22:00–06:00 local (scheduled time).
+function isNight(scheduledAt) {
+  if (!scheduledAt) return false;
+  const d = new Date(scheduledAt);
+  if (!Number.isFinite(d.getTime())) return false;
+  const h = d.getHours();
+  return h >= 22 || h < 6;
+}
 function seed() {
   const demoProviders = [
+    // v2.1.1 (audit #8): demo providers are seeded PENDING with the
+    // interview NOT STARTED — never verified/passed. The DEMO_OTP bypass
+    // (routes.js) only works when mockOtp is true, and these accounts
+    // cannot take work until they pass the interview + admin verification.
     {
       id: 'prov_demo_starter', demo: true, phone: '01000000001', name: 'Demo Nurse — Starter (تجريبي)',
-      role: 'nurse', tier: 'Starter', status: 'verified',
+      role: 'nurse', providerType: 'nurse', tier: 'Starter', status: 'pending',
       nationalIdHash: sha256('00000000000001'), nationalIdLast4: '0001',
       licenseHash: sha256('DEMO-LIC-0001'), licenseLast4: '0001',
-      certificates: [], extraLanguages: [], verifiedCertificates: 0,
-      interviewStatus: 'passed', interviewScore: null, ratingAvg: 4.8, completedVisits: 12,
+      certificates: [], courses: [], languageCertificates: [], extraLanguages: [], verifiedCertificates: 0,
+      interviewStatus: 'not_started', interviewScore: null, interviewPoints: 0,
+      ratingAvg: null, completedVisits: 0, casesByWeek: {},
+      joinedAt: nowIso(),
       createdAt: nowIso(),
     },
     {
       id: 'prov_demo_pro', demo: true, phone: '01000000002', name: 'Demo Nurse — Pro (تجريبي)',
-      role: 'nurse', tier: 'Pro', status: 'verified',
+      role: 'nurse', providerType: 'nurse', tier: 'Pro', status: 'pending',
       nationalIdHash: sha256('00000000000002'), nationalIdLast4: '0002',
       licenseHash: sha256('DEMO-LIC-0002'), licenseLast4: '0002',
-      certificates: [], extraLanguages: [{ language: 'de', certified: true }],
-      verifiedCertificates: 1,
-      interviewStatus: 'passed', interviewScore: null, ratingAvg: 4.9, completedVisits: 47,
+      certificates: [], courses: [], languageCertificates: [{ language: 'de', certificateName: 'Demo German certificate', verified: false }], extraLanguages: [{ language: 'de', certified: true }],
+      verifiedCertificates: 0,
+      interviewStatus: 'not_started', interviewScore: null, interviewPoints: 0,
+      ratingAvg: null, completedVisits: 0, casesByWeek: {},
+      joinedAt: nowIso(),
       createdAt: nowIso(),
     },
   ];
@@ -68,6 +103,19 @@ function seed() {
     notifications: {}, // phone -> [{id, type, titleAr/titleEn, bodyAr/bodyEn, data, createdAt, validUntil, readAt, pushStatus, smsStatus, critical}]
     doctors: [], // {id, name, specialty, phone, clinic, address, workingHours, notes, active, createdAt}
     settlementNotifiedOn: null, // 'YYYY-MM-DD' (Africa/Cairo) of the last Thursday-settlement notification pass
+    // v2.1.1 — weekly settlement records (audit #5): one per provider per
+    // week. Records only — money movement itself needs a bank account.
+    settlements: [], // {id, providerId, weekKey, generatedAt, totals{...}}
+    // v2.1.1 — medical-file interest (PLACEHOLDER ONLY): count + deduped
+    // phones. No medical file, no Pro subscription, no price.
+    medicalFileInterest: { count: 0, phones: [], lastAt: null },
+    // v2.1.1 — per-IP admin PIN lockout (audit #16).
+    adminPinAttempts: {}, // ip -> {failures, lockedUntil}
+    // v2.1.1 — patient favourites (patientPhone -> [providerId]).
+    favorites: {},
+    // v2.1.1 — SOS / safety-report daily counters per booking (M11).
+    sosDaily: {}, // 'bookingId:YYYY-MM-DD' -> count
+    safetyDaily: {},
     adminPin: {
       // No PIN configured => hash a random value so NO pin can ever match.
       // Admin login is disabled until ADMIN_PIN is set and the service restarts.
@@ -141,6 +189,26 @@ class Store {
     if (!this.data.notifications) this.data.notifications = {};
     if (!this.data.doctors) this.data.doctors = [];
     if (!('settlementNotifiedOn' in this.data)) this.data.settlementNotifiedOn = null;
+    if (!Array.isArray(this.data.settlements)) this.data.settlements = [];
+    if (!this.data.medicalFileInterest) this.data.medicalFileInterest = { count: 0, phones: [], lastAt: null };
+    if (!this.data.adminPinAttempts) this.data.adminPinAttempts = {};
+    if (!this.data.favorites) this.data.favorites = {};
+    if (!this.data.sosDaily) this.data.sosDaily = {};
+    if (!this.data.safetyDaily) this.data.safetyDaily = {};
+    // v2.1.1 provider backfill: providerType = role, joinedAt = createdAt,
+    // languageCertificates from legacy extraLanguages, empty courses.
+    for (const p of Object.values(this.data.providers || {})) {
+      if (!p.providerType) p.providerType = (p.role === 'assistant' || p.role === 'nurse' || p.role === 'doctor' || p.role === 'physio') ? p.role : 'nurse';
+      if (!p.joinedAt) p.joinedAt = p.createdAt || nowIso();
+      if (!Array.isArray(p.courses)) p.courses = [];
+      if (!Array.isArray(p.languageCertificates)) {
+        p.languageCertificates = Array.isArray(p.extraLanguages)
+          ? p.extraLanguages.filter((l) => l && l.language).map((l) => ({ language: String(l.language).toLowerCase(), certificateName: '', verified: l.certified === true }))
+          : [];
+      }
+      if (!p.casesByWeek) p.casesByWeek = {};
+      if (p.interviewPoints == null) p.interviewPoints = 0;
+    }
   }
   load() {
     try {
@@ -212,15 +280,26 @@ class Store {
     if (!p) return null;
     const out = {
       id: p.id, demo: !!p.demo, name: p.name, role: p.role,
+      providerType: p.providerType || p.role,
       tier: p.tier, status: p.status, nationalIdLast4: p.nationalIdLast4,
       licenseLast4: p.licenseLast4, certificates: p.certificates || [],
+      courses: p.courses || [], languageCertificates: p.languageCertificates || [],
       extraLanguages: p.extraLanguages || [], verifiedCertificates: p.verifiedCertificates || 0,
       interviewStatus: p.interviewStatus, interviewScore: p.interviewScore,
+      interviewPoints: p.interviewPoints || 0,
       ratingAvg: p.ratingAvg ?? null, completedVisits: p.completedVisits || 0,
       suspended: !!p.suspended, permanentBan: !!p.permanentBan,
       warningCount: (p.warnings || []).length,
-      createdAt: p.createdAt,
+      createdAt: p.createdAt, joinedAt: p.joinedAt || p.createdAt,
+      buddyId: p.buddyId || null,
+      // v2.1.1 — tourist badge (verified language certificate) + English
+      // block (interview English 0/3). Computed here from the record;
+      // points are attached by the caller when available (opts.points).
+      touristCompatible: Array.isArray(p.languageCertificates) && p.languageCertificates.some((l) => l && l.verified === true),
+      englishBlocked: p.interviewEnglishCorrect === 0 && p.interviewEnglishTotal === 3,
     };
+    if (opts.points) out.points = opts.points;
+    else if (p.points) out.points = p.points;
     if (opts.admin || opts.self) out.phone = p.phone;
     if (opts.admin) out.warnings = p.warnings || [];
     if (opts.admin) out.volumeBonus = p.volumeBonus || null; // v2.0.9 snapshot (wallet recomputes live)
@@ -231,12 +310,15 @@ class Store {
   // window and amount. NO patient identity, phone, address, contact,
   // notes, triage, insurer, passport or diagnosis — those are revealed
   // to the ASSIGNED provider only (see publicBooking below).
-  radarBooking(b) {
+  radarBooking(b, opts = {}) {
     if (!b) return null;
+    const night = isNight(b.scheduledAt);
     return {
       id: b.id, kind: b.kind, serviceCode: b.serviceCode, serviceName: b.serviceName,
+      category: b.category || 'nursing', riskLevel: b.riskLevel || 'standard',
       status: b.status, amountEgp: b.amountEgp, distanceKm: b.distanceKm,
-      distanceBand: b.distanceBand, scheduledAt: b.scheduledAt,
+      distanceBand: b.distanceBand, scheduledAt: b.scheduledAt, night,
+      eliteEarly: !!opts.eliteEarly, preferredForYou: !!opts.preferredForYou,
       createdAt: b.createdAt,
     };
   }
@@ -264,7 +346,7 @@ class Store {
     if (viewer && viewer.role === 'provider' && b.providerId !== viewer.providerId && b.patientPhone !== viewer.phone) {
       return this.radarBooking(b);
     }
-    const out = { ...b, service: b.serviceCode, total: b.amountEgp };
+    const out = { ...b, service: b.serviceCode, total: b.amountEgp, night: isNight(b.scheduledAt) };
     if (viewer && viewer.role === 'provider' && b.patientPhone !== viewer.phone) {
       delete out.alternateContact;
       delete out.insurer;
@@ -312,4 +394,4 @@ class Store {
 }
 
 const store = new Store(config.dataFile);
-module.exports = { store, sha256, newId, nowIso };
+module.exports = { store, sha256, saltedSha256, matchesSaltedHash, newId, nowIso, isNight };

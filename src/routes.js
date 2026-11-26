@@ -4,13 +4,32 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const config = require('./config');
-const { store, sha256, newId, nowIso } = require('./store');
-const { makeCode, pickProvider, normalizePhone } = require('./otp');
-const { issueTokens, verifyRefreshToken, revokeRefreshToken, requireAuth, requireRole, issueAdminToken } = require('./auth');
+const crypto = require('crypto');
+const { store, sha256, saltedSha256, newId, nowIso, isNight } = require('./store');
+const { makeCode, hashOtpCode, verifyOtpCode, getMockCode, pickProvider, normalizePhone } = require('./otp');
+const { issueTokens, verifyRefreshToken, detectRefreshReuse, revokeRefreshToken, requireAuth, requireRole, requireAdmin, issueAdminToken } = require('./auth');
+const { computePoints, isoWeekKey, currentWeekKey, touristCompatible, englishBlocked } = require('./points');
 const cat = require('./catalog');
 const notify = require('./notify');
 
 const router = express.Router();
+
+// v2.1.1 (audit #26): '__proto__' / 'constructor' / 'prototype' are never
+// valid ids — reject them at the router level before any store lookup
+// (a lookup like store.data.providers['__proto__'] returns
+// Object.prototype, which is truthy and would be mutated otherwise).
+router.param('id', (req, res, next, id) => {
+  if (isReservedId(id)) return res.status(400).json({ error: 'validation_error', message: 'Invalid identifier.' });
+  return next();
+});
+router.param('providerId', (req, res, next, id) => {
+  if (isReservedId(id)) return res.status(400).json({ error: 'validation_error', message: 'Invalid identifier.' });
+  return next();
+});
+router.param('reportId', (req, res, next, id) => {
+  if (isReservedId(id)) return res.status(400).json({ error: 'validation_error', message: 'Invalid identifier.' });
+  return next();
+});
 
 const DEMO_OTP = '123456'; // dev only, demo phones only, mock mode only
 
@@ -34,6 +53,7 @@ function nextThursday(from = new Date()) {
   return d.toISOString().slice(0, 10);
 }
 function loadBooking(req, res) {
+  if (isReservedId(req.params.id)) { res.status(400).json({ error: 'validation_error', message: 'Invalid identifier.' }); return null; }
   const b = store.data.bookings[req.params.id];
   if (!b) { res.status(404).json({ error: 'not_found', message: 'Booking not found.' }); return null; }
   return b;
@@ -74,6 +94,102 @@ function providerBlocked(p) {
   if (p.suspended) return 'This provider account is suspended. Contact admin.';
   return null;
 }
+// --- v2.1.1 helpers --------------------------------------------------
+// Reject prototype-pollution / reserved identifiers anywhere they are
+// used as ids (audit #26).
+const RESERVED_IDS = new Set(['__proto__', 'constructor', 'prototype']);
+function isReservedId(id) { return typeof id === 'string' && RESERVED_IDS.has(id); }
+function rejectReservedId(req, res) {
+  if (isReservedId(req.params.id) || isReservedId(req.params.providerId) || isReservedId(req.params.reportId)) {
+    res.status(400).json({ error: 'validation_error', message: 'Invalid identifier.' });
+    return true;
+  }
+  return false;
+}
+// HTML-escape for the insurance report (audit #13).
+function escapeHtml(v) {
+  return String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+// v2.1.1 — EXPLICIT WRITTEN CONSENT for high-risk services (owner
+// decision 26 Nov 2026, after legal review): the patient must give
+// explicit written consent (consentGiven=true) before booking a
+// high-risk service. Returns true when the request must be rejected
+// (response already sent). Standard services are unaffected.
+function requireHighRiskConsent(req, res, serviceCode) {
+  if (!cat.isHighRiskService(serviceCode)) return false;
+  if (req.body?.consentGiven === true) return false;
+  res.status(400).json({ error: 'explicit_consent_required', message: 'هذه الخدمة عالية الخطورة وتتطلب موافقة كتابية صريحة من المريض قبل الحجز.' });
+  return true;
+}
+// Length caps (M11): name <=120, notes <=1000, address <=300,
+// complaint <=1000, safety text <=1000.
+function capStr(v, max) { return v == null ? v : String(v).slice(0, max); }
+function validScheduledAt(v) {
+  if (v == null || v === '') return true; // optional
+  const d = new Date(v);
+  return Number.isFinite(d.getTime());
+}
+// Recompute a provider's points + auto-promote (audit #17). Runs on
+// interview submit, admin credential verify and booking release.
+function recomputeProviderPoints(p, { auditTier = true } = {}) {
+  if (!p) return null;
+  const pts = computePoints(p, Object.values(store.data.bookings));
+  p.points = pts;
+  p.ratingAvg = pts.ratingAvg;
+  p.casesByWeek = pts.casesByWeek;
+  if (pts.tier !== p.tier) {
+    const from = p.tier;
+    p.tier = pts.tier;
+    if (auditTier) store.audit('points.tier_changed', p.id, { from, to: pts.tier, points: pts.total });
+  }
+  return pts;
+}
+// Stay bonus (v2.1.1): 250 EGP, earned when 90 days since joining AND
+// >=10 completed cases. Paid once, via a settlement record.
+function stayBonusState(p) {
+  const joined = p.joinedAt ? new Date(p.joinedAt).getTime() : Date.now();
+  const days = Math.floor((Date.now() - joined) / (24 * 60 * 60 * 1000));
+  const cases = (p.points && typeof p.points.totalCases === 'number')
+    ? p.points.totalCases
+    : Object.values(store.data.bookings).filter((b) => b.providerId === p.id && (b.status === 'released' || b.status === 'auto_released')).length;
+  const earned = days >= cat.STAY_BONUS_DAYS && cases >= cat.STAY_BONUS_MIN_CASES;
+  return {
+    eligibleAt: new Date(joined + cat.STAY_BONUS_DAYS * 24 * 60 * 60 * 1000).toISOString(),
+    amountEgp: cat.STAY_BONUS_EGP, earned, paid: !!p.stayBonusPaid, daysSinceJoin: days,
+  };
+}
+// Weekly settlement records (audit #5): one per provider per ISO week.
+// RECORDS ONLY — no money moves (that needs a bank account).
+function generateSettlements() {
+  const weekKey = currentWeekKey();
+  const made = [];
+  for (const p of Object.values(store.data.providers)) {
+    if (p.demo) continue;
+    const weekBookings = Object.values(store.data.bookings).filter((b) =>
+      b.providerId === p.id && b.releasedAt && isoWeekKey(new Date(b.releasedAt)) === weekKey);
+    const stay = stayBonusState(p);
+    const vb = volumeBonusFor(p.id, monthKey());
+    const stayDue = stay.earned && !stay.paid ? cat.STAY_BONUS_EGP : 0;
+    if (!weekBookings.length && !stayDue && !(vb.bonusEgp > 0)) continue;
+    const exists = (store.data.settlements || []).some((x) => x.providerId === p.id && x.weekKey === weekKey);
+    if (exists) continue;
+    const totals = {
+      appOwesProviderEgp: weekBookings.reduce((sum, b) => sum + (b.providerShareEgp || 0), 0) + vb.bonusEgp + stayDue,
+      providerOwesAppEgp: weekBookings.filter((b) => b.cashCollectedByProvider).reduce((sum, b) => sum + (b.appShareEgp || 0), 0),
+      volumeBonusEgp: vb.bonusEgp, stayBonusEgp: stayDue,
+      releasedCases: weekBookings.length,
+    };
+    const rec = { id: newId('stl'), providerId: p.id, weekKey, generatedAt: nowIso(), totals };
+    store.data.settlements.push(rec);
+    if (stayDue > 0) {
+      p.stayBonusPaid = true;
+      store.audit('stay_bonus.paid', p.id, { settlementId: rec.id, amountEgp: stayDue });
+    }
+    made.push(rec);
+  }
+  return made;
+}
+
 // Phone numbers are forbidden inside in-app messages: the masked channel
 // must never become a way to exchange personal numbers.
 const PHONE_IN_MESSAGE_RE = /(?:\+?20[\s-]?|0)?1[0-9][\s-]?[0-9]{4}[\s-]?[0-9]{4}|\b\d{10,}\b/;
@@ -170,6 +286,7 @@ function activePromo() {
 function effectiveCommissionPct(tier) {
   const promo = activePromo();
   if (promo) return promo.commissionPct;
+  if (typeof tier !== 'string' || !Object.hasOwn(cat.TIERS, tier)) return cat.TIERS.Starter.commission_pct;
   return cat.TIERS[tier].commission_pct;
 }
 
@@ -284,6 +401,20 @@ function refundAmount(b) {
 //   Complaint FILING is only allowed inside the 24h window; an open
 //   complaint pauses final settlement indefinitely until admin resolves it
 //   (the window limits filing, not resolution time).
+// v2.1.1 (L4): rating average over ALL reviews on the provider's
+// bookings (including the current visit) — the old incremental formula
+// never counted the current visit.
+function recomputeRatingAvg(p) {
+  if (!p) return null;
+  const rated = Object.values(store.data.bookings).filter((b) =>
+    b.providerId === p.id && b.review && Number.isFinite(Number(b.review.rating))
+    && !['cancelled', 'refunded'].includes(b.status));
+  p.ratingAvg = rated.length
+    ? Math.round((rated.reduce((sum, b) => sum + Number(b.review.rating), 0) / rated.length) * 10) / 10
+    : null;
+  return p.ratingAvg;
+}
+
 function releaseBooking(b, mode) {
   const total = b.amountEgp;
   const pct = b.commissionPct ?? 0;
@@ -294,7 +425,21 @@ function releaseBooking(b, mode) {
   // is the app's cost of the voucher).
   b.appShareEgp = Math.max(0, grossAppShare - (b.voucherDiscountEgp || 0));
   b.providerShareEgp = total - grossAppShare;
-  const p = b.providerId ? store.data.providers[b.providerId] : null;
+  // v2.1.1 (audit #18): language bonus — if the tourist booking's
+  // language matches a VERIFIED language certificate the provider holds,
+  // add $15/€15 at the booking FX rate to the provider's share (the app
+  // funds it) and record it for the wallet ledger line.
+  b.languageBonusEgp = 0;
+  const p0 = b.providerId ? store.data.providers[b.providerId] : null;
+  if (b.kind === 'tourist' && b.language && b.language !== 'en' && p0 && b.fxRate) {
+    const hasCert = Array.isArray(p0.languageCertificates)
+      && p0.languageCertificates.some((l) => l && l.verified === true && String(l.language).toLowerCase() === String(b.language).toLowerCase());
+    if (hasCert) {
+      b.languageBonusEgp = Math.round(cat.EXTRA_LANGUAGE_BONUS[b.currency.toLowerCase()] * b.fxRate);
+      b.providerShareEgp += b.languageBonusEgp;
+    }
+  }
+  const p = p0;
   // Volume-bonus threshold detection: count BEFORE this release, so the
   // crossing is detected (and audited) exactly once.
   const key = monthKey();
@@ -307,6 +452,12 @@ function releaseBooking(b, mode) {
   b.settleableAt = b.complaintDeadline || null;
   if (p) {
     p.completedVisits = (p.completedVisits || 0) + 1;
+    // v2.1.1 (points system): track cases by ISO week on the record.
+    const wk = isoWeekKey(new Date(b.releasedAt || nowIso()));
+    p.casesByWeek = p.casesByWeek || {};
+    p.casesByWeek[wk] = (p.casesByWeek[wk] || 0) + 1;
+    // Points recompute + auto-promotion (interview/credential/release).
+    recomputeProviderPoints(p);
     // Volume bonus snapshot on the provider record (the wallet recomputes
     // live from bookings; this is the audit trail / admin view).
     const vb = volumeBonusFor(p.id, key);
@@ -356,8 +507,12 @@ async function sweepAutoRelease() {
       releaseBooking(b, 'reviewed');
       released.push(b.id);
     }
-    if ((b.status === 'accepted' || b.status === 'provider_confirmed') && b.acceptedAt) {
-      if (!b.overdue && now - new Date(b.acceptedAt).getTime() >= 120 * 60 * 1000) {
+    // v2.1.1 (audit #28): the 120-minute late-visit clock starts at the
+    // FIRST on-site event (vitals / en-route / acceptance), not at
+    // acceptance only.
+    const onSiteAt = b.vitalsAt || b.enRouteAt || b.acceptedAt;
+    if ((b.status === 'accepted' || b.status === 'provider_confirmed') && onSiteAt) {
+      if (!b.overdue && now - new Date(onSiteAt).getTime() >= 120 * 60 * 1000) {
         b.overdue = true;
         overdue.push(b.id);
         store.audit('visit.overdue', 'system', { bookingId: b.id, minutes: 120 });
@@ -427,8 +582,11 @@ async function sweepAutoRelease() {
   } catch (e) {
     console.error('[sweep] sms fallback pass failed:', e.message);
   }
+  // v2.1.1 (audit #5): weekly settlement records (records only).
+  const settlementsMade = generateSettlements();
+  if (settlementsMade.length) changed = true;
   if (released.length || overdue.length || changed) store.save();
-  return { released, overdue, notificationsSent, smsSent: fb.sent, smsFallbackAttempted: fb.attempted };
+  return { released, overdue, notificationsSent, smsSent: fb.sent, smsFallbackAttempted: fb.attempted, settlementsGenerated: settlementsMade.length };
 }
 
 // ---------------------------------------------------------------- bootstrap
@@ -445,6 +603,7 @@ router.get('/bootstrap', (req, res) => {
       // v2.1.0 — risk tier (owner refinement 26 Nov 2026): 'high' services
       // need a doctor's order to book and a verified nurse to accept.
       riskLevel: s.riskLevel || 'standard',
+      category: s.category || 'nursing',
       requiresDoctorOrder: s.requiresDoctorOrder === true,
       experience_bands: s.experience_bands || undefined,
     }));
@@ -459,10 +618,14 @@ router.get('/bootstrap', (req, res) => {
     tourist_services: Object.values(cat.TOURIST_SERVICES),
     tourist,
     tourist_urgent_extra: cat.TOURIST_URGENT_EXTRA,
+    // v2.1.1 (M1): tiers match the catalog exactly — 20–35 km is 350,
+    // AT 35 km the fee is 500 (not 350).
     distanceTiers: [
       { maxKm: 6, fee: 0 }, { maxKm: 10, fee: 100 }, { maxKm: 20, fee: 200 },
-      { maxKm: 35, fee: 350 }, { maxKm: 35.01, fee: 500 },
+      { maxKm: 34.99, fee: 350 }, { maxKm: 35, fee: 500 },
     ],
+    volumeBonusTiers: cat.VOLUME_BONUS_TIERS,
+    pointsTiers: cat.POINTS.tiers,
     fx: { usd: config.usdEgp, eur: config.eurEgp },
     mockMode: config.mockOtp,
     ambulance: '123',
@@ -581,6 +744,127 @@ router.post('/me/notifications/:id/read', requireAuth, (req, res) => {
   res.json({ ok: true, notification: rec });
 });
 
+// ---------------------------------------------------------------- favorites (v2.1.1)
+// Patients keep favourite providers; a booking can name a preferred
+// provider (validated at creation) who sees preferredForYou on the radar.
+router.post('/me/favorites', requireAuth, requireRole('patient'), (req, res) => {
+  const providerId = String(req.body?.providerId || '');
+  if (isReservedId(providerId)) return bad(res, 400, 'Invalid providerId.');
+  const prov = store.data.providers[providerId];
+  if (!prov || prov.status !== 'verified') return res.status(400).json({ error: 'validation_error', message: 'Favourite provider must exist and be verified.' });
+  const favs = store.data.favorites[req.user.phone] || (store.data.favorites[req.user.phone] = []);
+  if (!favs.includes(providerId)) favs.push(providerId);
+  store.save();
+  res.status(201).json({ ok: true, favorites: favs });
+});
+router.delete('/me/favorites/:providerId', requireAuth, requireRole('patient'), (req, res) => {
+  const favs = store.data.favorites[req.user.phone] || [];
+  store.data.favorites[req.user.phone] = favs.filter((x) => x !== req.params.providerId);
+  store.save();
+  res.json({ ok: true, favorites: store.data.favorites[req.user.phone] });
+});
+router.get('/me/favorites', requireAuth, requireRole('patient'), (req, res) => {
+  const favs = store.data.favorites[req.user.phone] || [];
+  const out = favs.map((id) => store.data.providers[id]).filter(Boolean).map((prov) => ({
+    providerId: prov.id, name: prov.name, role: prov.role, tier: prov.tier,
+    touristCompatible: touristCompatible(prov),
+  }));
+  res.json({ favorites: out });
+});
+
+// ---------------------------------------------------------------- medical-file interest (v2.1.1 — PLACEHOLDER ONLY)
+// Revised item 10: a public, rate-limited interest counter for a future
+// full medical file. NO file, NO Pro subscription, NO price, Postgres
+// stays DISABLED. Stores only a count + deduped phones.
+router.post('/medical-file-interest', (req, res) => {
+  const phone = req.body?.phone ? normalizePhone(req.body.phone) : null;
+  const rec = store.data.medicalFileInterest || (store.data.medicalFileInterest = { count: 0, phones: [], lastAt: null });
+  let recorded = true;
+  if (phone) {
+    if (rec.phones.includes(phone)) recorded = false;
+    else { rec.phones.push(phone); rec.count += 1; rec.lastAt = nowIso(); }
+  } else {
+    rec.count += 1; rec.lastAt = nowIso();
+  }
+  store.save();
+  res.json({ ok: true, recorded });
+});
+
+// ---------------------------------------------------------------- monitor (v2.1.1)
+// READ-ONLY oversight summary for Muse (owner-approved 26 Nov 2026).
+// Auth ONLY by header X-Monitor-Token exact match (timingSafeEqual when
+// lengths match). Env unset -> 404 so the endpoint looks disabled.
+// Wrong/missing token -> 401 generic. NO PII: no phones, names,
+// addresses. Each access is audit-logged WITHOUT the token value.
+router.get('/monitor/summary', (req, res) => {
+  const configured = config.museMonitorToken;
+  if (!configured) return res.status(404).json({ error: 'not_found', message: 'Route not found.' });
+  const presented = req.headers['x-monitor-token'];
+  let ok = false;
+  if (typeof presented === 'string' && presented.length === configured.length) {
+    try { ok = crypto.timingSafeEqual(Buffer.from(presented), Buffer.from(configured)); } catch { ok = false; }
+  }
+  if (!ok) return res.status(401).json({ error: 'unauthorized', message: 'Invalid or missing monitor token.' });
+  const today = new Date().toISOString().slice(0, 10);
+  const bookings = Object.values(store.data.bookings);
+  const todayBookings = bookings.filter((b) => (b.createdAt || '').slice(0, 10) === today);
+  const byStatus = {};
+  for (const b of todayBookings) byStatus[b.status] = (byStatus[b.status] || 0) + 1;
+  const openComplaints = store.data.safetyReports.filter((r) => r.type === 'complaint' && r.status === 'open');
+  const openSos = store.data.sos.filter((x) => x.status === 'open');
+  const overdueVisits = bookings.filter((b) => b.overdue && ['accepted', 'provider_confirmed'].includes(b.status));
+  const circumventionReports = (store.data.circumventionReports || []).filter((r) => r.status === 'open');
+  // Settlement snapshot (ledger only — no money movement here).
+  let appOwes = 0, provOwes = 0, pending = 0, hold = 0;
+  for (const b of bookings) {
+    if (!['released', 'auto_released'].includes(b.status)) continue;
+    const holdOpen = b.complaintStatus === 'open' || b.circumventionHold;
+    const windowOpen = b.complaintDeadline && Date.now() < new Date(b.complaintDeadline).getTime() && b.complaintStatus !== 'rejected';
+    if (holdOpen || windowOpen) hold += b.providerShareEgp || 0;
+    else if (b.cashCollectedByProvider) provOwes += b.appShareEgp || 0;
+    else appOwes += b.providerShareEgp || 0;
+  }
+  for (const b of bookings) {
+    if (['provider_confirmed', 'patient_confirmed', 'reviewed'].includes(b.status)) pending += b.estimatedProviderShareEgp ?? b.providerShareEgp ?? 0;
+  }
+  // v2.1.1 — repeat-booking rate (owner's launch metric, 26 Nov 2026):
+  // share of patients with 2+ COMPLETED bookings, overall and last 30 days.
+  // "Completed" = the visit happened (provider_confirmed or later) — a
+  // cancelled/refunded/held booking never counts. Grouped by patient phone;
+  // only counts + rates leave the server, never any phone or name.
+  const COMPLETED = ['provider_confirmed', 'patient_confirmed', 'reviewed', 'released', 'auto_released'];
+  const completedAt = (b) => b.releasedAt || b.patientConfirmedAt || b.providerConfirmedAt || b.createdAt || null;
+  const repeatRate = (list) => {
+    const perPatient = {};
+    for (const b of list) {
+      if (!COMPLETED.includes(b.status) || !b.patientPhone) continue;
+      perPatient[b.patientPhone] = (perPatient[b.patientPhone] || 0) + 1;
+    }
+    const patients = Object.keys(perPatient).length;
+    const repeat = Object.values(perPatient).filter((n) => n >= 2).length;
+    return { patientsWithCompleted: patients, repeatPatients: repeat, rate: patients ? Math.round((repeat / patients) * 1000) / 1000 : 0 };
+  };
+  const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const recentCompleted = bookings.filter((b) => {
+    const t = completedAt(b);
+    return t && new Date(t).getTime() >= thirtyDaysAgo;
+  });
+  const repeatBookingRate = { overall: repeatRate(bookings), last30Days: repeatRate(recentCompleted) };
+  store.audit('monitor.access', 'monitor', { ip: req.ip });
+  store.save();
+  res.json({
+    date: today,
+    bookingsToday: { total: todayBookings.length, byStatus },
+    openComplaints: { count: openComplaints.length, items: openComplaints.map((r) => ({ id: r.id, status: r.status })) },
+    openSos: { count: openSos.length, items: openSos.map((x) => ({ id: x.id, bookingId: x.bookingId })) },
+    overdueVisits: { count: overdueVisits.length, items: overdueVisits.map((b) => ({ id: b.id })) },
+    circumventionReports: { count: circumventionReports.length, items: circumventionReports.map((r) => ({ id: r.id, bookingId: r.bookingId })) },
+    settlement: { appOwesProviderEgp: appOwes, providerOwesAppEgp: provOwes, pendingEgp: pending, complaintHoldEgp: hold },
+    repeatBookingRate,
+    medicalFileInterestCount: (store.data.medicalFileInterest || {}).count || 0,
+  });
+});
+
 // ---------------------------------------------------------------- OTP
 router.post('/otp/request', async (req, res) => {
   const phone = normalizePhone(req.body?.phone);
@@ -593,9 +877,12 @@ router.post('/otp/request', async (req, res) => {
     return res.status(429).json({ error: 'rate_limited', message: 'Too many OTP requests for this number. Try again later.' });
   }
   const code = makeCode();
-  rec.codeHash = sha256(code);
+  // v2.1.1 (audit #15 / M18): bcrypt-hashed code, NEVER logged; a
+  // re-request does NOT reset the attempt counter.
+  rec.codeHashBcrypt = hashOtpCode(code);
+  delete rec.codeHash;
   rec.expiresAt = new Date(Date.now() + config.otpTtlMinutes * 60 * 1000).toISOString();
-  rec.attempts = 0;
+  rec.attempts = rec.attempts || 0;
   rec.channel = channel;
   rec.requests.push(Date.now());
   store.data.otps[phone] = rec;
@@ -612,6 +899,7 @@ router.post('/otp/request', async (req, res) => {
     const provider = pickProvider(channel);
     await provider.send({ phone, channel, code });
   } catch (e) {
+    store.audit('auth.otp_request_failed', phone, { channel });
     // A real provider failure must never look like a success.
     return res.status(502).json({ error: 'otp_provider_error', message: e.message });
   }
@@ -624,21 +912,25 @@ router.post('/otp/verify', (req, res) => {
   const code = String(req.body?.code || '').trim();
   if (!phone || !/^\d{6}$/.test(code)) return bad(res, 400, 'Phone and 6-digit code required.');
   const rec = store.data.otps[phone];
-  // Demo phones in mock/dev mode accept the documented demo code.
+  // v2.1.1 (audit #8): the demo-code bypass works ONLY when mockOtp is
+  // true (dev/test). In production it never applies.
   const isDemo = config.mockOtp && (phone === '01000000001' || phone === '01000000002') && code === DEMO_OTP;
   if (!isDemo) {
-    if (!rec) return res.status(401).json({ error: 'unauthorized', message: 'No OTP requested for this number.' });
+    if (!rec) { store.audit('auth.otp_verify_failed', phone, { reason: 'no_otp' }); return res.status(401).json({ error: 'unauthorized', message: 'No OTP requested for this number.' }); }
     if (new Date(rec.expiresAt).getTime() < Date.now()) {
       delete store.data.otps[phone]; store.save();
+      store.audit('auth.otp_verify_failed', phone, { reason: 'expired' });
       return res.status(401).json({ error: 'unauthorized', message: 'OTP expired. Request a new one.' });
     }
     if ((rec.attempts || 0) >= config.otpMaxAttempts) {
       delete store.data.otps[phone]; store.save();
+      store.audit('auth.otp_verify_failed', phone, { reason: 'too_many_attempts' });
       return res.status(401).json({ error: 'unauthorized', message: 'Too many wrong attempts. Request a new OTP.' });
     }
-    if (rec.codeHash !== sha256(code)) {
+    if (!verifyOtpCode(code, rec)) {
       rec.attempts = (rec.attempts || 0) + 1;
       store.save();
+      store.audit('auth.otp_verify_failed', phone, { reason: 'wrong_code' });
       return res.status(401).json({ error: 'unauthorized', message: 'Wrong OTP code.' });
     }
   }
@@ -695,7 +987,12 @@ router.post('/auth/login-phone', (req, res) => {
   if (!store.data.users[phone]) store.data.users[phone] = { phone, createdAt: nowIso() };
   const role = provider ? 'provider' : 'patient';
   const tokens = issueTokens({ phone, role, providerId: provider ? provider.id : null });
-  store.audit('auth.phone_login', phone, { role, authMethod: 'phone-only-fallback' });
+  // v2.1.1 (audit #1): flag a login from a phone with NO prior login
+  // record — a new-device alert. Phone-only login stays the
+  // owner-authorized fallback (accepted residual risk, documented in
+  // SERVER-CHANGES-2.1.1.md); OTP is the real fix when unblocked.
+  const isNewDevice = !store.data.phoneLogins[phone] || (store.data.phoneLogins[phone].requests || []).length <= 1;
+  store.audit(isNewDevice ? 'auth.phone_login_new_device' : 'auth.phone_login', phone, { role, authMethod: 'phone-only-fallback', newDevice: isNewDevice });
   store.save();
   // `token` is the field the web frontend reads (alias of accessToken).
   res.json({ ...tokens, token: tokens.accessToken, role, providerId: provider ? provider.id : null, phone, authMethod: 'phone-only' });
@@ -703,12 +1000,20 @@ router.post('/auth/login-phone', (req, res) => {
 
 // ---------------------------------------------------------------- auth
 router.post('/auth/refresh', (req, res) => {
-  const rec = verifyRefreshToken(req.body?.refreshToken);
-  if (!rec) return res.status(401).json({ error: 'unauthorized', message: 'Invalid or expired refresh token.' });
-  const tokens = issueTokens({ phone: rec.phone, role: rec.role, providerId: rec.providerId });
-  // Rotate: revoke the old refresh token.
+  const presented = req.body?.refreshToken;
+  const rec = verifyRefreshToken(presented);
+  if (!rec) {
+    // v2.1.1 (M9): reuse of a revoked/unknown refresh token revokes the
+    // whole family + audits 'auth.refresh_reuse'.
+    const fam = detectRefreshReuse(presented);
+    store.audit('auth.refresh_failed', typeof presented === 'string' ? 'unknown' : 'unknown', { reuseDetected: !!fam, familyId: fam || undefined });
+    return res.status(401).json({ error: 'unauthorized', message: 'Invalid or expired refresh token.' });
+  }
+  // Rotate within the SAME family; revoke the old token.
+  const tokens = issueTokens({ phone: rec.phone, role: rec.role, providerId: rec.providerId }, rec.familyId);
   rec.revoked = true;
   store.save();
+  store.audit('auth.refresh_used', rec.phone, { familyId: rec.familyId });
   res.json(tokens);
 });
 
@@ -754,7 +1059,10 @@ function priceBooking({ serviceCode, experienceYears, distanceKm, hotelId, trans
     if (!hotel) return { error: 'Unknown hotel id.' };
     distance = hotel.distance_km;
   }
-  if (distance == null) distance = 0; // no location given: assume city centre (0–6 km band, fee 0); the real distance is confirmed with the provider
+  // v2.1.1 (audit #23): a missing distance is NOT silently 0 — the
+  // client must send distanceKm or a hotelId (the web flow requires
+  // km/hotel first). Callers map this to 400 'distance_required'.
+  if (distance == null) return { error: 'distance_required' };
   const fee = cat.distanceFee(distance, transport);
   if (fee.error) return { error: fee.error };
   if (fee.contract_required) {
@@ -763,16 +1071,50 @@ function priceBooking({ serviceCode, experienceYears, distanceKm, hotelId, trans
   return { baseEgp: base, distanceFeeEgp: fee.fee_egp, totalEgp: base + fee.fee_egp, distanceKm: distance, band: fee.band, hotel };
 }
 
-router.post('/bookings', requireAuth, (req, res) => {
+// v2.1.1 (M11/M13): shared booking-input validation. Returns an error
+// response object when invalid, else null. Length caps: name <=120,
+// notes <=1000, address <=300. scheduledAt must be a valid date.
+// triage.dangerSigns must be an array; triage.level==='emergency'
+// rejects the booking even with empty dangerSigns.
+function validateBookingInput(b) {
+  if (b.patientName && typeof b.patientName === 'string' && b.patientName.length > 120) return { status: 400, error: 'validation_error', message: 'patientName is too long (max 120 characters).' };
+  if (b.notes && String(b.notes).length > 1000) return { status: 400, error: 'validation_error', message: 'notes are too long (max 1000 characters).' };
+  if (b.address && String(b.address).length > 300) return { status: 400, error: 'validation_error', message: 'address is too long (max 300 characters).' };
+  if (b.scheduledAt && !validScheduledAt(b.scheduledAt)) return { status: 400, error: 'validation_error', message: 'scheduledAt must be a valid date.' };
+  if (b.triage && b.triage.dangerSigns !== undefined && !Array.isArray(b.triage.dangerSigns)) return { status: 400, error: 'validation_error', message: 'triage.dangerSigns must be an array.' };
+  return null;
+}
+function validatePreferredProvider(b) {
+  if (b.preferredProviderId == null || b.preferredProviderId === '') return null;
+  if (isReservedId(String(b.preferredProviderId))) return { status: 400, error: 'validation_error', message: 'Invalid preferredProviderId.' };
+  const pp = store.data.providers[b.preferredProviderId];
+  if (!pp || pp.status !== 'verified') return { status: 400, error: 'validation_error', message: 'preferredProviderId must be a verified provider.' };
+  return null;
+}
+function triageRejects(triage) {
+  const t = triage || {};
+  if (t.level === 'emergency' || t.danger === true || t.emergency === true) return true;
+  const danger = Array.isArray(t.dangerSigns) ? t.dangerSigns.filter((x) => cat.DANGER_SIGNS.includes(x)) : [];
+  return danger.length > 0;
+}
+
+router.post('/bookings', requireAuth, requireRole('patient'), (req, res) => {
   const b = normalizeBookingBody(req.body);
   if (b.respectCharterAccepted !== true) {
     return bad(res, 400, 'Respect charter must be accepted before booking (respectCharterAccepted=true).', { charter: 'Treat the healthcare provider with respect: no insults, harassment or threats; keep the appointment; prepare the place. Violations lead to warning then account suspension.' });
   }
   // v2.0.8 — Terms & Conditions are mandatory (same version for everyone).
   if (!termsAccepted(req.body)) return termsError(res);
+  const vErr = validateBookingInput(b) || validatePreferredProvider(b);
+  if (vErr) return res.status(vErr.status).json({ error: vErr.error, message: vErr.message });
   if (!b.patientName || typeof b.patientName !== 'string') return bad(res, 400, 'patientName required.');
   if (!b.serviceCode || !cat.SERVICES[b.serviceCode]) return bad(res, 400, 'Valid serviceCode required.');
+  if (isReservedId(b.serviceCode)) return bad(res, 400, 'Valid serviceCode required.');
   if (!['cash_receipt', 'instapay'].includes(b.paymentMethod)) return bad(res, 400, 'paymentMethod must be cash_receipt or instapay.');
+  // v2.1.1 — explicit written consent (owner decision 26 Nov 2026,
+  // after legal review): a high-risk service may not be booked without
+  // the patient's explicit written consent (consentGiven=true).
+  if (requireHighRiskConsent(req, res, b.serviceCode)) return;
   // v2.1.0 — doctor's order gate (owner refinement 26 Nov 2026): HIGH-risk
   // services (catheter insertion, Ryle insertion, tracheostomy care, IV
   // infusion) AND suture removal require a written doctor order
@@ -784,10 +1126,11 @@ router.post('/bookings', requireAuth, (req, res) => {
   if ((cat.isHighRiskService(b.serviceCode) || b.serviceCode === 'suture_removal') && !orderOk) {
     return bad(res, 400, 'This service requires a written doctor order (ordering doctor name + order number). No order = no booking.');
   }
-  // Emergency triage — ANY danger sign rejects the booking.
+  // Emergency triage — ANY danger sign rejects the booking (M13: a
+  // level of 'emergency' rejects even with an empty dangerSigns array).
   const triage = b.triage || {};
-  const danger = (triage.dangerSigns || []).filter((s) => cat.DANGER_SIGNS.includes(s));
-  if (triage.danger === true || danger.length > 0 || triage.emergency === true) {
+  const danger = Array.isArray(triage.dangerSigns) ? triage.dangerSigns.filter((x) => cat.DANGER_SIGNS.includes(x)) : [];
+  if (triageRejects(triage)) {
     store.audit('booking.triage_rejected', req.user.phone, { danger });
     return res.status(422).json({
       error: 'emergency_triage',
@@ -796,6 +1139,7 @@ router.post('/bookings', requireAuth, (req, res) => {
     });
   }
   const priced = priceBooking(b);
+  if (priced.error === 'distance_required') return res.status(400).json({ error: 'distance_required', message: 'distanceKm or hotelId is required — the distance cannot be assumed to be 0.' });
   if (priced.error) return bad(res, 400, priced.error);
   if (priced.contract_required) {
     return res.status(422).json({ error: 'contract_required', ...priced });
@@ -806,8 +1150,12 @@ router.post('/bookings', requireAuth, (req, res) => {
   // app funds the 50 EGP discount (see releaseBooking).
   const vou = findVoucher(req.user.phone, priced.totalEgp);
   const booking = {
-    id, kind: 'standard', patientPhone: req.user.phone, patientName: b.patientName,
+    id, kind: 'standard', patientPhone: req.user.phone, patientName: capStr(b.patientName, 120),
     serviceCode: b.serviceCode, serviceName: cat.SERVICES[b.serviceCode].name_en,
+    category: cat.SERVICES[b.serviceCode].category || 'nursing',
+    riskLevel: cat.SERVICES[b.serviceCode].riskLevel || 'standard',
+    preferredProviderId: b.preferredProviderId || null,
+    night: isNight(b.scheduledAt),
     status: 'held', // escrow: money held in-app from booking
     amountEgp: priced.totalEgp, baseEgp: priced.baseEgp, distanceFeeEgp: priced.distanceFeeEgp,
     voucherId: vou ? vou.id : null, voucherDiscountEgp: vou ? vou.amountEgp : 0,
@@ -824,10 +1172,13 @@ router.post('/bookings', requireAuth, (req, res) => {
     doctorOrder: orderOk ? { doctorName: String(doctorOrder.doctorName).trim().slice(0, 120), orderNumber: String(doctorOrder.orderNumber).trim().slice(0, 80) } : null,
     doctorOrderConfirmed: b.doctorOrderConfirmed === true,
     doctorOrderSeenByProvider: false,
-    triage: { dangerSigns: danger, notes: triage.notes || null },
-    address: b.address || null, scheduledAt: b.scheduledAt || null, notes: b.notes || null,
+    // v2.1.1 — explicit written consent for high-risk services (stored
+    // with the time it was given; null for standard services).
+    consent: cat.isHighRiskService(b.serviceCode) ? { given: true, at: nowIso(), version: '1.0' } : null,
+    triage: { dangerSigns: danger, notes: triage.notes ? capStr(triage.notes, 1000) : null },
+    address: b.address ? capStr(b.address, 300) : null, scheduledAt: b.scheduledAt || null, notes: b.notes ? capStr(b.notes, 1000) : null,
     alternateContact: b.alternateContact || null, // admin-only if needed
-    providerId: null, commissionPct: null, providerShareEgp: null, appShareEgp: null,
+    providerId: null, commissionPct: null, providerShareEgp: null, appShareEgp: null, estimatedProviderShareEgp: null, languageBonusEgp: 0,
     vitals: null, review: null, providerReview: null, complaint: false,
     circumventionHold: false, circumventionReportId: null,
     complaintStatus: null, complaintDeadline: null, complaintAt: null, complaintResolvedAt: null,
@@ -839,6 +1190,7 @@ router.post('/bookings', requireAuth, (req, res) => {
   store.data.bookings[id] = booking;
   if (vou) { vou.status = 'used'; vou.usedAt = nowIso(); vou.usedBookingId = id; }
   store.audit('booking.created', req.user.phone, { bookingId: id, serviceCode: b.serviceCode, totalEgp: booking.amountEgp, voucherId: booking.voucherId, voucherDiscountEgp: booking.voucherDiscountEgp });
+  if (cat.isHighRiskService(b.serviceCode)) store.audit('booking.high_risk_consent', req.user.phone, { bookingId: id, serviceCode: b.serviceCode });
   recordTermsAcceptance(req.user.phone);
   store.save();
   // Payment number is shown only AFTER the booking is confirmed (accepted),
@@ -929,8 +1281,10 @@ router.post('/bookings/:id/review', requireAuth, requireRole('patient'), (req, r
   }
   const p = b.providerId ? store.data.providers[b.providerId] : null;
   if (p) {
-    const n = p.completedVisits || 0;
-    p.ratingAvg = n > 0 ? Math.round(((p.ratingAvg || 5) * n + rating) / (n + 1) * 10) / 10 : rating;
+    // v2.1.1 (L4): the average is recomputed over ALL reviews, INCLUDING
+    // this visit — the old formula never counted the current visit.
+    recomputeRatingAvg(p);
+    recomputeProviderPoints(p);
   }
   store.audit('booking.reviewed', req.user.phone, { bookingId: b.id, rating, circumventionReported: circumventionReported === true });
   if (b.complaint || b.circumventionHold) {
@@ -965,7 +1319,16 @@ router.post('/bookings/:id/safety-report', requireAuth, (req, res) => {
   if (!canSeeBooking(req, b)) return res.status(403).json({ error: 'forbidden', message: 'Not your booking.' });
   const type = req.body?.type || (req.body?.text ? 'safety' : null);
   if (!['complaint', 'safety', 'other'].includes(type)) return bad(res, 400, 'type must be complaint, safety or other.');
-  const desc = String(req.body?.description || req.body?.text || '').slice(0, 2000);
+  // v2.1.1 (M11): a provider cannot file a complaint on their OWN
+  // booking (it would pause their own payout release).
+  if (type === 'complaint' && req.user.role === 'provider' && b.providerId === req.user.providerId) {
+    return res.status(403).json({ error: 'forbidden', message: 'A provider cannot file a complaint on their own booking.' });
+  }
+  // v2.1.1 (M11): safety reports are capped at 5/day per booking.
+  const dayKey = `${b.id}:${new Date().toISOString().slice(0, 10)}`;
+  const daily = store.data.safetyDaily || (store.data.safetyDaily = {});
+  if ((daily[dayKey] || 0) >= 5) return res.status(429).json({ error: 'rate_limited', message: 'Too many safety reports for this booking today (max 5).' });
+  const desc = String(req.body?.description || req.body?.text || '').slice(0, 1000);
   if (!desc) return bad(res, 400, 'description required.');
   // v2.0.1 — refund complaints: only within 24 hours after the service
   // was completed (patient confirmation). Before completion, or after the
@@ -987,6 +1350,7 @@ router.post('/bookings/:id/safety-report', requireAuth, (req, res) => {
   }
   const report = { id: newId('sr'), bookingId: b.id, reporterPhone: req.user.phone, reporterRole: req.user.role, type, description: desc, at: nowIso(), status: 'open' };
   store.data.safetyReports.push(report);
+  daily[dayKey] = (daily[dayKey] || 0) + 1;
   if (type === 'complaint') {
     b.complaint = true; // blocks auto-release until admin reviews
     b.complaintStatus = 'open';
@@ -1006,6 +1370,11 @@ router.post('/bookings/:id/sos', requireAuth, (req, res) => {
   if (!['accepted', 'provider_confirmed'].includes(b.status)) {
     return bad(res, 409, 'SOS is for active visits only.');
   }
+  // v2.1.1 (M11): SOS is capped at 5/day per booking.
+  const sosDayKey = `${b.id}:${new Date().toISOString().slice(0, 10)}`;
+  const sosDaily = store.data.sosDaily || (store.data.sosDaily = {});
+  if ((sosDaily[sosDayKey] || 0) >= 5) return res.status(429).json({ error: 'rate_limited', message: 'Too many SOS alerts for this booking today (max 5).' });
+  sosDaily[sosDayKey] = (sosDaily[sosDayKey] || 0) + 1;
   const alert = { id: newId('sos'), bookingId: b.id, phone: req.user.phone, role: req.user.role, at: nowIso(), status: 'open' };
   store.data.sos.push(alert);
   store.audit('sos.raised', req.user.phone, { bookingId: b.id });
@@ -1068,7 +1437,7 @@ router.post('/bookings/:id/cash-collected', requireAuth, requireRole('provider')
 // Manual + scheduled escrow sweep (admin only via HTTP; interval calls it directly).
 // v2.1.0 — the sweep is async now (review reminder + settlement
 // notifications + SMS fallback pass).
-router.post('/jobs/sweep', requireAuth, requireRole('admin'), async (req, res) => {
+router.post('/jobs/sweep', requireAdmin, async (req, res) => {
   const result = await sweepAutoRelease();
   store.audit('jobs.sweep', req.user.phone, result);
   res.json({ ok: true, ...result });
@@ -1086,42 +1455,65 @@ router.post('/providers/register', requireAuth, (req, res) => {
   // must be accepted with the current version before registration.
   if (!termsAccepted(req.body)) return termsError(res);
   if (!b.name || typeof b.name !== 'string') return bad(res, 400, 'name required.');
-  if (!['assistant', 'nurse', 'doctor'].includes(b.role)) return bad(res, 400, 'role must be assistant, nurse or doctor.');
+  if (b.name.length > 120) return bad(res, 400, 'name is too long (max 120 characters).');
+  // v2.1.1: providerType is validated against an allowlist; role is
+  // provisional until admin verification sets the verified role.
+  const providerType = b.providerType || b.role;
+  if (!['assistant', 'nurse', 'doctor', 'physio'].includes(providerType)) return bad(res, 400, 'providerType must be assistant, nurse, doctor or physio.');
+  if (isReservedId(String(providerType))) return bad(res, 400, 'Invalid providerType.');
   const nationalId = String(b.nationalId || '');
   const licenseNo = String(b.licenseNo || '');
   if (!/^\d{14}$/.test(nationalId)) return bad(res, 400, 'nationalId must be 14 digits.');
   if (!licenseNo || licenseNo.length < 4) return bad(res, 400, 'licenseNo required.');
-  const certificates = Array.isArray(b.certificates) ? b.certificates.map(String).slice(0, 20) : [];
+  // Certificates / courses are METADATA only in Phase 1 (no real file
+  // upload yet — M29 partial): {name, verified:false} until admin
+  // verifies them. A physio registration REQUIRES >=1 certificate entry.
+  const certificates = Array.isArray(b.certificates)
+    ? b.certificates.map((c) => (typeof c === 'string' ? { name: String(c).slice(0, 200), verified: false } : { name: String(c.name || '').slice(0, 200), verified: false })).filter((c) => c.name).slice(0, 20)
+    : [];
+  const courses = Array.isArray(b.courses)
+    ? b.courses.map((c) => (typeof c === 'string' ? { name: String(c).slice(0, 200), verified: false } : { name: String(c.name || '').slice(0, 200), verified: false })).filter((c) => c.name).slice(0, 20)
+    : [];
+  if (providerType === 'physio' && certificates.length < 1) {
+    return res.status(400).json({ error: 'validation_error', message: 'Physiotherapy registration requires at least one certificate entry.' });
+  }
   const extraLanguages = Array.isArray(b.extraLanguages)
     ? b.extraLanguages.filter((l) => l && l.language).map((l) => ({ language: String(l.language).toLowerCase().slice(0, 5), certified: l.certified === true })).slice(0, 5)
     : [];
+  const languageCertificates = Array.isArray(b.languageCertificates)
+    ? b.languageCertificates.filter((l) => l && l.language).map((l) => ({ language: String(l.language).toLowerCase().slice(0, 10), certificateName: String(l.certificateName || l.name || '').slice(0, 200), verified: false })).slice(0, 5)
+    : extraLanguages.filter((l) => l.certified).map((l) => ({ language: l.language, certificateName: '', verified: false }));
   const id = newId('prov');
   const p = {
-    id, demo: false, phone: req.user.phone, name: b.name.trim().slice(0, 120), role: b.role,
+    id, demo: false, phone: req.user.phone, name: b.name.trim().slice(0, 120), role: providerType, providerType,
     tier: 'Starter', status: 'pending',
-    // v2.0.8 — Terms acceptance + graduated-discipline state.
     termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
     warnings: [], suspended: false, suspendedUntil: null, suspendedReason: null, permanentBan: false,
-    // Stored hashed; only last4 ever leaves the server.
-    nationalIdHash: sha256(nationalId), nationalIdLast4: nationalId.slice(-4),
-    licenseHash: sha256(licenseNo), licenseLast4: licenseNo.slice(-4),
-    certificates, extraLanguages,
-    verifiedCertificates: 0, // +5 points each (max 15) — set by admin certificate review
-    interviewStatus: 'not_started', interviewScore: null,
-    ratingAvg: null, completedVisits: 0, createdAt: nowIso(),
+    // v2.1.1 (M18): salted sha256; only last4 ever leaves the server.
+    nationalIdHash: saltedSha256(nationalId), nationalIdLast4: nationalId.slice(-4),
+    licenseHash: saltedSha256(licenseNo), licenseLast4: licenseNo.slice(-4),
+    certificates, courses, languageCertificates, extraLanguages,
+    verifiedCertificates: 0, // +5 points each (max 20) — set by admin certificate review
+    interviewStatus: 'not_started', interviewScore: null, interviewPoints: 0,
+    interviewEnglishCorrect: null, interviewEnglishTotal: null,
+    ratingAvg: null, completedVisits: 0, casesByWeek: {},
+    joinedAt: nowIso(), createdAt: nowIso(),
+    redFlagCount: 0, redFlagApprovalRequired: false, redFlagRetakeAllowed: false, canRetakeAt: null,
+    buddyId: null, stayBonusPaid: false,
   };
   store.data.providers[id] = p;
   store.data.providersByPhone[req.user.phone] = id;
   recordTermsAcceptance(req.user.phone);
-  store.audit('provider.registered', req.user.phone, { providerId: id, role: b.role });
+  recomputeProviderPoints(p);
+  store.audit('provider.registered', req.user.phone, { providerId: id, role: providerType, providerType });
   store.save();
-  res.status(201).json({ ...store.publicProvider(p, { self: true }), next: 'Take the 20-question interview: POST /api/providers/interview/start' });
+  res.status(201).json({ ...store.publicProvider(p, { self: true, points: p.points }), next: 'Take the 36-question interview: POST /api/providers/interview/start' });
 });
 
 router.get('/providers/me', requireAuth, requireRole('provider'), (req, res) => {
   const p = store.data.providers[req.user.providerId];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
-  res.json(store.publicProvider(p, { self: true }));
+  res.json(store.publicProvider(p, { self: true, points: recomputeProviderPoints(p, { auditTier: false }) }));
 });
 
 router.get('/providers/radar', requireAuth, requireRole('provider'), (req, res) => {
@@ -1130,6 +1522,11 @@ router.get('/providers/radar', requireAuth, requireRole('provider'), (req, res) 
   if (p.interviewStatus !== 'passed') {
     return res.status(403).json({ error: 'forbidden', message: 'Pass the interview first — radar is locked until interviewStatus=passed.' });
   }
+  // v2.1.1 (audit #11): radar requires admin-verified status, not just
+  // an interview pass.
+  if (p.status !== 'verified') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin document verification is required before radar access (status=verified).' });
+  }
   // v2.0.8 — a suspended / banned provider sees no radar at all.
   const blocked = providerBlocked(p);
   if (blocked) return res.status(403).json({ error: 'forbidden', message: blocked });
@@ -1137,23 +1534,56 @@ router.get('/providers/radar', requireAuth, requireRole('provider'), (req, res) 
   // returns MINIMAL items only (store.radarBooking): no patient phone,
   // name, address, contact, notes, triage or insurer data.
   const maxKm = Math.min(35, Number(req.query.maxKm) || 35);
+  const nowMs = Date.now();
   const held = Object.values(store.data.bookings)
-    // v2.1.0 — high-risk tier: nursing assistants never see high-risk
-    // bookings on the radar (they cannot accept them — enforced at
-    // accept time too). Nurses and doctors see everything.
     .filter((b) => b.status === 'held' && !b.providerId && (b.distanceKm ?? 99) <= maxKm
-      && !(p.role === 'assistant' && cat.isHighRiskService(b.serviceCode)))
-    .sort((a, b) => (a.distanceKm ?? 99) - (b.distanceKm ?? 99))
-    .map((b) => store.radarBooking(b));
+      // v2.1.0 — high-risk tier: nursing assistants never see high-risk
+      // bookings on the radar (they cannot accept them — enforced at
+      // accept time too). Nurses and doctors see everything.
+      && !(p.providerType === 'assistant' && cat.isHighRiskService(b.serviceCode))
+      // v2.1.1 — physio-category services ONLY to providerType 'physio'.
+      && !(b.category === 'physio' && p.providerType !== 'physio')
+      // v2.1.1 — tourist bookings ONLY to tourist-compatible providers
+      // who are not English-blocked.
+      && !(b.kind === 'tourist' && (!touristCompatible(p) || englishBlocked(p)))
+      // v2.1.1 — Elite early access: bookings created <30 min ago are
+      // visible ONLY to Elite providers; everyone else sees them after
+      // 30 minutes.
+      && !(nowMs - new Date(b.createdAt).getTime() < 30 * 60 * 1000 && p.tier !== 'Elite'))
+    .sort((a, b) => {
+      // Preferred bookings first, then nearest.
+      const aPref = a.preferredProviderId === p.id ? 0 : 1;
+      const bPref = b.preferredProviderId === p.id ? 0 : 1;
+      if (aPref !== bPref) return aPref - bPref;
+      return (a.distanceKm ?? 99) - (b.distanceKm ?? 99);
+    })
+    .map((b) => store.radarBooking(b, {
+      eliteEarly: nowMs - new Date(b.createdAt).getTime() < 30 * 60 * 1000,
+      preferredForYou: b.preferredProviderId === p.id,
+    }));
   res.json({ providerId: p.id, tier: p.tier, pending: held });
 });
 
 router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, res) => {
   const b = loadBooking(req, res);
   if (!b) return;
+  if (isReservedId(req.params.id)) return res.status(400).json({ error: 'validation_error', message: 'Invalid identifier.' });
   const p = store.data.providers[req.user.providerId];
   if (!p || p.interviewStatus !== 'passed') {
     return res.status(403).json({ error: 'forbidden', message: 'Pass the interview first.' });
+  }
+  // v2.1.1 (audit #11): accept requires admin-verified status.
+  if (p.status !== 'verified') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin document verification is required before accepting work (status=verified).' });
+  }
+  // v2.1.1 — defense in depth: tourist bookings need a verified language
+  // certificate and a non-blocked English check; physio services need a
+  // physio provider.
+  if (b.kind === 'tourist' && (!touristCompatible(p) || englishBlocked(p))) {
+    return res.status(403).json({ error: 'forbidden', message: 'Tourist bookings require a verified language certificate and a passing English check.' });
+  }
+  if (b.category === 'physio' && p.providerType !== 'physio') {
+    return res.status(403).json({ error: 'forbidden', message: 'Physiotherapy services can only be accepted by a physiotherapy specialist.' });
   }
   // v2.0.8 — a suspended / banned provider cannot accept work.
   const blocked = providerBlocked(p);
@@ -1179,6 +1609,10 @@ router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, 
   b.commissionPct = promoNow ? promoNow.commissionPct : cat.TIERS[p.tier].commission_pct;
   b.promoCommissionPct = promoNow ? promoNow.commissionPct : null;
   b.commissionTier = p.tier;
+  // v2.1.1 (audit M7): ESTIMATED provider share at accept time, so the
+  // wallet shows a pending amount before release (release recomputes
+  // exactly).
+  b.estimatedProviderShareEgp = Math.round(b.amountEgp * (1 - b.commissionPct / 100));
   b.status = 'accepted';
   b.acceptedAt = nowIso();
   store.audit('booking.accepted', req.user.phone, { bookingId: b.id, providerId: p.id, commissionPct: b.commissionPct, promoApplied: !!promoNow });
@@ -1226,6 +1660,7 @@ router.post('/bookings/:id/vitals', requireAuth, requireRole('provider'), (req, 
   if (b.providerId !== req.user.providerId) return res.status(403).json({ error: 'forbidden', message: 'Not your booking.' });
   const blockedVitals = providerBlocked(store.data.providers[req.user.providerId]);
   if (blockedVitals) return res.status(403).json({ error: 'forbidden', message: blockedVitals });
+  if (store.data.providers[req.user.providerId]?.status !== 'verified') return res.status(403).json({ error: 'forbidden', message: 'Admin document verification is required (status=verified).' });
   if (b.status !== 'accepted') return bad(res, 409, `Vitals are recorded during an accepted visit (status is ${b.status}).`);
   const v = req.body || {};
   const num = (k, min, max) => {
@@ -1240,6 +1675,7 @@ router.post('/bookings/:id/vitals', requireAuth, requireRole('provider'), (req, 
   const missing = Object.entries(vitals).filter(([, x]) => x == null).map(([k]) => k);
   if (missing.length) return bad(res, 400, `Mandatory vitals missing or out of range: ${missing.join(', ')}`, { required: ['bpSystolic', 'bpDiastolic', 'pulse', 'glucose', 'oxygen', 'temp'] });
   b.vitals = { ...vitals, at: nowIso(), notes: String(v.notes || '').slice(0, 500) };
+  b.vitalsAt = nowIso(); // v2.1.1 (audit #28): first on-site event — the late-visit clock starts here
   // v2.1.0 — suture removal: the provider may confirm here that they
   // have seen the written doctor order (also accepted at completion).
   if (v.doctorOrderSeen === true) b.doctorOrderSeenByProvider = true;
@@ -1254,6 +1690,7 @@ router.post('/bookings/:id/complete-provider', requireAuth, requireRole('provide
   if (b.providerId !== req.user.providerId) return res.status(403).json({ error: 'forbidden', message: 'Not your booking.' });
   const blockedComplete = providerBlocked(store.data.providers[req.user.providerId]);
   if (blockedComplete) return res.status(403).json({ error: 'forbidden', message: blockedComplete });
+  if (store.data.providers[req.user.providerId]?.status !== 'verified') return res.status(403).json({ error: 'forbidden', message: 'Admin document verification is required (status=verified).' });
   if (b.status !== 'accepted') return bad(res, 409, `Cannot confirm completion while status is ${b.status}.`);
   if (!b.vitals) return bad(res, 409, 'Mandatory vitals must be recorded before completing the visit.');
   // v2.1.0 — suture removal: the provider must confirm seeing the written
@@ -1272,11 +1709,27 @@ router.post('/bookings/:id/complete-provider', requireAuth, requireRole('provide
     }
     b.safetyChecklist = { orderSeen: true, sterileTechnique: true, identityConfirmed: true, complicationCheck: true, at: nowIso() };
   }
+  // v2.1.1 (web contract): the completion response carries the
+  // provider's points — earned = change in total points caused by THIS
+  // completion (usually 0; positive when a cases-points threshold or a
+  // weekly-double threshold is crossed), total/tier = current values
+  // after recompute. Points are computed BEFORE the status change so
+  // the delta is honest.
+  const prov = store.data.providers[req.user.providerId];
+  const pointsBefore = prov ? computePoints(prov, Object.values(store.data.bookings)).total : 0;
   b.status = 'provider_confirmed';
   b.providerConfirmedAt = nowIso();
-  store.audit('booking.provider_confirmed', req.user.phone, { bookingId: b.id, note: 'Provider confirmed completion before leaving; patient confirmation is separate.' });
+  let pointsAfter = pointsBefore;
+  let tierAfter = prov ? prov.tier : null;
+  if (prov) {
+    const pts = recomputeProviderPoints(prov);
+    pointsAfter = pts ? pts.total : pointsBefore;
+    tierAfter = pts ? pts.tier : tierAfter;
+  }
+  const pointsEarned = Math.max(0, pointsAfter - pointsBefore);
+  store.audit('booking.provider_confirmed', req.user.phone, { bookingId: b.id, note: 'Provider confirmed completion before leaving; patient confirmation is separate.', pointsEarned, pointsTotal: pointsAfter });
   store.save();
-  res.json(pubBooking(req, b, { includePaymentNumber: true }));
+  res.json({ ...pubBooking(req, b, { includePaymentNumber: true }), points: { earned: pointsEarned, total: pointsAfter, tier: tierAfter } });
 });
 
 router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res) => {
@@ -1308,8 +1761,10 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
       else { direction = 'app_owes_provider'; amountEgp = b.providerShareEgp || 0; }
     } else if (pending) {
       // v2.0.8 — a circumvention hold keeps the money in the hold bucket.
+      // v2.1.1 (M7): pending lines show the ESTIMATED share computed at
+      // accept time (release recomputes exactly).
       direction = b.circumventionHold ? 'complaint_hold' : 'pending';
-      amountEgp = b.providerShareEgp || 0;
+      amountEgp = b.estimatedProviderShareEgp ?? b.providerShareEgp ?? 0;
     }
     if (p.permanentBan && ['app_owes_provider', 'complaint_hold', 'pending'].includes(direction)) {
       // v2.0.8 — a permanent ban forfeits pending settlement. Money the
@@ -1319,6 +1774,8 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
     return {
       bookingId: b.id, service: b.serviceName, status: b.status,
       totalEgp: b.amountEgp, appShareEgp: b.appShareEgp, providerShareEgp: b.providerShareEgp,
+      estimatedProviderShareEgp: b.estimatedProviderShareEgp ?? null,
+      languageBonusEgp: b.languageBonusEgp || 0,
       commissionPct: b.commissionPct, cashCollectedByProvider: b.cashCollectedByProvider,
       direction, amountEgp, releasedAt: b.releasedAt || null,
       complaintStatus: b.complaintStatus || null, complaintDeadline: b.complaintDeadline || null,
@@ -1342,9 +1799,20 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
   totals.volumeBonusEgp = volumeBonus.bonusEgp;
   totals.appOwesProviderEgp += volumeBonus.bonusEgp;
   const promoNow = activePromo();
+  // v2.1.1 — points snapshot + 90-day stay bonus + buddy + days since join.
+  const pts = recomputeProviderPoints(p, { auditTier: false });
+  const stay = stayBonusState(p);
+  const stayDue = stay.earned && !stay.paid ? cat.STAY_BONUS_EGP : 0;
+  totals.stayBonusEgp = stayDue;
+  if (stayDue > 0) totals.appOwesProviderEgp += stayDue;
+  const buddy = p.buddyId ? store.data.providers[p.buddyId] : null;
   res.json({
     providerId: p.id, tier: p.tier, commissionPct: effectiveCommissionPct(p.tier),
     commissionPctTier: cat.TIERS[p.tier].commission_pct,
+    points: pts,
+    stayBonus: stay,
+    buddy: buddy ? { id: buddy.id, name: buddy.name } : null,
+    daysSinceJoin: stay.daysSinceJoin,
     promo: promoNow ? { active: true, commissionPct: promoNow.commissionPct, until: promoNow.until || null } : { active: false, commissionPct: null, until: null },
     monthlyCases: volumeBonus.cases, volumeBonusEgp: volumeBonus.bonusEgp,
     nextBonusAt: volumeBonus.nextBonusAt,
@@ -1359,14 +1827,33 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
   });
 });
 
-// ---------------------------------------------------------------- interview
-function buildAttemptQuestions() {
-  // Shuffle question order AND option order; keep the answer key server-side.
-  const questions = shuffle(cat.MCQ);
+// ---------------------------------------------------------------- interview (v2.1.1)
+// Expanded interview (owner-approved 26 Nov 2026, INTERVIEW-EXPANDED-
+// PROPOSAL.md): FIXED 30 common questions + 6 role-specific questions
+// (assistant / nurse / doctor / physio) = 36 per attempt, 30 minutes.
+// Dimensions: medical 8 / ethics 7 / safety 6 / communication 6 /
+// resilience 5 / conduct 4. Pass: total >= 24 AND medical >= 5 AND
+// ethics >= 5 AND safety >= 4 AND no red flag. Manual review: total
+// 21–23, or a mandatory minimum missed by exactly 1, or any dimension
+// 0–1. Fail: total < 21 or a minimum missed by > 1. Red flag: any of
+// the 10 dangerous options -> instant fail ('red-flag') whatever the
+// score. Retakes: normal fail -> +7 days, max 3 attempts then
+// admin-only; red flag -> +14 days AND admin approval before a new
+// attempt; 2nd red flag -> no retakes except by explicit admin decision.
+// Interview points: total >= 30 -> 20, 24–29 -> 15, manual-review admin
+// pass -> 10, else 0. English 0/3 -> englishBlocked (no tourist radar).
+// The 90-question rotating bank is Phase 2 — this is the fixed 36.
+function buildAttemptQuestions(providerType) {
+  const role = (providerType === 'assistant' || providerType === 'nurse' || providerType === 'doctor' || providerType === 'physio') ? providerType : 'nurse';
+  // Shuffle question order AND option order; keep the answer key +
+  // red-flag markers server-side ONLY (never sent to the client).
+  const questions = shuffle([...cat.INTERVIEW_COMMON, ...cat.INTERVIEW_ROLE_QUESTIONS[role]]);
   const answerKey = {};
+  const redFlagKey = {};
   const pub = questions.map((q) => {
     const opts = shuffle(q.options);
     answerKey[q.id] = q.correct;
+    if (q.redFlagOption) redFlagKey[q.id] = q.redFlagOption;
     return { id: q.id, category: q.category, text: q.text, options: opts };
   });
   const en = shuffle(cat.ENGLISH_CHECK);
@@ -1375,7 +1862,33 @@ function buildAttemptQuestions() {
     enKey[q.id] = q.correct;
     return { id: q.id, text: q.text, options: shuffle(q.options) };
   });
-  return { pub, answerKey, enPub, enKey };
+  return { pub, answerKey, redFlagKey, enPub, enKey, role };
+}
+function interviewPassRuleText() {
+  return `Pass needs ${config.interviewPassTotal}/36 total AND medical >= ${config.interviewPassMedical}/8 AND ethics >= ${config.interviewPassEthics}/7 AND safety >= ${config.interviewPassSafety}/6, with no red-flag answer. Manual review: 21–23 total, or a mandatory minimum missed by exactly 1, or any dimension 0–1.`;
+}
+function interviewResponse(active) {
+  return {
+    attemptId: active.attemptId, deadlineAt: active.deadlineAt, minutes: config.interviewMinutes,
+    totalQuestions: 36,
+    dimensions: cat.INTERVIEW_DIMENSIONS.map((d) => ({ key: d.key, nameAr: d.nameAr, nameEn: d.nameEn, questions: d.questions, min: d.min })),
+    passRule: interviewPassRuleText(),
+    questions: active.pub, // NO answers, NO red-flag markers
+    englishCheck: { note: 'Separate, unscored English check (3 simple questions). No certificate needed for English.', questions: active.enPub },
+  };
+}
+function interviewCooldown(p) {
+  // Returns {blocked, canRetakeAt, reason} from the provider record.
+  if (p.redFlagCount >= 2 && !p.redFlagRetakeAllowed) {
+    return { blocked: true, canRetakeAt: null, reason: 'Two red-flag failures — retakes need an explicit admin decision.' };
+  }
+  if (p.redFlagApprovalRequired && !p.redFlagRetakeAllowed) {
+    return { blocked: true, canRetakeAt: p.canRetakeAt || null, reason: 'A red-flag failure needs admin approval before a new attempt.' };
+  }
+  if (p.canRetakeAt && new Date(p.canRetakeAt).getTime() > Date.now()) {
+    return { blocked: true, canRetakeAt: p.canRetakeAt, reason: 'Retake cooldown is still active.' };
+  }
+  return { blocked: false, canRetakeAt: null, reason: null };
 }
 
 router.post('/providers/interview/start', requireAuth, requireRole('provider'), (req, res) => {
@@ -1385,33 +1898,26 @@ router.post('/providers/interview/start', requireAuth, requireRole('provider'), 
   if (rec.active && new Date(rec.active.deadlineAt).getTime() > Date.now()) {
     return res.status(409).json({ error: 'conflict', message: 'An interview attempt is already in progress.', deadlineAt: rec.active.deadlineAt });
   }
-  const { pub, answerKey, enPub, enKey } = buildAttemptQuestions();
+  const cd = interviewCooldown(p);
+  if (cd.blocked) {
+    return res.status(409).json({ error: 'retake_blocked', message: cd.reason, canRetakeAt: cd.canRetakeAt });
+  }
+  const attemptsUsed = (rec.attempts || []).length;
+  if (attemptsUsed >= config.interviewMaxAttempts && p.interviewStatus !== 'passed') {
+    return res.status(409).json({ error: 'attempts_exhausted', message: 'Maximum 3 interview attempts reached — further retakes need an admin decision.', attemptsUsed });
+  }
+  const { pub, answerKey, redFlagKey, enPub, enKey, role } = buildAttemptQuestions(p.providerType || p.role);
   const attemptId = newId('int');
   const deadlineAt = new Date(Date.now() + config.interviewMinutes * 60 * 1000).toISOString();
-  // pub/enPub are stored server-side so GET /questions can re-serve the same
-  // shuffled attempt, and submit can map option indexes back to keys.
-  rec.active = { attemptId, startedAt: nowIso(), deadlineAt, answerKey, enKey, pub, enPub };
+  rec.active = { attemptId, startedAt: nowIso(), deadlineAt, answerKey, redFlagKey, enKey, pub, enPub, role };
   store.data.interviews[p.id] = rec;
+  store.audit('provider.interview_started', req.user.phone, { providerId: p.id, attemptId, role });
   store.save();
-  res.json({
-    attemptId, deadlineAt, minutes: config.interviewMinutes, totalQuestions: 20,
-    distribution: { medical: 5, ethics: 5, personal: 5, resilience: 5 },
-    passRule: `Pass needs ${config.interviewPassTotal}/20 total AND at least ${config.interviewPassEthics}/5 in ethics.`,
-    questions: pub, // NO answers included
-    englishCheck: { note: 'Separate, unscored English check (3 simple questions). No certificate needed for English.', questions: enPub },
-  });
+  res.json(interviewResponse(rec.active));
 });
 
-// Compatibility: the web frontend GETs the questions (frontend shape:
-// {id, cat, q:{ar,en}, opts:{ar:[...], en:[...]}}). If an attempt is already
-// active, re-serve its shuffled questions; otherwise start a new attempt.
-function translateQuestions(pub) {
-  return pub.map((q) => ({
-    id: q.id, cat: q.category,
-    q: { ar: q.text, en: q.text },
-    opts: { ar: q.options.map((o) => o.text), en: q.options.map((o) => o.text) },
-  }));
-}
+// GET questions: re-serve the active attempt's shuffled questions, or
+// start a new attempt (same cooldown / attempt-cap rules as start).
 router.get('/providers/interview/questions', requireAuth, requireRole('provider'), (req, res) => {
   const p = store.data.providers[req.user.providerId];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
@@ -1419,31 +1925,35 @@ router.get('/providers/interview/questions', requireAuth, requireRole('provider'
   let active = rec.active;
   if (!active || new Date(active.deadlineAt).getTime() <= Date.now()) {
     if (active) { rec.active = null; }
-    const { pub, answerKey, enPub, enKey } = buildAttemptQuestions();
+    const cd = interviewCooldown(p);
+    if (cd.blocked) {
+      return res.status(409).json({ error: 'retake_blocked', message: cd.reason, canRetakeAt: cd.canRetakeAt });
+    }
+    const attemptsUsed = (rec.attempts || []).length;
+    if (attemptsUsed >= config.interviewMaxAttempts && p.interviewStatus !== 'passed') {
+      return res.status(409).json({ error: 'attempts_exhausted', message: 'Maximum 3 interview attempts reached — further retakes need an admin decision.', attemptsUsed });
+    }
+    const { pub, answerKey, redFlagKey, enPub, enKey, role } = buildAttemptQuestions(p.providerType || p.role);
     active = {
       attemptId: newId('int'), startedAt: nowIso(),
       deadlineAt: new Date(Date.now() + config.interviewMinutes * 60 * 1000).toISOString(),
-      answerKey, enKey, pub, enPub,
+      answerKey, redFlagKey, enKey, pub, enPub, role,
     };
     rec.active = active;
     store.data.interviews[p.id] = rec;
+    store.audit('provider.interview_started', req.user.phone, { providerId: p.id, attemptId: active.attemptId, role });
     store.save();
   }
-  res.json({
-    attemptId: active.attemptId, deadlineAt: active.deadlineAt, minutes: config.interviewMinutes,
-    totalQuestions: 20, distribution: { medical: 5, ethics: 5, personal: 5, resilience: 5 },
-    passRule: `Pass needs ${config.interviewPassTotal}/20 total AND at least ${config.interviewPassEthics}/5 in ethics.`,
-    questions: translateQuestions(active.pub),
-    englishCheck: { note: 'Separate, unscored English check (3 simple questions). No certificate needed for English.', questions: translateQuestions(active.enPub.map((q) => ({ ...q, category: 'english' }))) },
-  });
+  res.json(interviewResponse(active));
 });
 
 router.post('/providers/interview/submit', requireAuth, requireRole('provider'), (req, res) => {
   const p = store.data.providers[req.user.providerId];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
   const rec = store.data.interviews[p.id];
-  // The frontend does not send attemptId — the single active attempt per
-  // provider is authoritative. An explicit attemptId, if sent, must match.
+  // The frontend does not always send attemptId — the single active
+  // attempt per provider is authoritative. An explicit attemptId, if
+  // sent, must match.
   const active = rec?.active;
   if (!active || (req.body?.attemptId && req.body.attemptId !== active.attemptId)) {
     return bad(res, 409, 'No active interview attempt. Start one first.');
@@ -1452,7 +1962,7 @@ router.post('/providers/interview/submit', requireAuth, requireRole('provider'),
     rec.active = null;
     rec.attempts.push({ attemptId: active.attemptId, startedAt: active.startedAt, submittedAt: nowIso(), result: 'expired', scores: null, total: 0 });
     store.save();
-    return res.status(410).json({ error: 'expired', message: 'The 20-minute interview deadline passed (server time). Start a new attempt.' });
+    return res.status(410).json({ error: 'expired', message: 'The 30-minute interview deadline passed (server time). Start a new attempt.' });
   }
   // The frontend sends option INDEXES (0–3); map them back to option keys
   // using the stored shuffled order. Accept key strings too.
@@ -1468,33 +1978,89 @@ router.post('/providers/interview/submit', requireAuth, requireRole('provider'),
   };
   const answers = mapAnswers(req.body?.answers, active.pub);
   const enAnswers = mapAnswers(req.body?.englishAnswers || req.body?.english, active.enPub);
-  const scores = { medical: 0, ethics: 0, personal: 0, resilience: 0 };
-  for (const q of cat.MCQ) {
-    if (answers[q.id] === active.answerKey[q.id]) scores[q.category] += 1;
+  const scores = { medical: 0, ethics: 0, safety: 0, communication: 0, resilience: 0, conduct: 0 };
+  let redFlag = false;
+  const redFlagQuestions = [];
+  for (const q of [...cat.INTERVIEW_COMMON, ...(cat.INTERVIEW_ROLE_QUESTIONS[active.role] || [])]) {
+    const a = answers[q.id];
+    if (a === active.answerKey[q.id]) scores[q.category] += 1;
+    if (active.redFlagKey[q.id] && a === active.redFlagKey[q.id]) {
+      redFlag = true;
+      redFlagQuestions.push(q.id);
+    }
   }
-  const total = scores.medical + scores.ethics + scores.personal + scores.resilience;
+  const total = Object.values(scores).reduce((a, b) => a + b, 0);
   let enCorrect = 0;
   for (const q of cat.ENGLISH_CHECK) {
     if (enAnswers[q.id] === active.enKey[q.id]) enCorrect += 1;
   }
-  const passed = total >= config.interviewPassTotal && scores.ethics >= config.interviewPassEthics;
+  const english = { correct: enCorrect, total: 3, level: enCorrect >= 2 ? 'basic-ok' : enCorrect === 1 ? 'basic-weak' : 'needs-support', note: 'Unscored — reported separately; no certificate needed for English.' };
+  // Pass / manual-review / fail (all three mandatory minima matter).
+  const mins = [
+    { key: 'medical', need: config.interviewPassMedical },
+    { key: 'ethics', need: config.interviewPassEthics },
+    { key: 'safety', need: config.interviewPassSafety },
+  ];
+  const missedBy = mins.map((m) => ({ key: m.key, miss: m.need - scores[m.key] }));
+  const anyDimLow = Object.values(scores).some((v) => v <= 1);
+  let status;
+  if (redFlag) status = 'red-flag';
+  else if (total >= config.interviewPassTotal && missedBy.every((m) => m.miss <= 0)) status = 'passed';
+  // Fail wins over manual review: total < 21, or a mandatory minimum
+  // missed by MORE than 1.
+  else if (total < config.interviewManualReviewMin || missedBy.some((m) => m.miss > 1)) status = 'failed';
+  else if ((total >= config.interviewManualReviewMin && total <= config.interviewPassTotal - 1)
+    || missedBy.some((m) => m.miss === 1) || anyDimLow) status = 'manual-review';
+  else status = 'failed';
+  // Interview points (into the points system): >=30 -> 20, 24–29 -> 15,
+  // manual-review admin pass -> 10 (set by the admin decision endpoint),
+  // else 0.
+  let interviewPoints = 0;
+  if (status === 'passed') interviewPoints = total >= cat.POINTS.interview.excellentMin ? cat.POINTS.interview.excellentPts : cat.POINTS.interview.passPts;
+  const attemptsLeft = Math.max(0, config.interviewMaxAttempts - ((rec.attempts || []).length + 1));
+  let canRetakeAt = null;
+  if (status === 'red-flag') {
+    p.redFlagCount = (p.redFlagCount || 0) + 1;
+    p.redFlagApprovalRequired = true;
+    p.redFlagRetakeAllowed = false;
+    canRetakeAt = new Date(Date.now() + config.interviewRedFlagRetakeDays * 24 * 60 * 60 * 1000).toISOString();
+    p.canRetakeAt = canRetakeAt;
+    p.interviewStatus = 'failed';
+  } else if (status === 'failed') {
+    canRetakeAt = new Date(Date.now() + config.interviewRetakeDays * 24 * 60 * 60 * 1000).toISOString();
+    p.canRetakeAt = canRetakeAt;
+    p.interviewStatus = 'failed';
+  } else if (status === 'manual-review') {
+    p.interviewStatus = 'manual-review';
+    p.canRetakeAt = null;
+  } else {
+    p.interviewStatus = 'passed';
+    p.canRetakeAt = null;
+  }
+  p.interviewPoints = interviewPoints;
+  p.interviewScore = { scores, total };
+  p.interviewEnglishCorrect = enCorrect;
+  p.interviewEnglishTotal = 3;
   const attempt = {
     attemptId: active.attemptId, startedAt: active.startedAt, submittedAt: nowIso(),
-    scores, total, ethics: scores.ethics, passed, result: passed ? 'passed' : 'manual-review',
-    english: { correct: enCorrect, total: 3, level: enCorrect >= 2 ? 'basic-ok' : 'needs-support', note: 'Unscored — reported separately; no certificate needed for English.' },
+    scores, total, passed: status === 'passed', status, redFlag, redFlagQuestions: redFlag ? redFlagQuestions : [],
+    canRetakeAt, attemptsLeft,
+    english,
   };
   rec.attempts.push(attempt);
   rec.active = null;
-  p.interviewStatus = passed ? 'passed' : 'manual-review';
-  p.interviewScore = { scores, total };
-  store.audit('provider.interview_submitted', req.user.phone, { providerId: p.id, total, scores, passed });
+  recomputeProviderPoints(p);
+  store.audit('provider.interview_submitted', req.user.phone, { providerId: p.id, total, scores, status, redFlag, attemptsLeft });
   store.save();
-  res.json({
-    ...attempt,
-    message: passed
-      ? 'Passed. Awaiting admin document verification before activation.'
-      : 'Did not meet the pass rule — referred to manual review. A retake is allowed.',
-  });
+  const message = status === 'passed'
+    ? 'Passed. Awaiting admin document verification before activation.'
+    : status === 'red-flag'
+      ? 'An answer conflicts with patient safety — instant fail. A retake needs admin approval after 14 days.'
+      : status === 'manual-review'
+        ? 'Referred to manual review. Admin will decide: pass, fail, or allow a retake.'
+        : 'Did not meet the pass rule. You may retake after 7 days.';
+  // Back-compat aliases for the old response shape (result / ethics).
+  res.json({ ...attempt, result: status, ethics: scores.ethics, message });
 });
 
 // ---------------------------------------------------------------- hotels
@@ -1553,12 +2119,12 @@ function validateDoctorBody(body, { partial = false } = {}) {
   return { value: v };
 }
 
-router.get('/admin/doctors', requireAuth, requireRole('admin'), (req, res) => {
+router.get('/admin/doctors', requireAdmin, (req, res) => {
   const list = (store.data.doctors || []).map((d) => publicDoctor(d, { includePhone: true }));
   res.json({ doctors: list, count: list.length });
 });
 
-router.post('/admin/doctors', requireAuth, requireRole('admin'), (req, res) => {
+router.post('/admin/doctors', requireAdmin, (req, res) => {
   const checked = validateDoctorBody(req.body);
   if (checked.error) return bad(res, 400, checked.error);
   const d = { id: newId('doc'), ...checked.value, active: checked.value.active !== false, createdAt: nowIso() };
@@ -1568,13 +2134,13 @@ router.post('/admin/doctors', requireAuth, requireRole('admin'), (req, res) => {
   res.status(201).json(publicDoctor(d, { includePhone: true }));
 });
 
-router.get('/admin/doctors/:id', requireAuth, requireRole('admin'), (req, res) => {
+router.get('/admin/doctors/:id', requireAdmin, (req, res) => {
   const d = (store.data.doctors || []).find((x) => x.id === req.params.id);
   if (!d) return res.status(404).json({ error: 'not_found', message: 'Doctor not found.' });
   res.json(publicDoctor(d, { includePhone: true }));
 });
 
-router.put('/admin/doctors/:id', requireAuth, requireRole('admin'), (req, res) => {
+router.put('/admin/doctors/:id', requireAdmin, (req, res) => {
   const d = (store.data.doctors || []).find((x) => x.id === req.params.id);
   if (!d) return res.status(404).json({ error: 'not_found', message: 'Doctor not found.' });
   const checked = validateDoctorBody(req.body, { partial: true });
@@ -1585,7 +2151,7 @@ router.put('/admin/doctors/:id', requireAuth, requireRole('admin'), (req, res) =
   res.json(publicDoctor(d, { includePhone: true }));
 });
 
-router.delete('/admin/doctors/:id', requireAuth, requireRole('admin'), (req, res) => {
+router.delete('/admin/doctors/:id', requireAdmin, (req, res) => {
   const list = store.data.doctors || [];
   const i = list.findIndex((x) => x.id === req.params.id);
   if (i < 0) return res.status(404).json({ error: 'not_found', message: 'Doctor not found.' });
@@ -1637,20 +2203,23 @@ router.post('/bookings/:id/refer-doctor', requireAuth, requireRole('provider'), 
 });
 
 // ---------------------------------------------------------------- tourist bookings
-router.post('/tourist-bookings', requireAuth, (req, res) => {
+router.post('/tourist-bookings', requireAuth, requireRole('patient'), (req, res) => {
   const b = normalizeBookingBody(req.body);
   if (b.respectCharterAccepted !== true) return bad(res, 400, 'Respect charter must be accepted (respectCharterAccepted=true).');
   // v2.0.8 — Terms & Conditions are mandatory for every booking type.
   if (!termsAccepted(req.body)) return termsError(res);
+  const vErrT = validateBookingInput(b) || validatePreferredProvider(b);
+  if (vErrT) return res.status(vErrT.status).json({ error: vErrT.error, message: vErrT.message });
   const svc = cat.TOURIST_SERVICES[b.serviceCode];
   if (!svc) return bad(res, 400, 'Valid tourist serviceCode required (tourist_doctor, tourist_iv, tourist_dressing, tourist_nurse).');
+  if (isReservedId(b.serviceCode)) return bad(res, 400, 'Valid tourist serviceCode required.');
   const currency = (b.currency || 'usd').toLowerCase();
   if (!['usd', 'eur'].includes(currency)) return bad(res, 400, 'currency must be usd or eur.');
   if (!['cash_receipt', 'instapay', 'card'].includes(b.paymentMethod)) return bad(res, 400, 'paymentMethod must be cash_receipt, instapay or card.');
   if (!b.patientName) return bad(res, 400, 'patientName required.');
   const triage = b.triage || {};
-  const danger = (triage.dangerSigns || []).filter((s) => cat.DANGER_SIGNS.includes(s));
-  if (triage.danger === true || danger.length > 0) {
+  const danger = Array.isArray(triage.dangerSigns) ? triage.dangerSigns.filter((x) => cat.DANGER_SIGNS.includes(x)) : [];
+  if (triageRejects(triage)) {
     return res.status(422).json({ error: 'emergency_triage', message: 'Danger sign detected — call the ambulance now.', ambulance: '123', danger_signs: danger });
   }
   let distanceKm = b.distanceKm;
@@ -1679,8 +2248,11 @@ router.post('/tourist-bookings', requireAuth, (req, res) => {
   const vou = findVoucher(req.user.phone, amountEgp);
   const voucherDiscountForeign = vou ? Math.round((vou.amountEgp / fx) * 100) / 100 : 0;
   const booking = {
-    id, kind: 'tourist', patientPhone: req.user.phone, patientName: b.patientName,
+    id, kind: 'tourist', patientPhone: req.user.phone, patientName: capStr(b.patientName, 120),
     serviceCode: b.serviceCode, serviceName: svc.name_en, status: 'held',
+    category: 'nursing', riskLevel: svc.riskLevel || 'standard',
+    preferredProviderId: b.preferredProviderId || null,
+    night: isNight(b.scheduledAt),
     amountEgp, baseEgp: Math.round(base * fx), distanceFeeEgp: fee.fee_egp,
     voucherId: vou ? vou.id : null, voucherDiscountEgp: vou ? vou.amountEgp : 0,
     voucherDiscountForeign, amountPayableEgp: vou ? amountEgp - vou.amountEgp : amountEgp,
@@ -1700,7 +2272,7 @@ router.post('/tourist-bookings', requireAuth, (req, res) => {
     insurer: b.insurer || null, policyNo: b.policyNo || null, passportNo: b.passportNo ? `****${String(b.passportNo).slice(-4)}` : null,
     nationality: b.nationality || null, diagnosis: b.diagnosis || null,
     address: b.address || null, scheduledAt: b.scheduledAt || null, notes: b.notes || null,
-    providerId: null, commissionPct: null, providerShareEgp: null, appShareEgp: null,
+    providerId: null, commissionPct: null, providerShareEgp: null, appShareEgp: null, estimatedProviderShareEgp: null, languageBonusEgp: 0,
     vitals: null, review: null, providerReview: null, complaint: false,
     circumventionHold: false, circumventionReportId: null,
     complaintStatus: null, complaintDeadline: null, complaintAt: null, complaintResolvedAt: null,
@@ -1736,13 +2308,24 @@ router.get('/bookings/:id/insurance-report', requireAuth, (req, res) => {
   // share was computed on the full pre-discount price).
   if (b.voucherDiscountForeign) items.push({ item: lang === 'de' ? 'Treuegutschein' : 'Loyalty voucher discount', amount: -b.voucherDiscountForeign, currency: cur });
   else if (b.voucherDiscountEgp) items.push({ item: lang === 'de' ? 'Treuegutschein' : 'Loyalty voucher discount', amount: -b.voucherDiscountEgp, currency: cur });
+  // v2.1.1 (M4): procedures/medications lines from booking data when
+  // present (procedures[] / medications[] on the booking, or the single
+  // service as a fallback). No placeholder diagnosis text is invented
+  // beyond the neutral "see treatment notes" fallback already used.
+  const procedures = Array.isArray(b.procedures) && b.procedures.length
+    ? b.procedures.map((x) => ({ service: String(typeof x === 'string' ? x : x.service || x.name || '').slice(0, 200), at: (x && x.at) || b.providerConfirmedAt || b.createdAt }))
+    : [{ service: b.serviceName, at: b.providerConfirmedAt || b.createdAt }];
+  const medications = Array.isArray(b.medications)
+    ? b.medications.map((x) => String(typeof x === 'string' ? x : x.name || '').slice(0, 200)).filter(Boolean)
+    : (b.medicationNotes ? [String(b.medicationNotes).slice(0, 500)] : []);
   const report = {
     reportId: `INS-${b.id}`,
     language: lang,
     issuedAt: nowIso(),
     patient: { name: b.patientName, nationality: b.nationality || null, passport: b.passportNo || null, insurer: b.insurer || null, policyNo: b.policyNo || null },
     diagnosis: b.diagnosis || (lang === 'de' ? 'Siehe Behandlungsnotizen' : 'See treatment notes'),
-    procedures: [{ service: b.serviceName, at: b.providerConfirmedAt || b.createdAt }],
+    procedures,
+    medications,
     vitals: b.vitals || null,
     invoice: { items, total: b.amountForeign ?? b.amountEgp, currency: cur, totalEgp: b.amountEgp },
     provider: p ? { name: p.name, role: p.role, license: `****${p.licenseLast4}`, licenseVerified: p.status === 'verified' } : null,
@@ -1758,8 +2341,14 @@ router.get('/bookings/:id/insurance-report', requireAuth, (req, res) => {
     const t = lang === 'de'
       ? { title: 'Medizinischer Bericht / Rechnung', patient: 'Patient', diagnosis: 'Diagnose', procedures: 'Behandlungen', vitals: 'Vitalzeichen', invoice: 'Rechnung', total: 'Gesamt', provider: 'Behandler', stamp: 'Stempel / Unterschrift' }
       : { title: 'Medical Report / Invoice', patient: 'Patient', diagnosis: 'Diagnosis', procedures: 'Procedures', vitals: 'Vital signs', invoice: 'Invoice', total: 'Total', provider: 'Provider', stamp: 'Stamp / Signature' };
-    const html = `<!DOCTYPE html><html lang="${lang}"><head><meta charset="utf-8"><title>${t.title} ${report.reportId}</title><style>body{font-family:sans-serif;max-width:700px;margin:40px auto;padding:0 16px;color:#111}h1{font-size:22px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 8px;text-align:left}.stamp{border:2px solid #333;padding:16px;margin-top:24px;text-align:center}</style></head><body><h1>Shifa Care — ${t.title}</h1><p>${report.reportId} · ${report.issuedAt}</p><h2>${t.patient}</h2><p>${report.patient.name}${report.patient.nationality ? ` · ${report.patient.nationality}` : ''}${report.patient.passport ? ` · Passport ${report.patient.passport}` : ''}</p><h2>${t.diagnosis}</h2><p>${report.diagnosis}</p><h2>${t.procedures}</h2><ul>${report.procedures.map((x) => `<li>${x.service}</li>`).join('')}</ul><h2>${t.vitals}</h2><p>${report.vitals ? JSON.stringify(report.vitals) : '—'}</p><h2>${t.invoice}</h2><table><tr><th>Item</th><th>Amount</th></tr>${report.invoice.items.map((i) => `<tr><td>${i.item}</td><td>${i.amount} ${i.currency}</td></tr>`).join('')}<tr><td><b>${t.total}</b></td><td><b>${report.invoice.total} ${report.invoice.currency} (${report.invoice.totalEgp} EGP)</b></td></tr></table><h2>${t.provider}</h2><p>${report.provider ? `${report.provider.name} (${report.provider.role}) — Licence ****${p.licenseLast4}` : '—'}</p><div class="stamp"><b>${report.stamp.text}</b><br>${report.stamp.signature}<br><small>${report.stamp.note}</small></div></body></html>`;
+    // v2.1.1 (audit #13 / L2): EVERY interpolated field is HTML-escaped,
+    // and the HTML is served with a strict CSP + nosniff.
+    const esc = escapeHtml;
+    const medsHtml = report.medications.length ? `<h2>${lang === 'de' ? 'Medikamente' : 'Medications'}</h2><ul>${report.medications.map((m) => `<li>${esc(m)}</li>`).join('')}</ul>` : '';
+    const html = `<!DOCTYPE html><html lang="${lang}"><head><meta charset="utf-8"><title>${esc(t.title)} ${esc(report.reportId)}</title></head><body><h1>Shifa Care — ${esc(t.title)}</h1><p>${esc(report.reportId)} · ${esc(report.issuedAt)}</p><h2>${esc(t.patient)}</h2><p>${esc(report.patient.name)}${report.patient.nationality ? ` · ${esc(report.patient.nationality)}` : ''}${report.patient.passport ? ` · Passport ${esc(report.patient.passport)}` : ''}</p><h2>${esc(t.diagnosis)}</h2><p>${esc(report.diagnosis)}</p><h2>${esc(t.procedures)}</h2><ul>${report.procedures.map((x) => `<li>${esc(x.service)}</li>`).join('')}</ul>${medsHtml}<h2>${esc(t.vitals)}</h2><p>${report.vitals ? esc(JSON.stringify(report.vitals)) : '—'}</p><h2>${esc(t.invoice)}</h2><table><tr><th>Item</th><th>Amount</th></tr>${report.invoice.items.map((i) => `<tr><td>${esc(i.item)}</td><td>${esc(i.amount)} ${esc(i.currency)}</td></tr>`).join('')}<tr><td><b>${esc(t.total)}</b></td><td><b>${esc(report.invoice.total)} ${esc(report.invoice.currency)} (${esc(report.invoice.totalEgp)} EGP)</b></td></tr></table><h2>${esc(t.provider)}</h2><p>${report.provider ? `${esc(report.provider.name)} (${esc(report.provider.role)}) — Licence ****${esc(p.licenseLast4)}` : '—'}</p><div><b>${esc(report.stamp.text)}</b><br>${esc(report.stamp.signature)}<br><small>${esc(report.stamp.note)}</small></div></body></html>`;
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'");
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     return res.send(html);
   }
   res.json(report);
@@ -1822,6 +2411,8 @@ router.post('/npwt/calculate', requireAuth, (req, res) => {
 // The loyalty voucher applies like any other booking (amount >= 300).
 router.post('/npwt/bookings', requireAuth, (req, res) => {
   const b = normalizeBookingBody(req.body);
+  const vErrN = validateBookingInput(b) || validatePreferredProvider(b);
+  if (vErrN) return res.status(vErrN.status).json({ error: vErrN.error, message: vErrN.message });
   if (b.respectCharterAccepted !== true) return bad(res, 400, 'Respect charter must be accepted (respectCharterAccepted=true).');
   // v2.0.8 — Terms & Conditions are mandatory for every booking type.
   if (!termsAccepted(req.body)) return termsError(res);
@@ -1829,6 +2420,9 @@ router.post('/npwt/bookings', requireAuth, (req, res) => {
   if (!['cash_receipt', 'instapay'].includes(b.paymentMethod)) return bad(res, 400, 'paymentMethod must be cash_receipt or instapay.');
   const calc = calculateNpwt(req.body);
   if (calc.error) return bad(res, 400, calc.error);
+  // v2.1.1 — explicit written consent (NPWT is high-risk; same gate,
+  // same consentGiven field as POST /bookings).
+  if (requireHighRiskConsent(req, res, 'npwt')) return;
   // Doctor's order — REQUIRED (high-risk gate, same as suture removal).
   const doctorOrder = b.doctorOrder && typeof b.doctorOrder === 'object' ? b.doctorOrder : null;
   if (!doctorOrder || !String(doctorOrder.doctorName || '').trim() || !String(doctorOrder.orderNumber || '').trim()) {
@@ -1842,8 +2436,8 @@ router.post('/npwt/bookings', requireAuth, (req, res) => {
     return bad(res, 400, `NPWT safety checklist incomplete (missing: ${missing.join(', ')}). Foam count in/out, bleeding check, canister status and a wound photo at the first visit are all required.`, { required: npwtChecklist, missing });
   }
   const triage = b.triage || {};
-  const danger = (triage.dangerSigns || []).filter((s) => cat.DANGER_SIGNS.includes(s));
-  if (triage.danger === true || danger.length > 0 || triage.emergency === true) {
+  const danger = Array.isArray(triage.dangerSigns) ? triage.dangerSigns.filter((x) => cat.DANGER_SIGNS.includes(x)) : [];
+  if (triageRejects(triage)) {
     store.audit('booking.triage_rejected', req.user.phone, { danger });
     return res.status(422).json({
       error: 'emergency_triage',
@@ -1852,6 +2446,7 @@ router.post('/npwt/bookings', requireAuth, (req, res) => {
     });
   }
   const priced = priceBooking({ serviceCode: 'standard', distanceKm: b.distanceKm, hotelId: b.hotelId, transport: b.transport });
+  if (priced.error === 'distance_required') return res.status(400).json({ error: 'distance_required', message: 'distanceKm or hotelId is required — the distance cannot be assumed to be 0.' });
   if (priced.error) return bad(res, 400, priced.error);
   if (priced.contract_required) return res.status(422).json({ error: 'contract_required', ...priced });
   // priceBooking with 'standard' prices the DISTANCE FEE only here (its
@@ -1861,8 +2456,11 @@ router.post('/npwt/bookings', requireAuth, (req, res) => {
   const id = newId('bk');
   const vou = findVoucher(req.user.phone, totalEgp);
   const booking = {
-    id, kind: 'npwt', patientPhone: req.user.phone, patientName: b.patientName,
+    id, kind: 'npwt', patientPhone: req.user.phone, patientName: capStr(b.patientName, 120),
     serviceCode: 'npwt', serviceName: 'NPWT — vacuum-assisted closure (real device only)', status: 'held',
+    category: 'nursing', riskLevel: 'high',
+    preferredProviderId: b.preferredProviderId || null,
+    night: isNight(b.scheduledAt),
     amountEgp: totalEgp, baseEgp: calc.totalEgp, distanceFeeEgp,
     voucherId: vou ? vou.id : null, voucherDiscountEgp: vou ? vou.amountEgp : 0,
     amountPayableEgp: vou ? totalEgp - vou.amountEgp : totalEgp,
@@ -1873,6 +2471,8 @@ router.post('/npwt/bookings', requireAuth, (req, res) => {
     termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
     doctorOrder: { doctorName: String(doctorOrder.doctorName).trim().slice(0, 120), orderNumber: String(doctorOrder.orderNumber).trim().slice(0, 80) },
     doctorOrderConfirmed: true, doctorOrderSeenByProvider: false,
+    // v2.1.1 — explicit written consent (NPWT is high-risk).
+    consent: { given: true, at: nowIso(), version: '1.0' },
     npwt: {
       days: calc.days, dressings: calc.dressings,
       doctorOrder: { doctorName: String(doctorOrder.doctorName).trim().slice(0, 120), orderNumber: String(doctorOrder.orderNumber).trim().slice(0, 80) },
@@ -1894,14 +2494,17 @@ router.post('/npwt/bookings', requireAuth, (req, res) => {
   store.data.bookings[id] = booking;
   if (vou) { vou.status = 'used'; vou.usedAt = nowIso(); vou.usedBookingId = id; }
   store.audit('npwt_booking.created', req.user.phone, { bookingId: id, days: calc.days, dressings: calc.dressings, totalEgp, voucherId: booking.voucherId, voucherDiscountEgp: booking.voucherDiscountEgp });
+  store.audit('booking.high_risk_consent', req.user.phone, { bookingId: id, serviceCode: 'npwt' });
   recordTermsAcceptance(req.user.phone);
   store.save();
   res.status(201).json(pubBooking(req, booking));
 });
 
 // ---------------------------------------------------------------- post-op
-router.post('/postop', requireAuth, (req, res) => {
+router.post('/postop', requireAuth, requireRole('patient'), (req, res) => {
   const b = normalizeBookingBody(req.body);
+  const vErrP = validateBookingInput(b) || validatePreferredProvider(b);
+  if (vErrP) return res.status(vErrP.status).json({ error: vErrP.error, message: vErrP.message });
   if (b.respectCharterAccepted !== true) return bad(res, 400, 'Respect charter must be accepted (respectCharterAccepted=true).');
   // v2.0.8 — Terms & Conditions are mandatory for every booking type.
   if (!termsAccepted(req.body)) return termsError(res);
@@ -1909,14 +2512,18 @@ router.post('/postop', requireAuth, (req, res) => {
   if (!b.surgeryType) return bad(res, 400, 'surgeryType required.');
   if (!['cash_receipt', 'instapay'].includes(b.paymentMethod)) return bad(res, 400, 'paymentMethod must be cash_receipt or instapay.');
   const priced = priceBooking({ serviceCode: 'postop', distanceKm: b.distanceKm, hotelId: b.hotelId, transport: b.transport });
+  if (priced.error === 'distance_required') return res.status(400).json({ error: 'distance_required', message: 'distanceKm or hotelId is required — the distance cannot be assumed to be 0.' });
   if (priced.error) return bad(res, 400, priced.error);
   if (priced.contract_required) return res.status(422).json({ error: 'contract_required', ...priced });
   const id = newId('bk');
   // v2.0.9 — loyalty voucher (same rule as standard bookings).
   const vou = findVoucher(req.user.phone, priced.totalEgp);
   const booking = {
-    id, kind: 'postop', patientPhone: req.user.phone, patientName: b.patientName,
+    id, kind: 'postop', patientPhone: req.user.phone, patientName: capStr(b.patientName, 120),
     serviceCode: 'postop', serviceName: cat.SERVICES.postop.name_en, status: 'held',
+    category: 'nursing', riskLevel: 'standard',
+    preferredProviderId: b.preferredProviderId || null,
+    night: isNight(b.scheduledAt),
     amountEgp: priced.totalEgp, baseEgp: priced.baseEgp, distanceFeeEgp: priced.distanceFeeEgp,
     voucherId: vou ? vou.id : null, voucherDiscountEgp: vou ? vou.amountEgp : 0,
     amountPayableEgp: vou ? priced.totalEgp - vou.amountEgp : priced.totalEgp,
@@ -1950,29 +2557,35 @@ router.post('/postop', requireAuth, (req, res) => {
 router.post('/admin/pin/verify', (req, res) => {
   const pin = String(req.body?.pin || '');
   const rec = store.data.adminPin;
-  if (rec.lockedUntil && new Date(rec.lockedUntil).getTime() > Date.now()) {
-    return res.status(423).json({ error: 'locked', message: 'Admin PIN locked after 5 failed attempts. Try again later.', lockedUntil: rec.lockedUntil });
+  // v2.1.1 (audit #16): lockout is PER-IP (a global lockout let any IP
+  // lock out the real admin). Errors are generic — no attemptsLeft or
+  // lockedUntil in responses (M12).
+  const ip = req.ip || 'unknown';
+  const attempts = store.data.adminPinAttempts || (store.data.adminPinAttempts = {});
+  const ipRec = attempts[ip] || (attempts[ip] = { failures: 0, lockedUntil: null });
+  if (ipRec.lockedUntil && new Date(ipRec.lockedUntil).getTime() > Date.now()) {
+    return res.status(423).json({ error: 'locked', message: 'Admin PIN is temporarily locked. Try again later.' });
   }
   if (!/^\d{6,}$/.test(pin) || !bcrypt.compareSync(pin, rec.hash)) {
-    rec.failures = (rec.failures || 0) + 1;
-    if (rec.failures >= config.adminPinMaxAttempts) {
-      rec.lockedUntil = new Date(Date.now() + config.adminPinLockMinutes * 60 * 1000).toISOString();
-      rec.failures = 0;
-      store.audit('admin.pin_locked', req.ip, { attempts: config.adminPinMaxAttempts }, req.ip);
+    ipRec.failures = (ipRec.failures || 0) + 1;
+    if (ipRec.failures >= config.adminPinMaxAttempts) {
+      ipRec.lockedUntil = new Date(Date.now() + config.adminPinLockMinutes * 60 * 1000).toISOString();
+      ipRec.failures = 0;
+      store.audit('admin.pin_locked', ip, { attempts: config.adminPinMaxAttempts }, ip);
     } else {
-      store.audit('admin.pin_failed', req.ip, { failures: rec.failures }, req.ip);
+      store.audit('admin.pin_failed', ip, { failures: ipRec.failures }, ip);
     }
     store.save();
-    return res.status(401).json({ error: 'unauthorized', message: 'Wrong admin PIN.', attemptsLeft: Math.max(0, config.adminPinMaxAttempts - (rec.failures || 0)) });
+    return res.status(401).json({ error: 'unauthorized', message: 'Wrong admin PIN.' });
   }
-  rec.failures = 0;
-  rec.lockedUntil = null;
+  ipRec.failures = 0;
+  ipRec.lockedUntil = null;
   store.save();
-  store.audit('admin.pin_verified', 'admin', {}, req.ip);
+  store.audit('admin.pin_verified', 'admin', {}, ip);
   res.json({ ok: true, token: issueAdminToken(), expiresInSeconds: 30 * 60, role: 'admin' });
 });
 
-router.get('/admin/dashboard', requireAuth, requireRole('admin'), (req, res) => {
+router.get('/admin/dashboard', requireAdmin, (req, res) => {
   // Aggregate view the web frontend expects, with its field names.
   const providers = Object.values(store.data.providers).map((p) => {
     const pub = store.publicProvider(p, { admin: true });
@@ -2000,12 +2613,14 @@ router.get('/admin/dashboard', requireAuth, requireRole('admin'), (req, res) => 
     promo: promoNow ? { active: true, commissionPct: promoNow.commissionPct, until: promoNow.until || null, source: promoNow.source } : { active: false, commissionPct: null, until: null },
     promoMonthsUsed: store.data.promoMonths || {},
     doctors, doctorsCount: doctors.length,
+    medicalFileInterestCount: (store.data.medicalFileInterest || {}).count || 0,
+    settlementsCount: (store.data.settlements || []).length,
   });
 });
 
 // v2.1.0 — persistence status (admin only): which backend holds the data
 // and whether the Postgres fallback is active. No URLs or secrets here.
-router.get('/admin/persistence', requireAuth, requireRole('admin'), (req, res) => {
+router.get('/admin/persistence', requireAdmin, (req, res) => {
   res.json({
     persistence: store.persistence,
     postgresConfigured: config.postgresConfigured(),
@@ -2016,15 +2631,31 @@ router.get('/admin/persistence', requireAuth, requireRole('admin'), (req, res) =
   });
 });
 
-router.get('/admin/providers', requireAuth, requireRole('admin'), (req, res) => {
+router.get('/admin/settlements', requireAdmin, (req, res) => {
+  const list = (store.data.settlements || []).slice().reverse();
+  const providerId = req.query.providerId;
+  res.json({ settlements: providerId ? list.filter((x) => x.providerId === providerId) : list, count: list.length });
+});
+
+// v2.1.1 (audit #4): full data.json download for backup (admin JWT,
+// rate-limited in app.js). Postgres stays disabled — this is the
+// backup mitigation for the file store.
+router.get('/admin/export', requireAdmin, (req, res) => {
+  store.audit('admin.export', 'admin', {});
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', 'attachment; filename="shifa-care-data.json"');
+  res.send(JSON.stringify(store.data, null, 2));
+});
+
+router.get('/admin/providers', requireAdmin, (req, res) => {
   res.json(Object.values(store.data.providers).map((p) => store.publicProvider(p, { admin: true })));
 });
 
-router.post('/admin/providers/:id/tier', requireAuth, requireRole('admin'), (req, res) => {
+router.post('/admin/providers/:id/tier', requireAdmin, (req, res) => {
   const p = store.data.providers[req.params.id];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
   const tier = req.body?.tier;
-  if (!cat.TIERS[tier]) return bad(res, 400, 'tier must be Starter, Pro or Elite.');
+  if (typeof tier !== 'string' || !Object.hasOwn(cat.TIERS, tier)) return bad(res, 400, 'tier must be Starter, Pro or Elite.');
   const old = p.tier;
   p.tier = tier;
   store.audit('admin.tier_changed', 'admin', { providerId: p.id, from: old, to: tier });
@@ -2032,15 +2663,129 @@ router.post('/admin/providers/:id/tier', requireAuth, requireRole('admin'), (req
   res.json(store.publicProvider(p, { admin: true }));
 });
 
-router.post('/admin/providers/:id/verify', requireAuth, requireRole('admin'), (req, res) => {
+router.post('/admin/providers/:id/verify', requireAdmin, (req, res) => {
   const p = store.data.providers[req.params.id];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
+  if (isReservedId(req.params.id)) return res.status(400).json({ error: 'validation_error', message: 'Invalid identifier.' });
   const verifiedCertificates = Number(req.body?.verifiedCertificates);
   if (Number.isFinite(verifiedCertificates)) {
     p.verifiedCertificates = Math.max(0, Math.min(3, Math.floor(verifiedCertificates))); // +5 pts each, max 15
   }
+  // v2.1.1 (audit #29): the admin sets the VERIFIED role — the role is
+  // no longer purely self-selected at registration.
+  if (req.body?.role) {
+    if (!['assistant', 'nurse', 'doctor', 'physio'].includes(req.body.role)) return bad(res, 400, 'role must be assistant, nurse, doctor or physio.');
+    p.role = req.body.role;
+    p.providerType = req.body.role;
+  }
+  if (req.body?.providerType) {
+    if (!['assistant', 'nurse', 'doctor', 'physio'].includes(req.body.providerType)) return bad(res, 400, 'providerType must be assistant, nurse, doctor or physio.');
+    p.providerType = req.body.providerType;
+    p.role = req.body.providerType;
+  }
   p.status = 'verified';
-  store.audit('admin.provider_verified', 'admin', { providerId: p.id, verifiedCertificates: p.verifiedCertificates });
+  p.roleVerified = true;
+  recomputeProviderPoints(p);
+  store.audit('admin.provider_verified', 'admin', { providerId: p.id, verifiedCertificates: p.verifiedCertificates, role: p.role });
+  store.save();
+  res.json(store.publicProvider(p, { admin: true, points: p.points }));
+});
+
+// v2.1.1 — admin interview decision (manual-review pass/fail, or allow a
+// retake after a red-flag / exhausted attempts).
+router.post('/admin/providers/:id/interview', requireAdmin, (req, res) => {
+  const p = store.data.providers[req.params.id];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
+  const decision = req.body?.decision;
+  if (!['pass', 'fail', 'allow-retake'].includes(decision)) return bad(res, 400, "decision must be pass, fail or allow-retake.");
+  if (decision === 'pass') {
+    if (p.interviewStatus !== 'manual-review') return bad(res, 409, 'Only a manual-review interview can be passed by admin.');
+    p.interviewStatus = 'passed';
+    p.interviewPoints = cat.POINTS.interview.manualReviewPts; // 10
+    p.canRetakeAt = null;
+    recomputeProviderPoints(p);
+    store.audit('admin.interview_passed', 'admin', { providerId: p.id, interviewPoints: p.interviewPoints });
+  } else if (decision === 'fail') {
+    p.interviewStatus = 'failed';
+    p.interviewPoints = 0;
+    p.canRetakeAt = new Date(Date.now() + config.interviewRetakeDays * 24 * 60 * 60 * 1000).toISOString();
+    store.audit('admin.interview_failed', 'admin', { providerId: p.id });
+  } else {
+    // allow-retake: clears the cooldown AND the red-flag approval gate.
+    p.canRetakeAt = null;
+    p.redFlagApprovalRequired = false;
+    p.redFlagRetakeAllowed = true;
+    store.audit('admin.interview_retake_allowed', 'admin', { providerId: p.id });
+  }
+  store.save();
+  res.json(store.publicProvider(p, { admin: true, points: p.points }));
+});
+
+// v2.1.1 — admin credentials: append a certificate / course / language
+// entry (unverified until verified below), and verify one by index.
+router.post('/admin/providers/:id/credentials', requireAdmin, (req, res) => {
+  const p = store.data.providers[req.params.id];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
+  const kind = req.body?.kind;
+  if (!['certificate', 'course', 'language'].includes(kind)) return bad(res, 400, "kind must be certificate, course or language.");
+  const name = String(req.body?.name || '').trim().slice(0, 200);
+  if (!name) return bad(res, 400, 'name required.');
+  const verified = req.body?.verified === true;
+  if (kind === 'certificate') {
+    p.certificates = p.certificates || [];
+    p.certificates.push({ name, verified });
+  } else if (kind === 'course') {
+    p.courses = p.courses || [];
+    p.courses.push({ name, verified });
+  } else {
+    const language = String(req.body?.language || '').trim().toLowerCase().slice(0, 10);
+    if (!language) return bad(res, 400, 'language required for a language certificate.');
+    p.languageCertificates = p.languageCertificates || [];
+    p.languageCertificates.push({ language, certificateName: name, verified });
+  }
+  recomputeProviderPoints(p);
+  store.audit('admin.credential_added', 'admin', { providerId: p.id, kind, name, verified });
+  store.save();
+  res.status(201).json(store.publicProvider(p, { admin: true, points: p.points }));
+});
+
+router.post('/admin/providers/:id/credentials/:index/verify', requireAdmin, (req, res) => {
+  const p = store.data.providers[req.params.id];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
+  const idx = Number(req.params.index);
+  if (!Number.isInteger(idx) || idx < 0) return bad(res, 400, 'index must be a non-negative integer.');
+  // The kind is inferred from the index across the three arrays in
+  // order: certificates, then courses, then languageCertificates — OR
+  // pass ?kind=certificate|course|language to target one array.
+  const kind = req.query.kind || req.body?.kind;
+  let arr;
+  if (kind === 'certificate') arr = p.certificates || [];
+  else if (kind === 'course') arr = p.courses || [];
+  else if (kind === 'language') arr = p.languageCertificates || [];
+  else arr = [...(p.certificates || []), ...(p.courses || []), ...(p.languageCertificates || [])];
+  const entry = arr[idx];
+  if (!entry) return res.status(404).json({ error: 'not_found', message: 'Credential not found at that index.' });
+  entry.verified = req.body?.verified !== false;
+  recomputeProviderPoints(p);
+  store.audit('admin.credential_verified', 'admin', { providerId: p.id, kind: kind || 'any', index: idx, verified: entry.verified });
+  store.save();
+  res.json(store.publicProvider(p, { admin: true, points: p.points }));
+});
+
+// v2.1.1 — buddy: a new provider is paired with an ELITE provider
+// (90-day program: the buddy supports the newcomer; the stay bonus is
+// the retention reward).
+router.post('/admin/providers/:id/buddy', requireAdmin, (req, res) => {
+  const p = store.data.providers[req.params.id];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
+  const buddyId = String(req.body?.buddyProviderId || '');
+  if (isReservedId(buddyId)) return bad(res, 400, 'Invalid buddyProviderId.');
+  const buddy = store.data.providers[buddyId];
+  if (!buddy) return res.status(404).json({ error: 'not_found', message: 'Buddy provider not found.' });
+  if (buddy.tier !== 'Elite') return bad(res, 400, 'The buddy must be an Elite provider.');
+  if (buddyId === p.id) return bad(res, 400, 'A provider cannot be their own buddy.');
+  p.buddyId = buddyId;
+  store.audit('admin.buddy_assigned', 'admin', { providerId: p.id, buddyProviderId: buddyId });
   store.save();
   res.json(store.publicProvider(p, { admin: true }));
 });
@@ -2054,7 +2799,7 @@ router.post('/admin/providers/:id/verify', requireAuth, requireRole('admin'), (r
 // the cash volume bonus is PAUSED (titles still awarded).
 // Set:  POST /api/admin/promo { commissionPct: 0–100, until?: ISO date }
 // Clear: POST /api/admin/promo { commissionPct: null }
-router.post('/admin/promo', requireAuth, requireRole('admin'), (req, res) => {
+router.post('/admin/promo', requireAdmin, (req, res) => {
   const pct = req.body?.commissionPct;
   // Clear the live override — tier rates resume immediately.
   if (pct === null || pct === undefined) {
@@ -2102,7 +2847,7 @@ router.post('/admin/promo', requireAuth, requireRole('admin'), (req, res) => {
 // Warning → temporary suspension (radar + accept + wallet actions
 // blocked) → permanent ban + forfeiture of pending settlement.
 // Warnings are visible to the provider in their own wallet screen.
-router.post('/admin/providers/:id/warn', requireAuth, requireRole('admin'), (req, res) => {
+router.post('/admin/providers/:id/warn', requireAdmin, (req, res) => {
   const p = store.data.providers[req.params.id];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
   const reason = String(req.body?.reason || 'Violation of the Terms & Conditions (non-circumvention / respect charter).').slice(0, 500);
@@ -2113,7 +2858,7 @@ router.post('/admin/providers/:id/warn', requireAuth, requireRole('admin'), (req
   res.json(store.publicProvider(p, { admin: true }));
 });
 
-router.post('/admin/providers/:id/suspend', requireAuth, requireRole('admin'), (req, res) => {
+router.post('/admin/providers/:id/suspend', requireAdmin, (req, res) => {
   const p = store.data.providers[req.params.id];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
   const permanent = req.body?.permanent === true;
@@ -2127,7 +2872,7 @@ router.post('/admin/providers/:id/suspend', requireAuth, requireRole('admin'), (
   res.json(store.publicProvider(p, { admin: true }));
 });
 
-router.post('/admin/providers/:id/unsuspend', requireAuth, requireRole('admin'), (req, res) => {
+router.post('/admin/providers/:id/unsuspend', requireAdmin, (req, res) => {
   const p = store.data.providers[req.params.id];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
   p.suspended = false;
@@ -2140,7 +2885,7 @@ router.post('/admin/providers/:id/unsuspend', requireAuth, requireRole('admin'),
 });
 
 // Circumvention reports (from patient reviews) + computed pattern flags.
-router.get('/admin/circumvention', requireAuth, requireRole('admin'), (req, res) => {
+router.get('/admin/circumvention', requireAdmin, (req, res) => {
   const openOnly = req.query.open !== 'false';
   const list = (store.data.circumventionReports || []).slice().reverse();
   res.json({
@@ -2152,7 +2897,7 @@ router.get('/admin/circumvention', requireAuth, requireRole('admin'), (req, res)
 // Resolve a circumvention report. Confirmed => the patient is refunded
 // in full (the visit was taken off-platform) and the provider's pending
 // settlement for it is forfeited. Rejected => the held release proceeds.
-router.post('/admin/circumvention/:reportId/resolve', requireAuth, requireRole('admin'), (req, res) => {
+router.post('/admin/circumvention/:reportId/resolve', requireAdmin, (req, res) => {
   const report = (store.data.circumventionReports || []).find((r) => r.id === req.params.reportId);
   if (!report) return res.status(404).json({ error: 'not_found', message: 'Circumvention report not found.' });
   if (report.status !== 'open') return bad(res, 409, `Circumvention report already ${report.status}.`);
@@ -2190,7 +2935,7 @@ router.post('/admin/circumvention/:reportId/resolve', requireAuth, requireRole('
 // the wallet; a cash refund is deducted from the provider's settleable
 // balance at Thursday settlement). Rejected => the held amount becomes
 // finally settleable at once (and a paused 'reviewed' release proceeds).
-router.post('/admin/complaints/:reportId/resolve', requireAuth, requireRole('admin'), (req, res) => {
+router.post('/admin/complaints/:reportId/resolve', requireAdmin, (req, res) => {
   const report = store.data.safetyReports.find((r) => r.id === req.params.reportId);
   if (!report) return res.status(404).json({ error: 'not_found', message: 'Complaint report not found.' });
   if (report.type !== 'complaint') return bad(res, 400, 'Only complaint reports can be resolved here.');
@@ -2233,7 +2978,7 @@ router.post('/admin/complaints/:reportId/resolve', requireAuth, requireRole('adm
   res.json({ ok: true, report, booking: pubBooking(req, b, { includePaymentNumber: false }) });
 });
 
-router.get('/admin/sos', requireAuth, requireRole('admin'), (req, res) => {
+router.get('/admin/sos', requireAdmin, (req, res) => {
   const open = req.query.open === 'true';
   const list = open ? store.data.sos.filter((s) => s.status === 'open') : store.data.sos;
   const overdue = Object.values(store.data.bookings)
@@ -2242,30 +2987,37 @@ router.get('/admin/sos', requireAuth, requireRole('admin'), (req, res) => {
   res.json({ sos: list.slice().reverse(), overdue, safetyReports: store.data.safetyReports.slice().reverse() });
 });
 
-router.get('/admin/audit', requireAuth, requireRole('admin'), (req, res) => {
+router.get('/admin/audit', requireAdmin, (req, res) => {
   const limit = Math.min(200, Number(req.query.limit) || 100);
   res.json(store.data.audit.slice(-limit).reverse());
 });
 
 // Dev only: shows last OTP codes for testing. Gated by MOCK_OTP=true.
 // Default OFF in production — never enable there.
-router.get('/admin/mock-otp', requireAuth, requireRole('admin'), (req, res) => {
+router.get('/admin/mock-otp', requireAdmin, (req, res) => {
   if (!config.mockOtp) {
     return res.status(404).json({ error: 'not_found', message: 'Mock OTP endpoint is disabled (MOCK_OTP is not true).' });
   }
+  // v2.1.1: pending codes are returned here (admin-only, mock mode
+  // only) because OTP codes are NEVER logged anywhere (audit #15).
+  // Tests read the code from this endpoint after an admin login.
   const codes = Object.entries(store.data.otps).map(([phone, r]) => ({
     phone, channel: r.channel, expiresAt: r.expiresAt, attempts: r.attempts,
-    note: 'DEV ONLY — in mock mode the code is also logged to the server console.',
+    note: 'DEV ONLY — mock mode; the code is available to admin here, never in logs.',
   }));
   const qPhone = normalizePhone(req.query.phone || '');
   const demo = [{ phone: '01000000001', code: DEMO_OTP }, { phone: '01000000002', code: DEMO_OTP }];
+  // v2.1.1: in mock mode the admin-only endpoint returns the pending code
+  // for the queried phone (from process memory — never logged, never in
+  // data.json). Demo phones use the documented demo code.
+  const pendingCode = qPhone ? getMockCode(qPhone) : null;
+  const demoCode = qPhone ? (demo.find((d) => d.phone === qPhone) || {}).code || null : null;
   res.json({
     mockOtp: true,
     demoPhones: demo,
-    // The web frontend reads `code` for the requested phone (demo phones only).
-    code: qPhone ? (demo.find((d) => d.phone === qPhone) || {}).code || null : null,
-    otp: qPhone ? (demo.find((d) => d.phone === qPhone) || {}).code || null : null,
-    pending: codes,
+    code: demoCode || pendingCode || null,
+    otp: demoCode || pendingCode || null,
+    pending: codes.map((c) => ({ ...c, code: getMockCode(c.phone) })),
   });
 });
 

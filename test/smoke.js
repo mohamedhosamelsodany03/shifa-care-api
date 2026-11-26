@@ -7,6 +7,13 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 
+// v2.1.1: correct answers come from the server catalog (the test knows
+// the bank, not the API — the API never leaks 'correct' or red flags).
+const { MCQ, ENGLISH_CHECK } = require('../src/catalog');
+const CORRECT = Object.fromEntries(MCQ.map((q) => [q.id, q.correct]));
+const RED_FLAG = Object.fromEntries(MCQ.filter((q) => q.redFlagOption).map((q) => [q.id, q.redFlagOption]));
+const EN_CORRECT = Object.fromEntries(ENGLISH_CHECK.map((q) => [q.id, q.correct]));
+
 // Test-only admin PIN: generated fresh on every run (never a fixed value).
 // The server seeds NO default PIN, so the admin-login checks below need
 // an explicit test PIN passed to the spawned server.
@@ -23,13 +30,15 @@ function check(name, cond, extra = '') {
   if (cond) { pass++; console.log(`  PASS ${name}`); }
   else { fail++; failures.push(name); console.log(`  FAIL ${name} ${extra}`); }
 }
-async function req(method, p, { token, body, admin } = {}) {
+async function req(method, p, { token, body, admin, origin, monitorToken } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;
+  if (origin) headers.Origin = origin;
+  if (monitorToken) headers['X-Monitor-Token'] = monitorToken;
   const r = await fetch(BASE + p, { method, headers, body: body ? JSON.stringify(body) : undefined });
   let json = null;
   try { json = await r.json(); } catch { /* html responses */ }
-  return { status: r.status, json, text: typeof json === 'string' ? json : '' };
+  return { status: r.status, json, text: typeof json === 'string' ? json : '', acao: r.headers.get('access-control-allow-origin') };
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // v2.0.8 — registration + every booking creation must accept the current
@@ -41,6 +50,7 @@ async function main() {
   const env = {
     ...process.env, PORT: String(PORT), NODE_ENV: 'test',
     DATA_FILE, MOCK_OTP: 'true', JWT_SECRET: 'smoke-test-secret', ADMIN_PIN: TEST_ADMIN_PIN,
+    MUSE_MONITOR_TOKEN: 'monitor-test-token', // test-only monitor token for §21
     AUTO_RELEASE_MS: '1000', // shorten the 1h auto-release window for the test only
     BOOKING_LIMIT_MAX: '1000', // v2.0.9: volume-bonus cycles make ~200 booking-route calls
     CANCEL_WINDOW_MS: '5000', // shorten the 15-min cancel window for the test only
@@ -61,6 +71,49 @@ async function main() {
     }
     check('server starts and /health is ok', up);
     if (!up) { console.log(out); process.exitCode = 1; stop(); return; }
+    // v2.1.1: admin login FIRST — OTP codes are never logged (audit #15),
+    // so tests read them from the admin-only mock-otp endpoint.
+    let adminToken = null;
+    {
+      const ar = await req('POST', '/api/admin/pin/verify', { body: { pin: TEST_ADMIN_PIN } });
+      check('admin PIN verify early (for mock-otp reads)', ar.status === 200 && !!ar.json?.token, JSON.stringify(ar.json));
+      adminToken = ar.json?.token;
+    }
+    // Mock-OTP code reader (admin-only, mock mode only).
+    async function mockCode(phone) {
+      const cr = await req('GET', `/api/admin/mock-otp?phone=${phone}`, { token: adminToken });
+      return cr.json?.code || null;
+    }
+    // Register a fresh provider + return a provider-role token.
+    async function registerProvider(phone, role, extra = {}) {
+      await req('POST', '/api/otp/request', { body: { phone, channel: 'whatsapp' } });
+      const code = await mockCode(phone);
+      const v = await req('POST', '/api/otp/verify', { body: { phone, code } });
+      const tok = v.json?.accessToken;
+      const reg = await req('POST', '/api/providers/register', { token: tok, body: { ...TERMS,
+        name: `Test ${role}`, providerType: role, role, nationalId: '12345678901234', licenseNo: 'LIC-TEST1',
+        certificates: extra.certificates || [],
+      } });
+      const login = await req('POST', '/api/auth/login-phone', { body: { phone, role: 'provider' } });
+      return { token: login.json?.accessToken, providerId: login.json?.providerId, reg, regStatus: reg.status };
+    }
+    // Answer an interview attempt in a given mode.
+    async function answerInterview(token, mode) {
+      const st = await req('POST', '/api/providers/interview/start', { token });
+      if (st.status !== 200) return { start: st, submit: null };
+      const answers = {};
+      for (const q of st.json.questions) {
+        if (mode === 'all-correct') answers[q.id] = CORRECT[q.id];
+        else if (mode === 'all-wrong') answers[q.id] = 'zzz';
+        else if (mode === 'ethics-wrong') answers[q.id] = q.category === 'ethics' ? 'zzz' : CORRECT[q.id];
+        else if (mode === 'manual-review') answers[q.id] = ['communication', 'resilience', 'conduct'].includes(q.category) ? 'zzz' : CORRECT[q.id];
+        else if (mode === 'red-flag') answers[q.id] = q.id === 'm1' ? RED_FLAG[q.id] : CORRECT[q.id];
+      }
+      const enAnswers = {};
+      for (const q of st.json.englishCheck.questions) enAnswers[q.id] = EN_CORRECT[q.id];
+      const sub = await req('POST', '/api/providers/interview/submit', { token, body: { attemptId: st.json.attemptId, answers, englishAnswers: enAnswers } });
+      return { start: st, submit: sub };
+    }
 
     // --- 1. bootstrap is public, minimal -------------------------------
     console.log('\n[bootstrap]');
@@ -88,10 +141,10 @@ async function main() {
     check('otp response never contains the code', !/^\d{6}$/.test(JSON.stringify(r.json)) || JSON.stringify(r.json).indexOf('123456') === -1);
     r = await req('POST', '/api/otp/verify', { body: { phone: patientPhone, code: '000000' } });
     check('wrong OTP -> 401', r.status === 401);
-    // In mock mode the code is logged to the server console; read it from there.
-    const m = out.match(/\[MOCK OTP\] channel=whatsapp phone=01012345678 code=(\d{6})/);
-    check('mock OTP code appears in server log', !!m, out.slice(-500));
-    const code = m ? m[1] : '000000';
+    // v2.1.1: the code is NEVER logged — read it from the admin-only
+    // mock-otp endpoint (mock mode only).
+    const code = await mockCode(patientPhone);
+    check('mock OTP code readable via admin mock-otp endpoint', !!code && /^\d{6}$/.test(code));
     r = await req('POST', '/api/otp/verify', { body: { phone: patientPhone, code } });
     check('correct OTP -> 200 with access+refresh', r.status === 200 && !!r.json?.accessToken && !!r.json?.refreshToken, JSON.stringify(r.json));
     const patientToken = r.json?.accessToken;
@@ -160,53 +213,71 @@ async function main() {
     // payment number must NOT appear before confirmation
     check('unconfirmed booking hides payment number', JSON.stringify(rr.json).indexOf('01008629060') === -1);
 
-    // --- 6. demo provider OTP + interview -------------------------------
+    // --- 6. demo provider OTP + interview (v2.1.1: 36 questions) -------
     console.log('\n[provider interview]');
     r = await req('POST', '/api/otp/request', { body: { phone: '01000000001', channel: 'whatsapp' } });
     check('demo provider otp request 200', r.status === 200);
     r = await req('POST', '/api/otp/verify', { body: { phone: '01000000001', code: '123456' } });
     check('demo provider mock OTP 123456 works', r.status === 200 && r.json?.role === 'provider', JSON.stringify(r.json));
-    const provToken = r.json?.accessToken;
-    r = await req('POST', '/api/providers/interview/start', { token: provToken });
-    check('interview start 200, 20 questions, no answers leaked', r.status === 200 && r.json?.questions?.length === 20 && JSON.stringify(r.json).indexOf('"correct"') === -1, `got ${r.json?.questions?.length}`);
-    check('interview has 5/5/5/5 distribution', ['medical', 'ethics', 'personal', 'resilience'].every((c) => r.json.questions.filter((q) => q.category === c).length === 5));
+    const prov1Token = r.json?.accessToken;
+    // Demo providers seed PENDING / not_started (audit #8) — the interview
+    // is what moves them forward.
+    r = await req('GET', '/api/providers/me', { token: prov1Token });
+    check('demo provider seeds pending + interview not_started', r.status === 200 && r.json?.status === 'pending' && r.json?.interviewStatus === 'not_started', JSON.stringify(r.json));
+    r = await req('POST', '/api/providers/interview/start', { token: prov1Token });
+    check('interview start 200, 36 questions, 30 min, no answers/red-flags leaked', r.status === 200 && r.json?.questions?.length === 36 && r.json?.minutes === 30 && r.json?.totalQuestions === 36 && JSON.stringify(r.json).indexOf('"correct"') === -1 && JSON.stringify(r.json).indexOf('redFlag') === -1, `got ${r.json?.questions?.length}`);
+    check('interview distribution medical 8 / ethics 7 / safety 6 / comm 6 / resilience 5 / conduct 4',
+      ['medical', 'ethics', 'safety', 'communication', 'resilience', 'conduct'].every((c) => r.json.questions.filter((q) => q.category === c).length === { medical: 8, ethics: 7, safety: 6, communication: 6, resilience: 5, conduct: 4 }[c]));
+    check('interview dimensions carry minima (medical 5, ethics 5, safety 4)', Array.isArray(r.json?.dimensions) && r.json.dimensions.find((d) => d.key === 'medical')?.min === 5 && r.json.dimensions.find((d) => d.key === 'ethics')?.min === 5 && r.json.dimensions.find((d) => d.key === 'safety')?.min === 4);
     check('english check present, 3 questions', r.json?.englishCheck?.questions?.length === 3);
-    const attemptId = r.json?.attemptId;
-    // Submit all-wrong answers -> must fail to manual-review.
+    // All-wrong -> FAILED (total 0 < 21), retake blocked for 7 days.
     const wrong = {};
     for (const q of r.json.questions) wrong[q.id] = 'zzz';
     const enWrong = {};
     for (const q of r.json.englishCheck.questions) enWrong[q.id] = 'zzz';
-    r = await req('POST', '/api/providers/interview/submit', { token: provToken, body: { attemptId, answers: wrong, englishAnswers: enWrong } });
-    check('all-wrong interview -> manual-review, total 0', r.status === 200 && r.json?.result === 'manual-review' && r.json?.total === 0, JSON.stringify(r.json));
+    const attemptId = r.json?.attemptId;
+    r = await req('POST', '/api/providers/interview/submit', { token: prov1Token, body: { attemptId, answers: wrong, englishAnswers: enWrong } });
+    check('all-wrong interview -> failed, total 0, 7-day cooldown', r.status === 200 && r.json?.status === 'failed' && r.json?.total === 0 && !!r.json?.canRetakeAt && r.json?.attemptsLeft === 2, JSON.stringify(r.json));
     check('english reported separately, unscored', r.json?.english?.total === 3 && r.json?.english?.correct === 0);
-    // Retake: start again and answer everything correctly using the known bank
-    // (the test knows the correct answers from the spec bank, not from the API).
-    r = await req('POST', '/api/providers/interview/start', { token: provToken });
-    check('retake allowed after fail', r.status === 200 && !!r.json?.attemptId);
-    const attempt2 = r.json?.attemptId;
-    // Correct answers per the v1.4 bank, keyed by question id (from catalog).
-    const CORRECT = { m1: 'b', m2: 'b', m3: 'b', m4: 'b', m5: 'b', e1: 'b', e2: 'a', e3: 'b', e4: 'b', e5: 'b', p1: 'b', p2: 'a', p3: 'a', p4: 'b', p5: 'b', r1: 'b', r2: 'b', r3: 'b', r4: 'b', r5: 'b' };
-    const EN_CORRECT = { en1: 'a', en2: 'a', en3: 'a' };
-    // NOTE: options are shuffled, but the answer KEY is what the server grades
-    // (keys travel with the option text), so submitting the key works.
-    const right = {};
-    for (const q of r.json.questions) right[q.id] = CORRECT[q.id];
-    const enRight = {};
-    for (const q of r.json.englishCheck.questions) enRight[q.id] = EN_CORRECT[q.id];
-    r = await req('POST', '/api/providers/interview/submit', { token: provToken, body: { attemptId: attempt2, answers: right, englishAnswers: enRight } });
-    check('all-correct interview -> passed 20/20, ethics 5/5', r.status === 200 && r.json?.result === 'passed' && r.json?.total === 20 && r.json?.scores?.ethics === 5, JSON.stringify(r.json));
-    check('english 3/3 basic-ok', r.json?.english?.correct === 3 && r.json?.english?.level === 'basic-ok');
-    // Ethics-fail case: 12+ total but ethics <3 must still fail (fresh provider).
+    r = await req('POST', '/api/providers/interview/start', { token: prov1Token });
+    check('retake during 7-day cooldown -> 409 retake_blocked', r.status === 409 && r.json?.error === 'retake_blocked' && !!r.json?.canRetakeAt, JSON.stringify(r.json));
+    // Demo provider 2: all-correct -> passed 36/36, interview points 20.
     r = await req('POST', '/api/otp/request', { body: { phone: '01000000002', channel: 'whatsapp' } });
     r = await req('POST', '/api/otp/verify', { body: { phone: '01000000002', code: '123456' } });
-    const prov2Token = r.json?.accessToken;
-    r = await req('POST', '/api/providers/interview/start', { token: prov2Token });
-    const a3 = r.json?.attemptId;
-    const mixed = {};
-    for (const q of r.json.questions) mixed[q.id] = q.category === 'ethics' ? 'zzz' : CORRECT[q.id];
-    r = await req('POST', '/api/providers/interview/submit', { token: prov2Token, body: { attemptId: a3, answers: mixed, englishAnswers: enRight } });
-    check('15/20 but ethics 0/5 -> manual-review (ethics gate)', r.status === 200 && r.json?.result === 'manual-review' && r.json?.total === 15 && r.json?.scores?.ethics === 0, JSON.stringify(r.json));
+    const provToken = r.json?.accessToken;
+    const passed = await answerInterview(provToken, 'all-correct');
+    check('all-correct interview -> passed 36/36, medical 8 ethics 7 safety 6', passed.submit?.status === 200 && passed.submit?.json?.status === 'passed' && passed.submit?.json?.total === 36 && passed.submit?.json?.scores?.medical === 8 && passed.submit?.json?.scores?.ethics === 7 && passed.submit?.json?.scores?.safety === 6, JSON.stringify(passed.submit?.json));
+    check('english 3/3 basic-ok', passed.submit?.json?.english?.correct === 3 && passed.submit?.json?.english?.level === 'basic-ok');
+    r = await req('GET', '/api/providers/me', { token: provToken });
+    check('interview points 20 on the provider record (36/36)', r.json?.points?.interview === 20 && r.json?.interviewStatus === 'passed', JSON.stringify(r.json?.points));
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/verify', { token: adminToken, body: { role: 'nurse' } });
+    check('admin verifies demo provider 2 (role nurse) -> verified', r.status === 200 && r.json?.status === 'verified' && r.json?.role === 'nurse', JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Starter' } });
+    check('admin sets main provider tier Starter', r.status === 200 && r.json?.tier === 'Starter', JSON.stringify(r.json));
+    // Ethics-fail: 29/36 but ethics 0/7 -> FAILED (mandatory minimum).
+    const ethicsProv = await registerProvider('01014141414', 'nurse');
+    check('ethics-fail provider registered', ethicsProv.regStatus === 201, JSON.stringify(ethicsProv.reg));
+    const ethicsFail = await answerInterview(ethicsProv.token, 'ethics-wrong');
+    check('29/36 but ethics 0/7 -> failed (mandatory minimum)', ethicsFail.submit?.status === 200 && ethicsFail.submit?.json?.status === 'failed' && ethicsFail.submit?.json?.total === 29 && ethicsFail.submit?.json?.scores?.ethics === 0, JSON.stringify(ethicsFail.submit?.json));
+    // Manual review: 21/36 (non-mandatory dims wrong) -> admin pass.
+    const manualProv = await registerProvider('01015151515', 'nurse');
+    check('manual-review provider registered', manualProv.regStatus === 201, JSON.stringify(manualProv.reg));
+    const manual = await answerInterview(manualProv.token, 'manual-review');
+    check('21/36 -> manual-review', manual.submit?.status === 200 && manual.submit?.json?.status === 'manual-review' && manual.submit?.json?.total === 21, JSON.stringify(manual.submit?.json));
+    r = await req('POST', `/api/admin/providers/${manualProv.providerId}/interview`, { token: adminToken, body: { decision: 'pass' } });
+    check('admin passes manual-review interview -> passed, points 10', r.status === 200 && r.json?.interviewStatus === 'passed' && r.json?.points?.interview === 10, JSON.stringify(r.json));
+    // Red flag: correct everywhere except the unconscious-patient question
+    // (treat at home instead of calling 123) -> instant 'red-flag' fail.
+    const redProv = await registerProvider('01016161616', 'nurse');
+    check('red-flag provider registered', redProv.regStatus === 201, JSON.stringify(redProv.reg));
+    const red = await answerInterview(redProv.token, 'red-flag');
+    check('red-flag answer -> instant red-flag fail at 35/36', red.submit?.status === 200 && red.submit?.json?.status === 'red-flag' && red.submit?.json?.redFlag === true && red.submit?.json?.total === 35 && !!red.submit?.json?.canRetakeAt, JSON.stringify(red.submit?.json));
+    r = await req('POST', '/api/providers/interview/start', { token: redProv.token });
+    check('red-flag retake needs admin approval -> 409', r.status === 409 && r.json?.error === 'retake_blocked', JSON.stringify(r.json));
+    r = await req('POST', `/api/admin/providers/${redProv.providerId}/interview`, { token: adminToken, body: { decision: 'allow-retake' } });
+    check('admin allow-retake clears the gate -> 200', r.status === 200, JSON.stringify(r.json));
+    r = await req('POST', '/api/providers/interview/start', { token: redProv.token });
+    check('retake allowed after admin approval -> 200', r.status === 200 && !!r.json?.attemptId, JSON.stringify(r.json));
 
     // --- 7. full escrow flow -------------------------------------------
     console.log('\n[escrow end-to-end]');
@@ -216,8 +287,8 @@ async function main() {
     } });
     check('booking created held, total 275+100=375', r.status === 201 && r.json?.status === 'held' && r.json?.amountEgp === 375, JSON.stringify(r.json));
     const bkId = r.json?.id;
-    // Provider 2 failed interview -> cannot accept (radar/accept locked).
-    r = await req('POST', `/api/bookings/${bkId}/accept`, { token: prov2Token });
+    // Provider 1 failed interview -> cannot accept (radar/accept locked).
+    r = await req('POST', `/api/bookings/${bkId}/accept`, { token: prov1Token });
     check('interview-failed provider cannot accept -> 403', r.status === 403, JSON.stringify(r.json));
     // Provider 1 (passed) accepts.
     r = await req('POST', `/api/bookings/${bkId}/accept`, { token: provToken });
@@ -225,8 +296,8 @@ async function main() {
     check('commission locked at accept (Starter 15% — reversed rates, v2.0.9)', r.json?.commissionPct === 15);
     // Another patient cannot see it.
     const other = await req('POST', '/api/otp/request', { body: { phone: '01099999999', channel: 'sms' } });
-    const mm = out.match(/\[MOCK OTP\] channel=sms phone=01099999999 code=(\d{6})/);
-    const otherLogin = await req('POST', '/api/otp/verify', { body: { phone: '01099999999', code: mm ? mm[1] : '000000' } });
+    const mm = await mockCode('01099999999');
+    const otherLogin = await req('POST', '/api/otp/verify', { body: { phone: '01099999999', code: mm || '000000' } });
     const otherToken = otherLogin.json?.accessToken;
     r = await req('GET', `/api/bookings/${bkId}`, { token: otherToken });
     check('other patient cannot view booking -> 403', r.status === 403, JSON.stringify(r.json));
@@ -272,10 +343,10 @@ async function main() {
     await req('POST', `/api/bookings/${bk2}/confirm-patient`, { token: patientToken2 });
     // Auto-release window is 1000 ms in this test (AUTO_RELEASE_MS env).
     await sleep(1500);
-    // Admin login for sweep.
+    // Admin token was obtained at startup (mock-otp reads need it); refresh it here.
     r = await req('POST', '/api/admin/pin/verify', { body: { pin: TEST_ADMIN_PIN } });
     check('admin PIN verify 200', r.status === 200 && !!r.json?.token, JSON.stringify(r.json));
-    const adminToken = r.json?.token;
+    adminToken = r.json?.token;
     r = await req('POST', '/api/jobs/sweep', { token: adminToken });
     check('sweep auto-releases 1h-old patient-confirmed booking', r.status === 200 && (r.json?.released || []).includes(bk2), JSON.stringify(r.json));
     r = await req('GET', `/api/bookings/${bk2}`, { token: patientToken2 });
@@ -320,13 +391,8 @@ async function main() {
     console.log('\n[provider register]');
     const newPhone = '01055555555';
     await req('POST', '/api/otp/request', { body: { phone: newPhone, channel: 'whatsapp' } });
-    // Poll for the mock-code log line (stdout delivery is async).
-    let nm = null;
-    for (let i = 0; i < 20 && !nm; i++) {
-      nm = out.match(/\[MOCK OTP\] channel=whatsapp phone=01055555555 code=(\d{6})/);
-      if (!nm) await sleep(100);
-    }
-    const nl = await req('POST', '/api/otp/verify', { body: { phone: newPhone, code: nm ? nm[1] : '000000' } });
+    const nm = await mockCode(newPhone);
+    const nl = await req('POST', '/api/otp/verify', { body: { phone: newPhone, code: nm || '000000' } });
     const newToken = nl.json?.accessToken;
     r = await req('POST', '/api/providers/register', { token: newToken, body: { ...TERMS,
       name: 'New Nurse', role: 'nurse', nationalId: '12345678901234', licenseNo: 'LIC-98765',
@@ -427,8 +493,8 @@ async function main() {
     // Registration without terms -> 400.
     const regPhone = '01066666666';
     await req('POST', '/api/otp/request', { body: { phone: regPhone, channel: 'whatsapp' } });
-    const rm = out.match(/\[MOCK OTP\] channel=whatsapp phone=01066666666 code=(\d{6})/);
-    const rl2 = await req('POST', '/api/otp/verify', { body: { phone: regPhone, code: rm ? rm[1] : '000000' } });
+    const rm = await mockCode(regPhone);
+    const rl2 = await req('POST', '/api/otp/verify', { body: { phone: regPhone, code: rm || '000000' } });
     const regToken = rl2.json?.accessToken;
     r = await req('POST', '/api/providers/register', { token: regToken, body: {
       name: 'No Terms Nurse', role: 'nurse', nationalId: '12345678901234', licenseNo: 'LIC-11111',
@@ -443,14 +509,19 @@ async function main() {
     } });
     check('v2.0.8 booking created', r.status === 201, JSON.stringify(r.json));
     const bk8 = r.json?.id;
+    // v2.1.1: bookings <30 min old are Elite-only on the radar.
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Elite' } });
+    check('main provider temporarily Elite for the radar check', r.status === 200 && r.json?.tier === 'Elite', JSON.stringify(r.json));
     r = await req('GET', '/api/providers/radar', { token: provToken });
     const radarItem = (r.json?.pending || []).find((x) => x.id === bk8);
-    check('radar returns minimal view, no patient PII', r.status === 200 && !!radarItem && !('patientPhone' in radarItem) && !('patientName' in radarItem) && !('address' in radarItem) && !('alternateContact' in radarItem) && !('notes' in radarItem) && !('triage' in radarItem) && radarItem.serviceCode === 'standard' && radarItem.amountEgp === 250, JSON.stringify(radarItem));
+    check('radar returns minimal view, no patient PII', r.status === 200 && !!radarItem && !('patientPhone' in radarItem) && !('patientName' in radarItem) && !('address' in radarItem) && !('alternateContact' in radarItem) && !('notes' in radarItem) && !('triage' in radarItem) && radarItem.serviceCode === 'standard' && radarItem.amountEgp === 250 && radarItem.eliteEarly === true && radarItem.category === 'nursing' && radarItem.riskLevel === 'standard', JSON.stringify(radarItem));
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Starter' } });
+    check('main provider back to Starter after the radar check', r.status === 200 && r.json?.tier === 'Starter', JSON.stringify(r.json));
     // Radar maxKm is capped at 35.
     r = await req('GET', '/api/providers/radar?maxKm=500', { token: provToken });
     check('radar maxKm capped at 35', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
     // Unassigned provider cannot see the booking at all.
-    r = await req('GET', `/api/bookings/${bk8}`, { token: prov2Token });
+    r = await req('GET', `/api/bookings/${bk8}`, { token: prov1Token });
     check('unassigned provider cannot view booking -> 403', r.status === 403, JSON.stringify(r.json));
     // Assigned provider sees phone + address, never the alternate contact.
     r = await req('POST', `/api/bookings/${bk8}/accept`, { token: provToken });
@@ -459,7 +530,7 @@ async function main() {
     check('assigned provider sees patient phone + address, no alternate contact', r.status === 200 && r.json?.patientPhone === '01012345678' && !!r.json?.address && !('alternateContact' in r.json) && !('insurer' in r.json), JSON.stringify(r.json)?.slice(0, 300));
     // Patient view never contains the provider phone.
     r = await req('GET', `/api/bookings/${bk8}`, { token: patientToken2 });
-    check('patient view has no provider phone', r.status === 200 && !JSON.stringify(r.json).includes('01000000001'), JSON.stringify(r.json)?.slice(0, 300));
+    check('patient view has no provider phone', r.status === 200 && !JSON.stringify(r.json).includes('01000000002'), JSON.stringify(r.json)?.slice(0, 300));
 
     // In-app messaging: phone numbers are rejected, clean text works.
     r = await req('POST', `/api/bookings/${bk8}/messages`, { token: patientToken2, body: { text: 'Call me on 01099999999 please' } });
@@ -468,7 +539,7 @@ async function main() {
     check('clean message -> 201', r.status === 201 && r.json?.text === 'Hello, I am at the gate.', JSON.stringify(r.json));
     r = await req('GET', `/api/bookings/${bk8}/messages`, { token: provToken });
     check('assigned provider reads the thread', r.status === 200 && r.json?.open === true && r.json?.messages?.length === 1, JSON.stringify(r.json));
-    r = await req('GET', `/api/bookings/${bk8}/messages`, { token: prov2Token });
+    r = await req('GET', `/api/bookings/${bk8}/messages`, { token: prov1Token });
     check('unassigned provider cannot read messages -> 403', r.status === 403, JSON.stringify(r.json));
 
     // Review with circumvention=yes -> admin flag + release held.
@@ -491,11 +562,13 @@ async function main() {
     check('admin confirms circumvention -> booking refunded', r.status === 200 && r.json?.booking?.status === 'refunded' && r.json?.booking?.refundEgp === 250, JSON.stringify(r.json));
 
     // Graduated discipline: warn -> suspend blocks radar + accept -> unsuspend.
-    r = await req('POST', '/api/admin/providers/prov_demo_starter/warn', { token: adminToken, body: { reason: 'Test warning: asked a patient to deal outside the app.' } });
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/warn', { token: adminToken, body: { reason: 'Test warning: asked a patient to deal outside the app.' } });
     check('admin warn -> 200, warningCount 1', r.status === 200 && r.json?.warningCount === 1, JSON.stringify(r.json));
     r = await req('GET', '/api/providers/wallet', { token: provToken });
-    check('provider wallet shows the warning + tier/commission/next Thursday', r.status === 200 && Array.isArray(r.json?.warnings) && r.json.warnings.length === 1 && r.json?.commissionPct === 15 && !!r.json?.nextSettlementThursday, JSON.stringify(r.json)?.slice(0, 300));
-    r = await req('POST', '/api/admin/providers/prov_demo_starter/suspend', { token: adminToken, body: { reason: 'Test suspension.' } });
+    // v2.1.1: points auto-promoted the main provider to Pro (interview 20
+    // + rating 20 = 40 points) — wallet commission follows the points tier.
+    check('provider wallet shows the warning + tier/commission/next Thursday', r.status === 200 && Array.isArray(r.json?.warnings) && r.json.warnings.length === 1 && r.json?.tier === 'Pro' && r.json?.commissionPct === 12 && !!r.json?.nextSettlementThursday, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/suspend', { token: adminToken, body: { reason: 'Test suspension.' } });
     check('admin suspend -> 200, suspended true', r.status === 200 && r.json?.suspended === true, JSON.stringify(r.json));
     r = await req('GET', '/api/providers/radar', { token: provToken });
     check('suspended provider radar -> 403', r.status === 403, JSON.stringify(r.json));
@@ -506,14 +579,14 @@ async function main() {
     const bkSusp = r.json?.id;
     r = await req('POST', `/api/bookings/${bkSusp}/accept`, { token: provToken });
     check('suspended provider accept -> 403', r.status === 403, JSON.stringify(r.json));
-    r = await req('POST', '/api/admin/providers/prov_demo_starter/unsuspend', { token: adminToken });
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/unsuspend', { token: adminToken });
     check('admin unsuspend -> 200, suspended false', r.status === 200 && r.json?.suspended === false, JSON.stringify(r.json));
     r = await req('GET', '/api/providers/radar', { token: provToken });
     check('radar works again after unsuspend', r.status === 200 && Array.isArray(r.json?.pending), JSON.stringify(r.json)?.slice(0, 200));
-    // Permanent ban on the second demo provider (unused after section 7).
-    r = await req('POST', '/api/admin/providers/prov_demo_pro/suspend', { token: adminToken, body: { permanent: true, reason: 'Test permanent ban.' } });
+    // Permanent ban on the FAILED demo provider (unused after section 7).
+    r = await req('POST', '/api/admin/providers/prov_demo_starter/suspend', { token: adminToken, body: { permanent: true, reason: 'Test permanent ban.' } });
     check('admin permanent ban -> 200, permanentBan true', r.status === 200 && r.json?.permanentBan === true, JSON.stringify(r.json));
-    r = await req('GET', '/api/providers/me', { token: prov2Token });
+    r = await req('GET', '/api/providers/me', { token: prov1Token });
     check('banned provider sees permanentBan in /providers/me', r.status === 200 && r.json?.permanentBan === true, JSON.stringify(r.json));
 
     // --- 17. v2.0.9: reversed commissions + volume bonus + promo months + loyalty vouchers ---
@@ -541,9 +614,11 @@ async function main() {
       if (cf.status !== 200) return { ok: false, step: 'confirm-patient', res: cf };
       const rv = await req('POST', `/api/bookings/${id}/review`, { token: patientTok, body: { rating: 5, comment: 'Good.' } });
       if (rv.status !== 200 || rv.json?.status !== 'released') return { ok: false, step: 'review', res: rv };
-      return { ok: true, id, created: c.json, released: rv.json };
+      return { ok: true, id, created: c.json, complete: cp.json, released: rv.json };
     };
     // --- 17a. tier rates at accept: Starter 15 / Pro 12 / Elite 8 -------
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Starter' } });
+    check('main provider reset to Starter for tier-rate checks', r.status === 200 && r.json?.tier === 'Starter', JSON.stringify(r.json));
     r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Tier Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
       distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
@@ -551,7 +626,7 @@ async function main() {
     const bkTier1 = r.json?.id;
     r = await req('POST', `/api/bookings/${bkTier1}/accept`, { token: provToken });
     check('Starter accepts at 15%', r.status === 200 && r.json?.commissionPct === 15 && r.json?.commissionTier === 'Starter', JSON.stringify(r.json));
-    r = await req('POST', '/api/admin/providers/prov_demo_starter/tier', { token: adminToken, body: { tier: 'Pro' } });
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Pro' } });
     check('admin changes tier to Pro', r.status === 200 && r.json?.tier === 'Pro', JSON.stringify(r.json));
     r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Tier Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
@@ -560,7 +635,7 @@ async function main() {
     const bkTier2 = r.json?.id;
     r = await req('POST', `/api/bookings/${bkTier2}/accept`, { token: provToken });
     check('Pro accepts at 12%', r.status === 200 && r.json?.commissionPct === 12 && r.json?.commissionTier === 'Pro', JSON.stringify(r.json));
-    r = await req('POST', '/api/admin/providers/prov_demo_starter/tier', { token: adminToken, body: { tier: 'Elite' } });
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Elite' } });
     check('admin changes tier to Elite', r.status === 200 && r.json?.tier === 'Elite', JSON.stringify(r.json));
     r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Tier Test', serviceCode: 'standard', paymentMethod: 'cash_receipt',
@@ -569,7 +644,7 @@ async function main() {
     const bkTier3 = r.json?.id;
     r = await req('POST', `/api/bookings/${bkTier3}/accept`, { token: provToken });
     check('Elite accepts at 8%', r.status === 200 && r.json?.commissionPct === 8 && r.json?.commissionTier === 'Elite', JSON.stringify(r.json));
-    r = await req('POST', '/api/admin/providers/prov_demo_starter/tier', { token: adminToken, body: { tier: 'Starter' } });
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Starter' } });
     check('admin restores tier to Starter', r.status === 200 && r.json?.tier === 'Starter', JSON.stringify(r.json));
     r = await req('GET', `/api/bookings/${bkTier1}`, { token: patientToken2 });
     check('earlier accepted booking keeps locked 15% after tier change', r.json?.commissionPct === 15, JSON.stringify(r.json)?.slice(0, 200));
@@ -579,14 +654,21 @@ async function main() {
     check('volume-test patient login', volLogin.status === 200 && !!volToken, JSON.stringify(volLogin.json));
     // Provider already has 1 released case this month (bkId); 29 more -> 30.
     let volOk = true; let volFailStep = '';
+    let volPointsSeen = true; let volEarnedPositive = false;
     for (let i = 0; i < 29; i++) {
       const cyc = await completeVisit(volToken, 2);
       if (!cyc.ok) { volOk = false; volFailStep = `${cyc.step} ${JSON.stringify(cyc.res?.json || cyc.res)}`; break; }
+      // v2.1.1 contract: every completion returns points {earned,total,tier}.
+      const pts = cyc.complete?.points;
+      if (!pts || typeof pts.earned !== 'number' || typeof pts.total !== 'number' || typeof pts.tier !== 'string') volPointsSeen = false;
+      if (pts && pts.earned >= 1) volEarnedPositive = true;
     }
     check('29 volume cycles complete + release', volOk, volFailStep.slice(0, 300));
+    check('every complete-provider response carries points {earned,total,tier}', volPointsSeen, 'a cycle completion lacked a valid points payload');
+    check('a completion crossed a cases/weekly-double threshold (earned>=1)', volEarnedPositive, 'no completion in 29 cycles earned points');
     r = await req('GET', '/api/providers/wallet', { token: provToken });
-    check('wallet: 30 cases this month, bonus 500, title محترف موثّق', r.status === 200 && r.json?.monthlyCases === 30 && r.json?.volumeBonusEgp === 500 && r.json?.volumeBonus?.title === 'محترف موثّق' && r.json?.volumeBonus?.nextBonusAt === 60 && r.json?.volumeBonus?.casesToNextBonus === 30, JSON.stringify(r.json?.volumeBonus));
-    check('wallet totals carry the 500 bonus into what app owes provider', r.json?.totals?.volumeBonusEgp === 500 && r.json?.totals?.appOwesProviderEgp === 500, JSON.stringify(r.json?.totals));
+    check('wallet: 30 cases this month, bonus 1000 (new 15/30/60 thresholds), title الممرض الذهبي', r.status === 200 && r.json?.monthlyCases === 30 && r.json?.volumeBonusEgp === 1000 && r.json?.volumeBonus?.title === 'الممرض الذهبي' && r.json?.volumeBonus?.nextBonusAt === 60 && r.json?.volumeBonus?.casesToNextBonus === 30, JSON.stringify(r.json?.volumeBonus));
+    check('wallet totals carry the 1000 bonus into what app owes provider', r.json?.totals?.volumeBonusEgp === 1000 && r.json?.totals?.appOwesProviderEgp === 1000, JSON.stringify(r.json?.totals));
     r = await req('GET', '/api/me/vouchers', { token: volToken });
     check('volume patient earned vouchers (29 visits -> 7, next after 3 more)', r.status === 200 && r.json?.vouchers?.length === 7 && r.json?.completedPaidVisits === 29 && r.json?.visitsToNextVoucher === 3, JSON.stringify(r.json)?.slice(0, 300));
     // --- 17c. promo months ------------------------------------------------
@@ -613,12 +695,14 @@ async function main() {
     r = await req('POST', `/api/bookings/${bkPromo}/accept`, { token: provToken });
     check('accept under 0% promo locks commissionPct 0', r.status === 200 && r.json?.commissionPct === 0 && r.json?.promoCommissionPct === 0, JSON.stringify(r.json));
     r = await req('GET', '/api/providers/wallet', { token: provToken });
-    check('wallet under 0% promo: bonus paused, title kept', r.json?.volumeBonus?.paused === true && r.json?.volumeBonusEgp === 0 && r.json?.volumeBonus?.title === 'محترف موثّق' && r.json?.totals?.appOwesProviderEgp === 0, JSON.stringify(r.json?.volumeBonus));
+    check('wallet under 0% promo: bonus paused, title kept', r.json?.volumeBonus?.paused === true && r.json?.volumeBonusEgp === 0 && r.json?.volumeBonus?.title === 'الممرض الذهبي' && r.json?.totals?.appOwesProviderEgp === 0, JSON.stringify(r.json?.volumeBonus));
     check('wallet shows promo 0%', r.json?.promo?.active === true && r.json?.promo?.commissionPct === 0, JSON.stringify(r.json?.promo));
     r = await req('POST', '/api/admin/promo', { token: adminToken, body: { commissionPct: null } });
     check('admin clears promo -> inactive', r.status === 200 && r.json?.promo?.active === false, JSON.stringify(r.json));
     r = await req('GET', '/api/bootstrap');
     check('bootstrap promo inactive after clear', r.json?.promo?.active === false, JSON.stringify(r.json?.promo));
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Starter' } });
+    check('main provider reset to Starter after promo', r.status === 200 && r.json?.tier === 'Starter', JSON.stringify(r.json));
     r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Post Promo', serviceCode: 'standard', paymentMethod: 'cash_receipt',
       distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
@@ -665,6 +749,8 @@ async function main() {
     } });
     const bkVou = r.json?.id;
     check('350 booking auto-applies voucher: payable 300, discount 50', r.status === 201 && r.json?.amountEgp === 350 && r.json?.amountPayableEgp === 300 && r.json?.voucherDiscountEgp === 50 && !!r.json?.voucherId, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Starter' } });
+    check('main provider reset to Starter before the voucher visit accept', r.status === 200 && r.json?.tier === 'Starter', JSON.stringify(r.json));
     await req('POST', `/api/bookings/${bkVou}/accept`, { token: provToken });
     await req('POST', `/api/bookings/${bkVou}/vitals`, { token: provToken, body: { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 } });
     await req('POST', `/api/bookings/${bkVou}/complete-provider`, { token: provToken });
@@ -697,7 +783,7 @@ async function main() {
     console.log('\n[v2.1.0 notifications + high-risk + doctors + npwt booking]');
     // --- 18a. bootstrap flags + new services ---------------------------
     r = await req('GET', '/api/bootstrap');
-    check('bootstrap has 27 services (12 original + 15 new)', r.json?.services?.length === 27, `got ${r.json?.services?.length}`);
+    check('bootstrap has 41 priced services (27 v2.1.0 + 14 v2.1.1)', r.json?.services?.length === 41, `got ${r.json?.services?.length}`);
     const svc = (code) => r.json.services.find((s) => s.code === code);
     check('catheter_insert 400 high-risk', svc('catheter_insert')?.price_egp === 400 && svc('catheter_insert')?.riskLevel === 'high', JSON.stringify(svc('catheter_insert')));
     check('catheter_remove 300 high-risk', svc('catheter_remove')?.price_egp === 300 && svc('catheter_remove')?.riskLevel === 'high');
@@ -712,7 +798,7 @@ async function main() {
     check('cvp_dressing 300 high-risk (owner-set 26 Nov)', svc('cvp_dressing')?.price_egp === 300 && svc('cvp_dressing')?.riskLevel === 'high' && svc('cvp_dressing')?.requiresDoctorOrder === true);
     check('elderly shift mobile 400 / bedridden 500 (owner-set minimums)', svc('elderly_shift_mobile')?.price_egp === 400 && svc('elderly_shift_mobile')?.riskLevel === 'standard' && svc('elderly_shift_bedridden')?.price_egp === 500 && svc('elderly_shift_bedridden')?.riskLevel === 'standard');
     check('generic 12h shift still 500 (untouched)', svc('shift12')?.price_egp === 500);
-    check('bootstrap highRiskServices has 10 incl npwt + cannula_iv + cvp', Array.isArray(r.json?.highRiskServices) && r.json.highRiskServices.length === 10 && r.json.highRiskServices.includes('npwt') && r.json.highRiskServices.includes('cannula_iv') && r.json.highRiskServices.includes('cvp_dressing'), JSON.stringify(r.json?.highRiskServices));
+    check('bootstrap highRiskServices has 11 incl npwt + cannula_iv + cvp + iron', Array.isArray(r.json?.highRiskServices) && r.json.highRiskServices.length === 11 && r.json.highRiskServices.includes('npwt') && r.json.highRiskServices.includes('cannula_iv') && r.json.highRiskServices.includes('cvp_dressing') && r.json.highRiskServices.includes('iron_infusion'), JSON.stringify(r.json?.highRiskServices));
     check('bootstrap highRiskChecklist has 4 items', Array.isArray(r.json?.highRiskChecklist) && r.json.highRiskChecklist.length === 4 && r.json.highRiskChecklist.includes('sterileTechnique'), JSON.stringify(r.json?.highRiskChecklist));
     check('bootstrap otp/push/persistence flags (all off in test)', r.json?.otp?.smsConfigured === false && r.json?.otp?.whatsappConfigured === false && r.json?.push?.fcmConfigured === false && r.json?.persistence === 'file', JSON.stringify({ otp: r.json?.otp, push: r.json?.push, persistence: r.json?.persistence }));
     // --- 18b. doctor-order gate + high-risk accept + checklist --------
@@ -728,8 +814,8 @@ async function main() {
     const bkSuture = r.json?.id;
     r = await bookSvc('catheter_insert');
     check('catheter insertion without doctor order -> 400', r.status === 400, JSON.stringify(r.json));
-    r = await bookSvc('catheter_insert', { doctorOrder: order });
-    check('catheter insertion with order -> 201, 400 EGP', r.status === 201 && r.json?.amountEgp === 400, JSON.stringify(r.json));
+    r = await bookSvc('catheter_insert', { doctorOrder: order, consentGiven: true });
+    check('catheter insertion with order + consent -> 201, 400 EGP', r.status === 201 && r.json?.amountEgp === 400, JSON.stringify(r.json));
     const bkCath = r.json?.id;
     // Register a nursing ASSISTANT, pass the interview, then prove the
     // high-risk gates: radar hides it, accept refuses it (role gate fires
@@ -737,59 +823,61 @@ async function main() {
     const asstPhone = '01044444444';
     const asstOtpReq = await req('POST', '/api/otp/request', { body: { phone: asstPhone, channel: 'whatsapp' } });
     check('assistant otp request 200', asstOtpReq.status === 200, JSON.stringify(asstOtpReq.json));
-    // The mock code is logged to the server console; stdout delivery to
-    // this process is async, so poll briefly until the line appears
-    // (matching immediately after the request can race the log flush).
-    let am = null;
-    for (let i = 0; i < 20 && !am; i++) {
-      am = out.match(/\[MOCK OTP\] channel=whatsapp phone=01044444444 code=(\d{6})/);
-      if (!am) await sleep(100);
-    }
-    const al = await req('POST', '/api/otp/verify', { body: { phone: asstPhone, code: am ? am[1] : '000000' } });
+    const am = await mockCode(asstPhone);
+    const al = await req('POST', '/api/otp/verify', { body: { phone: asstPhone, code: am || '000000' } });
     check('assistant otp verify 200', al.status === 200 && !!al.json?.accessToken, JSON.stringify(al.json)?.slice(0, 150));
     const asstToken = al.json?.accessToken;
     r = await req('POST', '/api/providers/register', { token: asstToken, body: { ...TERMS,
       name: 'Test Assistant', role: 'assistant', nationalId: '12345678901234', licenseNo: 'LIC-ASST1',
     } });
     check('assistant registered', r.status === 201 && r.json?.role === 'assistant', JSON.stringify(r.json));
+    const asstProviderId = r.json?.id;
     // The OTP token was issued BEFORE registration (role=patient), so
     // re-login as provider to get a provider-role token for the interview.
     r = await req('POST', '/api/auth/login-phone', { body: { phone: asstPhone, role: 'provider' } });
     check('assistant re-login as provider -> 200', r.status === 200 && r.json?.role === 'provider' && !!r.json?.accessToken, JSON.stringify(r.json)?.slice(0, 200));
     const asstProvToken = r.json?.accessToken;
-    r = await req('POST', '/api/providers/interview/start', { token: asstProvToken });
-    const aAtt = r.json?.attemptId;
-    const aRight = {};
-    for (const q of r.json.questions) aRight[q.id] = CORRECT[q.id];
-    const aEn = {};
-    for (const q of r.json.englishCheck.questions) aEn[q.id] = EN_CORRECT[q.id];
-    r = await req('POST', '/api/providers/interview/submit', { token: asstProvToken, body: { attemptId: aAtt, answers: aRight, englishAnswers: aEn } });
-    check('assistant passes interview 20/20', r.status === 200 && r.json?.result === 'passed', JSON.stringify(r.json));
+    const asstInterview = await answerInterview(asstProvToken, 'all-correct');
+    check('assistant passes interview 36/36', asstInterview.submit?.status === 200 && asstInterview.submit?.json?.status === 'passed' && asstInterview.submit?.json?.total === 36, JSON.stringify(asstInterview.submit?.json));
+    r = await req('POST', `/api/admin/providers/${asstProviderId}/verify`, { token: adminToken, body: { role: 'assistant' } });
+    check('admin verifies assistant -> verified', r.status === 200 && r.json?.status === 'verified', JSON.stringify(r.json));
+    // v2.1.1 Elite early access: the assistant must be Elite to see the
+    // fresh standard booking on the radar at all.
+    r = await req('POST', `/api/admin/providers/${asstProviderId}/tier`, { token: adminToken, body: { tier: 'Elite' } });
+    check('assistant temporarily Elite for the radar check', r.status === 200 && r.json?.tier === 'Elite', JSON.stringify(r.json));
     r = await req('GET', '/api/providers/radar', { token: asstProvToken });
     const radarCodes = (r.json?.pending || []).map((b) => b.serviceCode);
     check('assistant radar hides high-risk, shows standard', r.status === 200 && !radarCodes.includes('catheter_insert') && radarCodes.includes('standard'), JSON.stringify(radarCodes));
     r = await req('POST', `/api/bookings/${bkCath}/accept`, { token: asstProvToken });
     check('assistant cannot accept high-risk -> 403 nurse-only', r.status === 403 && JSON.stringify(r.json).includes('Nursing assistants cannot'), JSON.stringify(r.json));
+    // Main provider tier may have auto-promoted via points; reset Starter.
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Starter' } });
+    check('main provider reset to Starter before high-risk accepts', r.status === 200 && r.json?.tier === 'Starter', JSON.stringify(r.json));
     r = await req('POST', `/api/bookings/${bkCath}/accept`, { token: provToken });
     check('verified nurse accepts high-risk -> 200, 15%', r.status === 200 && r.json?.status === 'accepted' && r.json?.commissionPct === 15, JSON.stringify(r.json));
+    // --- 18b. suture/catheter completion + points contract --------------
+    const vitalsBody = { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 };
     r = await req('POST', `/api/bookings/${bkSuture}/accept`, { token: provToken });
     check('verified nurse accepts suture removal -> 200', r.status === 200 && r.json?.status === 'accepted', JSON.stringify(r.json));
-    const vitalsBody = { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 };
     r = await req('POST', `/api/bookings/${bkSuture}/vitals`, { token: provToken, body: vitalsBody });
     check('suture vitals recorded', r.status === 200, JSON.stringify(r.json));
     r = await req('POST', `/api/bookings/${bkSuture}/complete-provider`, { token: provToken });
     check('suture complete without doctorOrderSeen -> 409', r.status === 409, JSON.stringify(r.json));
     r = await req('POST', `/api/bookings/${bkSuture}/complete-provider`, { token: provToken, body: { doctorOrderSeen: true } });
-    check('suture complete with doctorOrderSeen -> 200', r.status === 200 && r.json?.status === 'provider_confirmed', JSON.stringify(r.json));
+    check('suture complete with doctorOrderSeen -> 200 + points payload', r.status === 200 && r.json?.status === 'provider_confirmed' && r.json?.points && typeof r.json.points.earned === 'number' && typeof r.json.points.total === 'number' && typeof r.json.points.tier === 'string', JSON.stringify(r.json)?.slice(0, 300));
+    const suturePts = r.json?.points;
+    r = await req('GET', '/api/providers/me', { token: provToken });
+    check('completion points match provider record (total + tier)', r.status === 200 && suturePts && r.json?.points?.total === suturePts.total && r.json?.points?.tier === suturePts.tier, JSON.stringify(r.json?.points));
     r = await req('POST', `/api/bookings/${bkCath}/vitals`, { token: provToken, body: vitalsBody });
     check('catheter vitals recorded', r.status === 200, JSON.stringify(r.json));
     r = await req('POST', `/api/bookings/${bkCath}/complete-provider`, { token: provToken });
-    check('high-risk complete without checklist -> 409 listing missing', r.status === 409 && Array.isArray(r.json?.missing) && r.json.missing.length === 4, JSON.stringify(r.json));
+    check('high-risk complete without checklist -> 409', r.status === 409, JSON.stringify(r.json));
     r = await req('POST', `/api/bookings/${bkCath}/complete-provider`, { token: provToken, body: { safetyChecklist: { orderSeen: true, sterileTechnique: true, identityConfirmed: true, complicationCheck: true } } });
-    check('high-risk complete with full checklist -> 200', r.status === 200 && r.json?.status === 'provider_confirmed' && !!r.json?.safetyChecklist, JSON.stringify(r.json));
+    check('high-risk complete with full checklist -> 200 + points payload', r.status === 200 && r.json?.status === 'provider_confirmed' && r.json?.points && typeof r.json.points.earned === 'number' && typeof r.json.points.total === 'number', JSON.stringify(r.json)?.slice(0, 300));
     // --- 18c. NPWT booking endpoint ------------------------------------
     const npwtBody = { ...TERMS, patientName: 'NPWT Test', paymentMethod: 'cash_receipt',
-      days: 14, kitPrice: 300, distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] } };
+      days: 14, kitPrice: 300, distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+      consentGiven: true }; // v2.1.1: NPWT is high-risk — explicit consent required
     r = await req('POST', '/api/npwt/bookings', { token: patientToken2, body: npwtBody });
     check('NPWT booking without order/checklist -> 400', r.status === 400, JSON.stringify(r.json));
     r = await req('POST', '/api/npwt/bookings', { token: patientToken2, body: { ...npwtBody, doctorOrder: order } });
@@ -878,6 +966,221 @@ async function main() {
     // --- 18f. admin persistence endpoint --------------------------------
     r = await req('GET', '/api/admin/persistence', { token: adminToken });
     check('persistence endpoint: file store, postgres off in test', r.status === 200 && r.json?.persistence === 'file' && r.json?.postgresConfigured === false, JSON.stringify(r.json));
+
+    // --- 21. v2.1.1 coverage: new services, physio + tourist gating, ----
+    //     favorites, medical-file interest, monitor, CORS, refresh reuse,
+    //     points/credentials, stay bonus/buddy, settlements/export,
+    //     triage emergency, SOS cap --------------------------------------
+    console.log('\n[v2.1.1 coverage]');
+    const bookStd = async (serviceCode, extra = {}) => req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Coverage Patient', serviceCode, paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] }, ...extra,
+    } });
+    // 21a. six new nursing services (priced) + iron high-risk gate.
+    r = await bookStd('enema');
+    check('new service enema -> 201, 500 EGP', r.status === 201 && r.json?.amountEgp === 500, JSON.stringify(r.json)?.slice(0, 200));
+    r = await bookStd('allergy_test');
+    check('new service allergy_test -> 201, 250 EGP', r.status === 201 && r.json?.amountEgp === 250, JSON.stringify(r.json)?.slice(0, 200));
+    r = await bookStd('condom_catheter');
+    check('new service condom_catheter -> 201, 300 EGP', r.status === 201 && r.json?.amountEgp === 300, JSON.stringify(r.json)?.slice(0, 200));
+    r = await bookStd('culture_sample');
+    check('new service culture_sample -> 201, 400 EGP', r.status === 201 && r.json?.amountEgp === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await bookStd('urine_catheter_sample');
+    check('new service urine_catheter_sample -> 201, 350 EGP', r.status === 201 && r.json?.amountEgp === 350, JSON.stringify(r.json)?.slice(0, 200));
+    r = await bookStd('iron_infusion');
+    check('iron_infusion without doctor order -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await bookStd('iron_infusion', { doctorOrder: order, consentGiven: true });
+    check('iron_infusion with order + consent -> 201, 400 EGP', r.status === 201 && r.json?.amountEgp === 400, JSON.stringify(r.json)?.slice(0, 200));
+    // 21b. triage level emergency rejects even with empty dangerSigns.
+    r = await bookStd('standard', { triage: { level: 'emergency', dangerSigns: [] } });
+    check('triage level emergency -> 422 emergency_triage', r.status === 422 && r.json?.error === 'emergency_triage', JSON.stringify(r.json)?.slice(0, 200));
+    // 21c. physio: registration requires a certificate; then full flow.
+    const physNoCert = await registerProvider('01017171717', 'physio');
+    check('physio registration without certificate -> 400', physNoCert.regStatus === 400, JSON.stringify(physNoCert.reg)?.slice(0, 200));
+    const phys = await registerProvider('01017171717', 'physio', { certificates: [{ name: 'BSc Physiotherapy' }] });
+    check('physio registration with certificate -> 201', phys.regStatus === 201, JSON.stringify(phys.reg)?.slice(0, 200));
+    const physInterview = await answerInterview(phys.token, 'all-correct');
+    check('physio passes interview 36/36', physInterview.submit?.status === 200 && physInterview.submit?.json?.status === 'passed' && physInterview.submit?.json?.total === 36, JSON.stringify(physInterview.submit?.json));
+    r = await req('POST', `/api/admin/providers/${phys.providerId}/verify`, { token: adminToken, body: { role: 'physio' } });
+    check('admin verifies physio', r.status === 200 && r.json?.status === 'verified', JSON.stringify(r.json)?.slice(0, 200));
+    // Main provider Elite first, so radar exclusion below is the physio
+    // gate only (not the Elite early-access gate).
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Elite' } });
+    check('main provider Elite for radar-gate checks', r.status === 200 && r.json?.tier === 'Elite', JSON.stringify(r.json));
+    r = await bookStd('physio_general');
+    check('physio_general booking -> 201, 350 EGP, category physio', r.status === 201 && r.json?.amountEgp === 350 && r.json?.category === 'physio', JSON.stringify(r.json)?.slice(0, 200));
+    const bkPhysio = r.json?.id;
+    r = await req('GET', '/api/providers/radar', { token: provToken });
+    check('nurse radar hides physio-category booking', r.status === 200 && !(r.json?.pending || []).some((b) => b.id === bkPhysio), JSON.stringify((r.json?.pending || []).map((b) => b.serviceCode)));
+    r = await req('POST', `/api/bookings/${bkPhysio}/accept`, { token: provToken });
+    check('nurse cannot accept physio service -> 403', r.status === 403, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/providers/${phys.providerId}/tier`, { token: adminToken, body: { tier: 'Elite' } });
+    check('physio temporarily Elite for radar', r.status === 200 && r.json?.tier === 'Elite', JSON.stringify(r.json));
+    r = await req('GET', '/api/providers/radar', { token: phys.token });
+    check('physio radar shows physio booking', r.status === 200 && (r.json?.pending || []).some((b) => b.id === bkPhysio), JSON.stringify((r.json?.pending || []).map((b) => b.serviceCode)));
+    r = await req('POST', `/api/bookings/${bkPhysio}/accept`, { token: phys.token });
+    check('physio accepts physio booking -> 200', r.status === 200 && r.json?.status === 'accepted', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkPhysio}/vitals`, { token: phys.token, body: vitalsBody });
+    check('physio vitals recorded', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkPhysio}/complete-provider`, { token: phys.token });
+    check('physio complete-provider -> 200 + points', r.status === 200 && r.json?.status === 'provider_confirmed' && r.json?.points, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', `/api/bookings/${bkPhysio}/confirm-patient`, { token: patientToken2 });
+    check('physio patient confirm -> 200', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkPhysio}/review`, { token: patientToken2, body: { rating: 5, comment: 'Good.' } });
+    check('physio review releases visit', r.status === 200 && r.json?.status === 'released', JSON.stringify(r.json)?.slice(0, 200));
+    // 21d. tourist badge gating + language bonus on release.
+    r = await req('POST', '/api/tourist-bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Tourist Test', serviceCode: 'tourist_iv', language: 'de', currency: 'eur',
+      paymentMethod: 'cash_receipt', distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    check('tourist booking (de, eur) -> 201, kind tourist', r.status === 201 && r.json?.kind === 'tourist' && r.json?.language === 'de', JSON.stringify(r.json)?.slice(0, 300));
+    const bkTourist = r.json?.id;
+    const fxEur = r.json?.fxRate;
+    r = await req('GET', '/api/providers/radar', { token: provToken });
+    check('tourist booking hidden from non-compatible provider radar', r.status === 200 && !(r.json?.pending || []).some((b) => b.id === bkTourist), JSON.stringify((r.json?.pending || []).map((b) => b.id)));
+    r = await req('POST', `/api/bookings/${bkTourist}/accept`, { token: provToken });
+    check('non-compatible provider cannot accept tourist booking -> 403', r.status === 403, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/credentials', { token: adminToken, body: { kind: 'language', name: 'Goethe B2', language: 'de', verified: true } });
+    check('admin adds verified German certificate -> 201', r.status === 201, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', '/api/providers/me', { token: provToken });
+    check('provider is touristCompatible after verified language cert', r.status === 200 && r.json?.touristCompatible === true, JSON.stringify({ touristCompatible: r.json?.touristCompatible }));
+    // The credential add recomputed points and demoted the manual Elite
+    // tier back to Pro — re-apply Elite so the radar check below tests
+    // the tourist gate only, not the Elite early-access gate.
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Elite' } });
+    check('main provider Elite again for tourist radar check', r.status === 200 && r.json?.tier === 'Elite', JSON.stringify(r.json));
+    r = await req('GET', '/api/providers/radar', { token: provToken });
+    check('tourist booking visible to compatible provider radar', r.status === 200 && (r.json?.pending || []).some((b) => b.id === bkTourist), JSON.stringify((r.json?.pending || []).map((b) => b.id)));
+    r = await req('POST', `/api/bookings/${bkTourist}/accept`, { token: provToken });
+    check('compatible provider accepts tourist booking -> 200', r.status === 200 && r.json?.status === 'accepted', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkTourist}/vitals`, { token: provToken, body: vitalsBody });
+    check('tourist vitals recorded', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkTourist}/complete-provider`, { token: provToken });
+    check('tourist complete-provider -> 200 + points payload', r.status === 200 && r.json?.status === 'provider_confirmed' && r.json?.points && typeof r.json.points.earned === 'number', JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', `/api/bookings/${bkTourist}/confirm-patient`, { token: patientToken2 });
+    check('tourist patient confirm -> 200', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkTourist}/review`, { token: patientToken2, body: { rating: 5, comment: 'Great.' } });
+    check('tourist review releases visit', r.status === 200 && r.json?.status === 'released', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', '/api/providers/wallet', { token: provToken });
+    const tourLine = (r.json?.ledger || []).find((l) => l.bookingId === bkTourist);
+    check('language bonus 15 EUR at booking FX in wallet ledger', !!tourLine && tourLine.languageBonusEgp === Math.round(15 * fxEur), JSON.stringify(tourLine));
+    // 21e. favorites (patient role; provider must exist + verified).
+    r = await req('POST', '/api/me/favorites', { token: patientToken2, body: { providerId: 'prov_demo_starter' } });
+    check('favorite unverified provider -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/me/favorites', { token: patientToken2, body: { providerId: 'prov_demo_pro' } });
+    check('favorite verified provider -> 201', r.status === 201, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', '/api/me/favorites', { token: patientToken2 });
+    check('favorites list shows provider with tier + touristCompatible', r.status === 200 && (r.json?.favorites || []).some((f) => f.providerId === 'prov_demo_pro' && f.touristCompatible === true), JSON.stringify(r.json?.favorites));
+    r = await req('DELETE', '/api/me/favorites/prov_demo_pro', { token: patientToken2 });
+    check('unfavorite -> 200', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', '/api/me/favorites', { token: patientToken2 });
+    check('favorites empty after delete', r.status === 200 && (r.json?.favorites || []).length === 0, JSON.stringify(r.json?.favorites));
+    // 21f. medical-file interest (placeholder) + dashboard count.
+    r = await req('POST', '/api/medical-file-interest', { body: { phone: '01012345678' } });
+    check('medical-file interest first call -> recorded true', r.status === 200 && r.json?.ok === true && r.json?.recorded === true, JSON.stringify(r.json));
+    r = await req('POST', '/api/medical-file-interest', { body: { phone: '01012345678' } });
+    check('medical-file interest repeat phone -> recorded false', r.status === 200 && r.json?.recorded === false, JSON.stringify(r.json));
+    r = await req('GET', '/api/admin/dashboard', { token: adminToken });
+    check('dashboard carries medicalFileInterestCount 1', r.status === 200 && r.json?.medicalFileInterestCount === 1, JSON.stringify({ medicalFileInterestCount: r.json?.medicalFileInterestCount }));
+    // 21g. monitor endpoint (token set in spawn env).
+    r = await req('GET', '/api/monitor/summary');
+    check('monitor without token -> 401', r.status === 401, JSON.stringify(r.json));
+    r = await req('GET', '/api/monitor/summary', { monitorToken: 'wrong-token' });
+    check('monitor with wrong token -> 401', r.status === 401, JSON.stringify(r.json));
+    r = await req('GET', '/api/monitor/summary', { monitorToken: 'monitor-test-token' });
+    check('monitor with correct token -> 200, read-only shape, no PII', r.status === 200 && r.json?.bookingsToday && r.json?.settlement && r.json?.medicalFileInterestCount === 1 && !JSON.stringify(r.json).includes('010') && !JSON.stringify(r.json).includes('Test '), JSON.stringify(r.json)?.slice(0, 300));
+    // v2.1.1 — repeat-booking rate (owner's launch metric): overall + last
+    // 30 days, counts + rate 0..1, no PII. The run completed many bookings
+    // for the same patient phone, so overall repeatPatients must be >= 1.
+    const rbr = r.json?.repeatBookingRate;
+    check('monitor repeat-booking rate shape (overall + last30Days)', !!rbr && typeof rbr.overall?.rate === 'number' && rbr.overall.rate >= 0 && rbr.overall.rate <= 1 && Number.isInteger(rbr.overall.patientsWithCompleted) && Number.isInteger(rbr.overall.repeatPatients) && typeof rbr.last30Days?.rate === 'number' && rbr.last30Days.rate >= 0 && rbr.last30Days.rate <= 1, JSON.stringify(rbr));
+    check('monitor repeat-booking rate: repeat patients exist', rbr?.overall?.repeatPatients >= 1 && rbr?.overall?.patientsWithCompleted >= 1, JSON.stringify(rbr));
+    // Monitor looks disabled (404) when MUSE_MONITOR_TOKEN is unset:
+    // second server, same code, no token in env.
+    const DATA2 = path.join(__dirname, 'smoke-data-2.json');
+    if (fs.existsSync(DATA2)) fs.unlinkSync(DATA2);
+    const env2 = { ...process.env, PORT: '3458', NODE_ENV: 'test', DATA_FILE: DATA2, MOCK_OTP: 'true',
+      JWT_SECRET: 'smoke-test-secret', ADMIN_PIN: TEST_ADMIN_PIN, AUTO_RELEASE_MS: '1000',
+      BOOKING_LIMIT_MAX: '1000', CANCEL_WINDOW_MS: '5000' };
+    const child2 = spawn('node', [path.join(__dirname, '..', 'server.js')], { env: env2, stdio: ['ignore', 'pipe', 'pipe'] });
+    let up2 = false;
+    for (let i = 0; i < 40; i++) { try { const rr = await fetch('http://127.0.0.1:3458/health'); if (rr.ok) { up2 = true; break; } } catch {} await sleep(250); }
+    check('second server (no monitor token) starts', up2);
+    if (up2) {
+      const rr = await fetch('http://127.0.0.1:3458/api/monitor/summary');
+      check('monitor unset -> 404 not_found', rr.status === 404, `got ${rr.status}`);
+    }
+    try { child2.kill('SIGTERM'); } catch {}
+    await sleep(500);
+    if (fs.existsSync(DATA2)) fs.unlinkSync(DATA2);
+    // 21h. CORS: app origins allowed, evil origin rejected.
+    r = await req('GET', '/api/bootstrap', { origin: 'http://localhost' });
+    check('CORS localhost origin allowed', r.status === 200 && r.acao === 'http://localhost', JSON.stringify(r.acao));
+    r = await req('GET', '/api/bootstrap', { origin: 'https://evil.example' });
+    check('CORS evil origin rejected (403)', r.status === 403, JSON.stringify(r.json)?.slice(0, 150));
+    // 21i. refresh reuse detection (M9): rotate, replay old -> 401,
+    // then the rotated token is dead too (whole family revoked).
+    const rl = await req('POST', '/api/auth/login-phone', { body: { phone: '01012345678' } });
+    const rt1 = rl.json?.refreshToken;
+    check('fresh login for refresh-reuse test', rl.status === 200 && !!rt1, JSON.stringify(rl.json)?.slice(0, 150));
+    r = await req('POST', '/api/auth/refresh', { body: { refreshToken: rt1 } });
+    check('refresh rotates to a new refresh token', r.status === 200 && !!r.json?.refreshToken && r.json.refreshToken !== rt1, JSON.stringify(r.json)?.slice(0, 150));
+    const rt2 = r.json?.refreshToken;
+    r = await req('POST', '/api/auth/refresh', { body: { refreshToken: rt1 } });
+    check('replay of rotated refresh token -> 401 (reuse)', r.status === 401, JSON.stringify(r.json));
+    r = await req('POST', '/api/auth/refresh', { body: { refreshToken: rt2 } });
+    check('rotated token rejected after reuse (family revoked)', r.status === 401, JSON.stringify(r.json));
+    // 21j. points snapshot + admin credentials (+5 each, verified only).
+    r = await req('GET', '/api/providers/me', { token: provToken });
+    check('provider me exposes points snapshot', r.status === 200 && typeof r.json?.points?.total === 'number' && typeof r.json?.points?.tier === 'string' && 'nextTier' in (r.json?.points || {}) && typeof r.json?.points?.weeklyDoubleActive === 'boolean', JSON.stringify(r.json?.points));
+    const ptsBefore = r.json?.points?.total;
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/credentials', { token: adminToken, body: { kind: 'certificate', name: 'BLS', verified: true } });
+    check('admin adds verified certificate -> 201, +5 points', r.status === 201 && r.json?.points?.certificates === 5, JSON.stringify(r.json?.points));
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/credentials', { token: adminToken, body: { kind: 'course', name: 'Wound Care', verified: false } });
+    check('admin adds unverified course -> 201, no points yet', r.status === 201 && r.json?.points?.courses === 0, JSON.stringify(r.json?.points));
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/credentials/0/verify?kind=course', { token: adminToken, body: { verified: true } });
+    check('admin verifies course -> +5 points, total +10 overall', r.status === 200 && r.json?.points?.courses === 5 && r.json?.points?.total === ptsBefore + 10, JSON.stringify(r.json?.points));
+    // 21k. stay bonus (not yet earned) + buddy (Elite only).
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/buddy', { token: adminToken, body: { buddyProviderId: 'prov_demo_starter' } });
+    check('buddy must be Elite -> 400 for Starter', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/admin/providers/prov_demo_pro/buddy', { token: adminToken, body: { buddyProviderId: asstProviderId } });
+    check('Elite assistant assigned as buddy -> 200', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', '/api/providers/wallet', { token: provToken });
+    check('wallet shows buddy + stay bonus 250 not yet earned', r.status === 200 && r.json?.buddy?.id === asstProviderId && !!r.json?.buddy?.name && r.json?.stayBonus?.amountEgp === 250 && r.json?.stayBonus?.earned === false && r.json?.stayBonus?.paid === false && typeof r.json?.daysSinceJoin === 'number', JSON.stringify({ buddy: r.json?.buddy, stayBonus: r.json?.stayBonus, daysSinceJoin: r.json?.daysSinceJoin }));
+    // 21l. settlements + export (backup mitigation).
+    r = await req('POST', '/api/jobs/sweep', { token: adminToken });
+    check('sweep runs for settlements', r.status === 200 && typeof r.json?.settlementsGenerated === 'number', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', '/api/admin/settlements', { token: adminToken });
+    check('admin settlements list has this-week records', r.status === 200 && Array.isArray(r.json?.settlements) && r.json.settlements.length >= 1 && r.json.settlements.every((x) => x.providerId && x.weekKey), JSON.stringify(r.json?.settlements?.slice(0, 1)));
+    r = await req('GET', `/api/admin/settlements?providerId=${phys.providerId}`, { token: adminToken });
+    check('settlements filter by provider (physio)', r.status === 200 && (r.json?.settlements || []).every((x) => x.providerId === phys.providerId) && r.json.count >= 1, JSON.stringify({ count: r.json?.count }));
+    r = await req('GET', '/api/admin/export', { token: adminToken });
+    check('admin export returns full data.json', r.status === 200 && r.json?.providers && r.json?.bookings && r.json?.providers['prov_demo_pro'], JSON.stringify(Object.keys(r.json || {})));
+    // 21n. explicit written consent for high-risk services (v2.1.1).
+    r = await bookStd('catheter_insert', { doctorOrder: order });
+    check('high-risk booking WITHOUT consentGiven -> 400 explicit_consent_required', r.status === 400 && r.json?.error === 'explicit_consent_required', JSON.stringify(r.json)?.slice(0, 200));
+    r = await bookStd('catheter_insert', { doctorOrder: order, consentGiven: true });
+    check('high-risk booking WITH consentGiven -> 201, consent stored', r.status === 201 && r.json?.consent?.given === true && r.json?.consent?.version === '1.0' && !!r.json?.consent?.at, JSON.stringify(r.json?.consent));
+    r = await bookStd('standard');
+    check('standard booking without consent -> 201, no consent object', r.status === 201 && r.json?.consent == null, JSON.stringify(r.json?.consent));
+    r = await req('POST', '/api/npwt/bookings', { token: patientToken2, body: { ...npwtBody, consentGiven: false, doctorOrder: order,
+      safetyChecklist: { foamCountConfirmed: true, bleedingChecked: true, canisterChecked: true, woundPhotoConfirmed: true } } });
+    check('NPWT booking WITHOUT consent -> 400 explicit_consent_required', r.status === 400 && r.json?.error === 'explicit_consent_required', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/npwt/bookings', { token: patientToken2, body: { ...npwtBody, doctorOrder: order,
+      safetyChecklist: { foamCountConfirmed: true, bleedingChecked: true, canisterChecked: true, woundPhotoConfirmed: true } } });
+    check('NPWT booking WITH consent -> 201, consent stored', r.status === 201 && r.json?.consent?.given === true && r.json?.consent?.version === '1.0', JSON.stringify(r.json?.consent));
+
+    // 21m. SOS cap: 5/day per booking, 6th -> 429.
+    r = await bookStd('standard');
+    check('SOS test booking created', r.status === 201, JSON.stringify(r.json)?.slice(0, 200));
+    const bkSos = r.json?.id;
+    r = await req('POST', `/api/bookings/${bkSos}/accept`, { token: provToken });
+    check('SOS test booking accepted', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
+    let sosOk = 0;
+    for (let i = 0; i < 5; i++) { const sr = await req('POST', `/api/bookings/${bkSos}/sos`, { token: provToken }); if (sr.status === 201) sosOk++; }
+    check('5 SOS alerts accepted in one day', sosOk === 5, `got ${sosOk}`);
+    r = await req('POST', `/api/bookings/${bkSos}/sos`, { token: provToken });
+    check('6th SOS same day -> 429', r.status === 429, JSON.stringify(r.json)?.slice(0, 200));
 
     // --- 14. logout / refresh revocation ---------------------------------
     console.log('\n[logout]');

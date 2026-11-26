@@ -11,6 +11,10 @@ const { store } = require('./store');
 function createApp() {
   const app = express();
   app.disable('x-powered-by');
+  // v2.1.1 (audit #14): behind Railway's proxy, req.ip must be the real
+  // client IP — otherwise every user shares one rate-limit bucket and
+  // audit IPs are wrong. Trust ONE proxy hop only.
+  app.set('trust proxy', 1);
 
   // Compatibility rewrites: the web frontend uses a few legacy path names.
   // They are rewritten to the canonical server paths BEFORE rate limiters
@@ -37,16 +41,22 @@ function createApp() {
   }));
   app.use(express.json({ limit: '200kb' }));
 
-  // CORS: configured allowlist from CORS_ORIGIN; a configured '*' (the
-  // Railway deployment sets CORS_ORIGIN=* on purpose) means any origin.
+  // CORS (audit #9): '*' NO LONGER means any origin. A configured '*'
+  // is treated as the app-origin set only (the Capacitor app origin is
+  // http://localhost) and logs a boot warning. Allowed: the configured
+  // list + http://localhost + capacitor://localhost + ionic://localhost.
+  const APP_ORIGINS = ['http://localhost', 'capacitor://localhost', 'ionic://localhost'];
+  if (config.corsOrigins.includes('*')) {
+    console.warn('[WARN] CORS_ORIGIN contains "*" — treated as the app-origin set only (http://localhost, capacitor://localhost, ionic://localhost), NOT any origin.');
+  }
   app.use(cors({
     origin(origin, cb) {
       if (!origin) return cb(null, true); // non-browser clients (curl, tests)
-      if (config.corsOrigins.includes('*') || config.corsOrigins.includes(origin)) return cb(null, true);
+      if (config.corsOrigins.includes(origin) || APP_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error('CORS origin not allowed'));
     },
-    methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Monitor-Token'],
   }));
 
   // Rate limits.
@@ -59,13 +69,24 @@ function createApp() {
   // BOOKING_LIMIT_MAX is test-only (smoke/integration raise it so one
   // run's many booking calls don't trip the limiter); production default 60.
   const bookingLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: Number(process.env.BOOKING_LIMIT_MAX) || 60, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many booking requests from this IP.' } });
+  const genericLimiter = (max, msg) => rateLimit({ windowMs: 15 * 60 * 1000, max, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: msg } });
   app.use('/api/otp/request', otpLimiter);
   app.use('/api/otp/verify', otpVerifyLimiter);
   app.use('/api/auth/login-phone', phoneLoginLimiter);
+  app.use('/api/auth/refresh', genericLimiter(30, 'Too many token refresh attempts from this IP.'));
+  app.use('/api/auth/logout', genericLimiter(30, 'Too many logout attempts from this IP.'));
   app.use('/api/admin/pin/verify', pinLimiter);
   app.use('/api/bookings', bookingLimiter);
   app.use('/api/tourist-bookings', bookingLimiter);
   app.use('/api/npwt/bookings', bookingLimiter);
+  // v2.1.1 (audit #27): limiters for the remaining sensitive endpoints.
+  app.use('/api/providers/register', genericLimiter(10, 'Too many provider registrations from this IP.'));
+  app.use('/api/providers/interview', genericLimiter(30, 'Too many interview requests from this IP.'));
+  app.use('/api/postop', genericLimiter(60, 'Too many post-op booking requests from this IP.'));
+  app.use('/api/npwt/calculate', genericLimiter(60, 'Too many NPWT calculations from this IP.'));
+  app.use('/api/monitor/summary', rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many monitor requests from this IP.' } }));
+  app.use('/api/medical-file-interest', rateLimit({ windowMs: 60 * 60 * 1000, max: 5, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many interest submissions from this IP.' } }));
+  app.use('/api/admin/export', genericLimiter(5, 'Too many export requests from this IP.'));
 
   app.get('/health', (req, res) => res.json({ ok: true, app: 'shifa-care', version: '1.0.0', city: 'El Quseir' }));
   // v2.1.0 — Postgres mode loads the document asynchronously; no /api
