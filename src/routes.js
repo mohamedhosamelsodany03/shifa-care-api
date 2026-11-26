@@ -4525,8 +4525,16 @@ router.get('/admin/dashboard', requireAdmin, (req, res) => {
     // v2.1.5 — broadcast audience: total registered FCM tokens, and how
     // many distinct phones have at least one device. No tokens or phone
     // numbers are ever returned.
+    // v2.1.10 — broadcastUsers used to count ONLY phones with a registered
+    // FCM device, so the tab showed 0/0 even when user accounts existed
+    // (the send audience is accounts + devices). It now counts the true
+    // audience — distinct phones with an account OR a device — the same
+    // number the broadcast dry-run reports as `users`. broadcastAccounts
+    // is the registered-account count, shown separately so the tab labels
+    // all three numbers honestly.
     broadcastDevices: Object.values(store.data.devices || {}).reduce((n, list) => n + (Array.isArray(list) ? list.length : 0), 0),
-    broadcastUsers: Object.values(store.data.devices || {}).filter((list) => Array.isArray(list) && list.length > 0).length,
+    broadcastAccounts: Object.keys(store.data.users || {}).length,
+    broadcastUsers: new Set([...Object.keys(store.data.users || {}), ...Object.keys(store.data.devices || {})]).size,
     // v2.1.6 — C8 anomaly flags (fake-visit farming signals) + C7
     // package bulk-review queue + C1 new-device logins. Phones are
     // shown here (admin-only endpoint) so the admin can act on them.

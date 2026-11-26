@@ -1801,7 +1801,7 @@ async function main() {
     check('broadcast dry-run writes NO audit entry', Array.isArray(r.json) && !r.json.some((a) => a.action === 'admin.broadcast') && !hadBcAuditBefore);
     // Dashboard carries the same audience counts.
     r = await req('GET', '/api/admin/dashboard', { token: adminToken });
-    check('dashboard has broadcastDevices/broadcastUsers matching dry-run', r.status === 200 && r.json?.broadcastDevices === dryDevices && r.json?.broadcastUsers >= 1, JSON.stringify({ broadcastDevices: r.json?.broadcastDevices, broadcastUsers: r.json?.broadcastUsers }));
+    check('dashboard has broadcastDevices/broadcastUsers/broadcastAccounts matching dry-run', r.status === 200 && r.json?.broadcastDevices === dryDevices && r.json?.broadcastUsers === dryUsers && typeof r.json?.broadcastAccounts === 'number' && r.json.broadcastAccounts >= 1, JSON.stringify({ broadcastDevices: r.json?.broadcastDevices, broadcastUsers: r.json?.broadcastUsers, broadcastAccounts: r.json?.broadcastAccounts }));
     // Real broadcast: every user gets an in-app 'broadcast' record;
     // pushStatus is 'not_configured' (no Firebase in the test env), so
     // sent is 0 and failed equals the audience size. No SMS ever fires.
@@ -2221,9 +2221,9 @@ async function main() {
       const ua = (obj) => run(`__out = updateAvailable(${JSON.stringify(obj)});`);
       check('§28 update: no latestApp -> no update', ua(null) === false);
       check('§28 update: code 0 / empty URL -> no update', ua({ code: 0, apkUrl: '' }) === false);
-      check('§28 update: same code -> no update', ua({ code: 21, apkUrl: 'https://x/app.apk' }) === false);
-      check('§28 update: newer code + URL -> update', ua({ code: 24, apkUrl: 'https://x/app.apk' }) === true);
-      check('§28 update: newer code but no URL -> no update', ua({ code: 24, apkUrl: '' }) === false);
+      check('§28 update: same code -> no update', ua({ code: 24, apkUrl: 'https://x/app.apk' }) === false);
+      check('§28 update: newer code + URL -> update', ua({ code: 25, apkUrl: 'https://x/app.apk' }) === true);
+      check('§28 update: newer code but no URL -> no update', ua({ code: 25, apkUrl: '' }) === false);
       const dc = (obj) => run(`__out = updateDialogConfig(${JSON.stringify(obj)});`);
       check('§28 update dialog: optional update can be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: false }).hideCancel === false);
       check('§28 update dialog: forced update cannot be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: true }).hideCancel === true);
@@ -2324,7 +2324,7 @@ async function main() {
     check('§28 terms page shows a prominent scroll-to-accept hint', webJs.includes('termsScrollMust') && webJs.includes('termsScrollHintBox'), 'no prominent terms hint');
     check('§28 last-screen restore is wired (save on navigate, restore at boot)', webJs.includes('saveLastScreen(hash)') && webJs.includes('restoreLastScreen'), 'last-screen restore not wired');
     check('§28 update checker runs after bootstrap on launch', webJs.includes('await loadBootstrap(); checkForAppUpdate();'), 'update check not wired');
-    check('§28 version header is v2.1.9 code 23', webJs.includes('v2.1.9, code 23'), 'header not bumped');
+    check('§28 version header is v2.1.10 code 24', webJs.includes('v2.1.10, code 24'), 'header not bumped');
   }
 
   // --- §29. v2.1.8: password-gated login + push de-automation + responsive layout ---
@@ -2427,14 +2427,19 @@ async function main() {
   {
     const webJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
     const noComments = webJs.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
-    check('§29 no automatic push registration remains (registerPushToken is gone)', !noComments.includes('registerPushToken'), 'registerPushToken still present');
     const clStart = webJs.indexOf('async function completeLogin');
     const clEnd = webJs.indexOf('\n}\n', clStart);
     const clBody = clStart !== -1 && clEnd !== -1 ? webJs.slice(clStart, clEnd) : '';
+    // v2.1.10: registerPushToken is back — but ONLY as the register half
+    // of the explicit-tap flow (called from requestPushPermission) and of
+    // the notifications-screen Settings fallback (syncPushRegistration,
+    // only when the permission is already granted). It must NEVER run
+    // from the login path: that was the 2.1.7 login kill.
+    check('§29 no automatic push registration on the login path (registerPushToken only via tap/sync)', noComments.includes('async function registerPushToken(push)') && !clBody.includes('registerPushToken'), 'registerPushToken on the login path');
     check('§29 completeLogin shows only the DOM explain card, no native push', clBody.includes('maybeShowPushExplainCard();') && !clBody.includes('getPushPlugin') && !clBody.includes('PushNotifications') && !clBody.includes('registerPushToken'), 'completeLogin still touches push');
-    check('§29 getPushPlugin is called only from requestPushPermission', (webJs.match(/getPushPlugin\(\)/g) || []).length === 2, `getPushPlugin() occurrences: ${(webJs.match(/getPushPlugin\(\)/g) || []).length}`);
-    check('§29 no silent permission check on the login path (checkPermissions gone)', !noComments.includes('checkPermissions'), 'checkPermissions still present');
-    check('§29 native push.register() lives only in requestPushPermission', (webJs.match(/push\.register\(\)/g) || []).length === 1 && webJs.includes('async function requestPushPermission()'), 'push.register() outside requestPushPermission');
+    check('§29 getPushPlugin is called only from requestPushPermission + syncPushRegistration', (webJs.match(/getPushPlugin\(\)/g) || []).length === 3, `getPushPlugin() occurrences: ${(webJs.match(/getPushPlugin\(\)/g) || []).length}`);
+    check('§29 no silent permission check on the login path (checkPermissions only via tap/sync)', !clBody.includes('checkPermissions'), 'checkPermissions on the login path');
+    check('§29 native push.register() lives only in registerPushToken (tap/sync call it)', (webJs.match(/push\.register\(\)/g) || []).length === 1 && webJs.includes('async function registerPushToken(push)'), 'push.register() outside registerPushToken');
     check('§29 explicit-tap entry points exist (card Allow + notifications button)', webJs.includes('await requestPushPermission();') && webJs.includes('requestPushPermission();'), 'explicit-tap entry missing');
     check('§29 death-step markers wrap every native push call', webJs.includes('setDeathStep("push:requestPermissions")') && webJs.includes('setDeathStep("push:register")') && webJs.includes('setDeathStep("push:addListener")') && webJs.includes('clearDeathStep()'), 'step markers missing');
     const ruStart = webJs.indexOf('async function refreshUnreadCount');
@@ -2484,8 +2489,8 @@ async function main() {
   // 29f. Version header + responsive layout (360–430px audit).
   {
     const webJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
-    check('§29 version header is v2.1.9 code 23', webJs.includes('v2.1.9, code 23'), 'header not bumped');
-    check('§29 APP_VERSION_CODE is 23 / NAME is 2.1.9', webJs.includes('const APP_VERSION_CODE = 23;') && webJs.includes('const APP_VERSION_NAME = "2.1.9";'), 'version constants not bumped');
+    check('§29 version header is v2.1.10 code 24', webJs.includes('v2.1.10, code 24'), 'header not bumped');
+    check('§29 APP_VERSION_CODE is 24 / NAME is 2.1.10', webJs.includes('const APP_VERSION_CODE = 24;') && webJs.includes('const APP_VERSION_NAME = "2.1.10";'), 'version constants not bumped');
     check('§29 footer shows the installed version in-app', webJs.includes('v${APP_VERSION_NAME} (${APP_VERSION_CODE})'), 'footer has no version');
     const css = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'style.css'), 'utf8');
     check('§29 CSS: no horizontal page scroll (overflow-x clip safety net)', css.includes('overflow-x: clip'), 'no overflow-x guard');
@@ -2578,7 +2583,7 @@ async function main() {
     check('§30 CSS: option-sheet field + list styles exist', css.includes('.app-select') && css.includes('.opt-item') && css.includes('.opt-search'), 'sheet styles missing');
     check('§30 CSS: large complaint rows exist', css.includes('.opt-list.opt-large .opt-item'), 'large-row styles missing');
     // 30e. Version header.
-    check('§30 version header is v2.1.9 code 23', webJs.includes('v2.1.9, code 23') && webJs.includes('const APP_VERSION_CODE = 23;') && webJs.includes('const APP_VERSION_NAME = "2.1.9";'), 'header not bumped');
+    check('§30 version header is v2.1.10 code 24', webJs.includes('v2.1.10, code 24') && webJs.includes('const APP_VERSION_CODE = 24;') && webJs.includes('const APP_VERSION_NAME = "2.1.10";'), 'header not bumped');
     // 30g. The v2.1.9 interview SyntaxError (found by the zero-defect
     // tap-through): three radios embedded JSON.stringify (double
     // quotes) inside a DOUBLE-quoted inline handler — the attribute
@@ -2611,6 +2616,88 @@ async function main() {
       check('§30 normalizeTimeValue accepts 4-digit HHMM', tt('1000') === '10:00', tt('1000'));
       check('§30 normalizeTimeValue rejects hour 25', tt('25:00') === '', tt('25:00'));
       check('§30 normalizeTimeValue rejects garbage', tt('noon') === '' && tt('') === '', tt('noon'));
+    }
+  }
+
+  // --- §31. v2.1.10: push crash fix (main-thread permission request) + broadcast counts ---
+  console.log('\n[§31 v2.1.10]');
+  {
+    const webJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
+    // 31a. Native patch: the stock PushNotifications plugin is patched
+    // in node_modules (see build/BUILD-STATUS.md §v2.1.10) — the permission
+    // request runs on the main thread and both native entry points guard
+    // against uncaught throwables. If a future npm reinstall wipes the
+    // patch, these checks fail the suite instead of shipping it silently.
+    const pluginPath = path.join(__dirname, '..', '..', 'android', 'node_modules', '@capacitor', 'push-notifications', 'android', 'src', 'main', 'java', 'com', 'capacitorjs', 'plugins', 'pushnotifications', 'PushNotificationsPlugin.java');
+    const pluginJava = fs.readFileSync(pluginPath, 'utf8');
+    check('§31 plugin requestPermissions runs on the main thread', pluginJava.includes('executeOnMainThread') && pluginJava.includes('requestPermissionForAlias(PUSH_NOTIFICATIONS, call, "permissionsCallback")'), 'main-thread patch missing');
+    check('§31 plugin requestPermissions guards uncaught throwables', pluginJava.includes('ShifaCare main-thread permission request failed'), 'requestPermissions guard marker missing');
+    check('§31 plugin register guards uncaught throwables', pluginJava.includes('ShifaCare push registration failed'), 'register guard marker missing');
+    check('§31 plugin register null-safe on token error', pluginJava.includes('ex != null ? ex.getLocalizedMessage() : "token fetch failed"'), 'null-safe sendError missing');
+    // 31b. JS: checkPermissions FIRST (pure read, no dialog) — the native
+    // dialog runs only when the status is "prompt"; granted goes straight
+    // to register(); denied shows the Settings hint.
+    const reqFn = webJs.slice(webJs.indexOf('async function requestPushPermission()'), webJs.indexOf('async function registerPushToken'));
+    check('§31 requestPushPermission checks permission before asking', reqFn.includes('push.checkPermissions()') && reqFn.indexOf('push.checkPermissions()') < reqFn.indexOf('push.requestPermissions()'), 'check-first order wrong');
+    check('§31 requestPushPermission skips the dialog when already granted', reqFn.includes('perm.receive === "granted"') && reqFn.includes('await registerPushToken(push)'), 'granted fast-path missing');
+    check('§31 requestPushPermission shows Settings hint when denied', reqFn.includes('perm.receive === "denied"') && reqFn.includes('showPushDeniedHint()'), 'denied hint missing');
+    check('§31 requestPushPermission returns early when already registered', reqFn.includes('pushRegistered()'), 'already-registered early return missing');
+    check('§31 registerPushToken + syncPushRegistration exist', webJs.includes('async function registerPushToken(push)') && webJs.includes('async function syncPushRegistration()'), 'push helpers missing');
+    check('§31 syncPushRegistration runs from the notifications screen only', webJs.slice(webJs.indexOf('async function loadNotifications()'), webJs.indexOf('async function loadNotifications()') + 600).includes('syncPushRegistration();'), 'sync not wired to loadNotifications');
+    check('§31 syncPushRegistration never runs from login', !webJs.slice(webJs.indexOf('async function completeLogin'), webJs.indexOf('async function completeLogin') + 2500).includes('syncPushRegistration') && !webJs.slice(webJs.indexOf('async function afterPasswordSet'), webJs.indexOf('async function afterPasswordSet') + 800).includes('syncPushRegistration'), 'sync leaked into the login path');
+    check('§31 registration listener marks + confirms only on server success', webJs.includes('markPushRegistered(); toast(t("pushEnabled"))'), 'registration confirm missing');
+    check('§31 pushRegistered flag key exists', webJs.includes('shifa_push_registered') && webJs.includes('function pushRegistered()') && webJs.includes('function markPushRegistered()'), 'push flag missing');
+    check('§31 pushEnabled i18n exists in both languages', webJs.includes('pushEnabled: "تم تفعيل إشعارات الهاتف."') && webJs.includes('pushEnabled: "Phone notifications enabled."'), 'pushEnabled i18n missing');
+    // 31c. Broadcast tab: accounts + devices + true audience, labelled.
+    check('§31 broadcast tab shows accounts/devices/audience', webJs.includes('broadcastAccounts') && webJs.includes('broadcastAudience') && webJs.includes('d.broadcastAccounts'), 'broadcast tab labels missing');
+    check('§31 broadcast i18n exists in both languages', webJs.includes('broadcastAccounts: "حسابات مسجلة"') && webJs.includes('broadcastAccounts: "Registered accounts"') && webJs.includes('broadcastAudience: "جمهور البث"') && webJs.includes('broadcastAudience: "Broadcast audience"'), 'broadcast i18n missing');
+    // 31d. Version bump.
+    check('§31 app.js header + APP_VERSION_NAME are 2.1.10 / code 24', webJs.includes('v2.1.10, code 24') && webJs.includes('const APP_VERSION_NAME = "2.1.10"'), 'version not bumped');
+    // 31e. Dashboard counts: the true audience equals the dry-run users
+    // count, and it always includes the registered accounts (the v2.1.9
+    // 0/0 bug: broadcastUsers counted only phones with an FCM device, so
+    // the tab showed 0 even when accounts existed).
+    const dry31 = await req('POST', '/api/admin/broadcast', { token: adminToken, body: { title: 'x', body: 'y', dryRun: true } });
+    r = await req('GET', '/api/admin/dashboard', { token: adminToken });
+    check('§31 dashboard broadcastUsers equals the true audience (dry-run users)', r.status === 200 && dry31.json?.users >= 1 && r.json?.broadcastUsers === dry31.json?.users && r.json?.broadcastDevices === dry31.json?.devices, JSON.stringify({ broadcastUsers: r.json?.broadcastUsers, broadcastAccounts: r.json?.broadcastAccounts, broadcastDevices: r.json?.broadcastDevices, dryUsers: dry31.json?.users }));
+    check('§31 dashboard audience always includes the registered accounts', r.status === 200 && typeof r.json?.broadcastAccounts === 'number' && r.json.broadcastAccounts >= 2 && r.json.broadcastUsers >= r.json.broadcastAccounts, JSON.stringify({ broadcastUsers: r.json?.broadcastUsers, broadcastAccounts: r.json?.broadcastAccounts }));
+    // 31f. Password show/hide (eye) toggle (owner request, v2.1.10):
+    // every password field in the app has an in-app eye button that flips
+    // the input type between password and text ONLY — no login/register
+    // logic touched, nothing stored, nothing logged.
+    const css31 = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'style.css'), 'utf8');
+    const pwIds = ['loginPassword', 'loginPasswordConfirm', 'setPassword', 'setPasswordConfirm', 'adminPinInput'];
+    check('§31 every password field is wrapped with an eye button (6 fields)', (webJs.match(/type="password"/g) || []).length === 6 && (webJs.match(/class="pw-wrap"/g) || []).length === 6, `password inputs: ${(webJs.match(/type="password"/g) || []).length}, wraps: ${(webJs.match(/class="pw-wrap"/g) || []).length}`);
+    check('§31 pwEye is wired for every password field id', pwIds.every((id) => webJs.includes(`pwEye("${id}")`)), 'a password field has no eye button');
+    check('§31 togglePw + pwEye helpers exist', webJs.includes('window.togglePw = function (inputId, btn)') && webJs.includes('function pwEye(id)'), 'eye helpers missing');
+    check('§31 togglePw only flips the type, never stores or logs the password', webJs.slice(webJs.indexOf('window.togglePw'), webJs.indexOf('function pwEye')).includes('el.type = show ? "text" : "password"') && !/localStorage|sessionStorage|console\.log|api\(/.test(webJs.slice(webJs.indexOf('window.togglePw'), webJs.indexOf('function pwEye'))), 'togglePw touches storage/logs');
+    check('§31 eye button is type=button with an aria-label (never submits)', webJs.includes('type="button" class="pw-eye"') && webJs.includes('aria-label="${t("pwShow")}"'), 'eye button markup wrong');
+    check('§31 pwShow/pwHide i18n exists in both languages', webJs.includes('pwShow: "إظهار كلمة المرور"') && webJs.includes('pwHide: "إخفاء كلمة المرور"') && webJs.includes('pwShow: "Show password"') && webJs.includes('pwHide: "Hide password"'), 'eye i18n missing');
+    check('§31 CSS: .pw-wrap + .pw-eye styles exist', css31.includes('.pw-wrap') && css31.includes('.pw-eye') && css31.includes('padding-inline-end: 44px'), 'eye styles missing');
+    // Functional: run the extracted toggle block in a vm with a fake
+    // input + button and flip it both ways.
+    const vm31 = require('vm');
+    const BEGIN31 = '/* v2.1.10 — password show/hide (eye) toggle (BEGIN';
+    const END31 = '/* v2.1.10 — password show/hide (eye) toggle (END) */';
+    const bi31 = webJs.indexOf(BEGIN31);
+    const ei31 = webJs.indexOf(END31, bi31);
+    check('§31 eye-toggle block is extractable from web/app.js', bi31 !== -1 && ei31 !== -1 && ei31 > bi31, `${bi31}/${ei31}`);
+    if (bi31 !== -1 && ei31 !== -1) {
+      const fakeInput = { type: 'password' };
+      const fakeBtn = { textContent: '👁', attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } };
+      const ctx31 = { document: { getElementById: (id) => (id === 'pw1' ? fakeInput : null) }, fakeBtn, console };
+      ctx31.window = ctx31;
+      vm31.createContext(ctx31);
+      vm31.runInContext('function t(k){ return k; }', ctx31);
+      vm31.runInContext(webJs.slice(bi31, ei31), ctx31);
+      vm31.runInContext('togglePw("pw1", fakeBtn);', ctx31);
+      check('§31 togglePw flips password -> text and swaps the icon', fakeInput.type === 'text' && fakeBtn.textContent === '🙈' && fakeBtn.attrs['aria-label'] === 'pwHide', `${fakeInput.type}/${fakeBtn.textContent}`);
+      vm31.runInContext('togglePw("pw1", fakeBtn);', ctx31);
+      check('§31 togglePw flips text -> password and swaps the icon back', fakeInput.type === 'password' && fakeBtn.textContent === '👁' && fakeBtn.attrs['aria-label'] === 'pwShow', `${fakeInput.type}/${fakeBtn.textContent}`);
+      const eyeHtml = vm31.runInContext('pwEye("loginPassword");', ctx31);
+      check('§31 pwEye renders an eye button wired to its field', typeof eyeHtml === 'string' && eyeHtml.includes('class="pw-eye"') && eyeHtml.includes("togglePw('loginPassword'") && eyeHtml.includes('👁'), String(eyeHtml).slice(0, 120));
+      vm31.runInContext('togglePw("missing-id", fakeBtn);', ctx31);
+      check('§31 togglePw with an unknown id does nothing (no throw)', fakeInput.type === 'password', fakeInput.type);
     }
   }
 
