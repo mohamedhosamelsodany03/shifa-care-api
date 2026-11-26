@@ -585,29 +585,31 @@ const LANGUAGE_TEST_QUESTIONS = 8;
 const LANGUAGE_TEST_PASS_MIN = 6;
 const LANGUAGE_TEST_MINUTES = 15;
 const LANGUAGE_TEST_RETAKE_DAYS = 7;
-const LANGUAGE_TEST_TOPICS = ['greeting', 'symptoms', 'procedure', 'allergies', 'aftercare', 'emergency', 'payment'];
+// v2.1.6 — topics must match the rotated bank (medication + postcare
+// replaced the old 'aftercare'; the bank is the authority).
+const LANGUAGE_TEST_TOPICS = ['greeting', 'symptoms', 'procedure', 'allergies', 'medication', 'postcare', 'emergency', 'payment'];
 const LANGUAGE_TESTS = {
   "en": [
     {
       "id": "en1",
       "topic": "greeting",
-      "text": "How do you greet a patient?",
+      "text": "A patient arrives at the door. What do you say first?",
       "options": [
         {
           "key": "a",
-          "text": "Hello, I am your nurse."
+          "text": "Good morning, please come in."
         },
         {
           "key": "b",
-          "text": "Go away."
+          "text": "Leave your bag outside and wait."
         },
         {
           "key": "c",
-          "text": "Be quiet."
+          "text": "I am very busy today."
         },
         {
           "key": "d",
-          "text": "Pay me now."
+          "text": "Why did you come here?"
         }
       ],
       "correct": "a"
@@ -615,361 +617,553 @@ const LANGUAGE_TESTS = {
     {
       "id": "en2",
       "topic": "symptoms",
-      "text": "The patient says: “I have a strong pain in my leg.” What does that mean?",
+      "text": "The patient says: “My head hurts a lot.” What is the problem?",
       "options": [
         {
           "key": "a",
-          "text": "He has strong pain in his leg."
+          "text": "His stomach hurts."
         },
         {
           "key": "b",
-          "text": "He is very happy."
+          "text": "He has a bad headache."
         },
         {
           "key": "c",
-          "text": "He is hungry."
+          "text": "He cannot sleep at all."
         },
         {
           "key": "d",
-          "text": "He wants to sleep."
+          "text": "His leg is broken."
         }
       ],
-      "correct": "a"
+      "correct": "b"
     },
     {
       "id": "en3",
       "topic": "procedure",
-      "text": "How do you explain a dressing change?",
+      "text": "Before you change a dressing, what do you tell the patient?",
       "options": [
         {
           "key": "a",
-          "text": "I will change your dressing now. It may hurt a little."
+          "text": "Close your eyes and sleep."
         },
         {
           "key": "b",
-          "text": "I am going home now."
+          "text": "You must pay first."
         },
         {
           "key": "c",
-          "text": "You must pay right now."
+          "text": "This may hurt a little, please stay still."
         },
         {
           "key": "d",
-          "text": "I do not know."
+          "text": "Go home now."
         }
       ],
-      "correct": "a"
+      "correct": "c"
     },
     {
       "id": "en4",
       "topic": "allergies",
-      "text": "How do you ask about allergies?",
+      "text": "What should you ask before you give a new medicine?",
       "options": [
         {
           "key": "a",
-          "text": "Are you allergic to any medicines?"
+          "text": "Do you like the colour?"
         },
         {
           "key": "b",
-          "text": "Do you like chocolate?"
-        },
-        {
-          "key": "c",
           "text": "Where do you live?"
         },
         {
+          "key": "c",
+          "text": "What is your job?"
+        },
+        {
           "key": "d",
-          "text": "How old are you?"
+          "text": "Are you allergic to any medicine?"
         }
       ],
-      "correct": "a"
+      "correct": "d"
     },
     {
       "id": "en5",
-      "topic": "aftercare",
-      "text": "What do you say after a dressing change?",
+      "topic": "medication",
+      "text": "The patient asks: “How many tablets do I take?” What do you answer?",
       "options": [
         {
           "key": "a",
-          "text": "Keep the dressing dry and call us if you have a fever."
+          "text": "Take one tablet after breakfast."
         },
         {
           "key": "b",
-          "text": "Go swimming."
+          "text": "Take all the tablets now."
         },
         {
           "key": "c",
-          "text": "Do not eat anything more."
+          "text": "Stop taking them today."
         },
         {
           "key": "d",
-          "text": "Never sleep again."
+          "text": "Give the tablets to someone else."
         }
       ],
       "correct": "a"
     },
     {
       "id": "en6",
-      "topic": "emergency",
-      "text": "The patient suddenly cannot breathe. What do you say?",
+      "topic": "postcare",
+      "text": "After the visit, what do you tell the patient about the wound?",
       "options": [
         {
           "key": "a",
-          "text": "Stay calm, I am calling an ambulance right now."
+          "text": "Wash it with dirty water."
         },
         {
           "key": "b",
-          "text": "Wait until tomorrow."
+          "text": "Keep it clean and dry, and call us if it gets worse."
         },
         {
           "key": "c",
-          "text": "Drink water and go."
+          "text": "Touch it with your hands often."
         },
         {
           "key": "d",
-          "text": "That is not important."
+          "text": "Cover it with a wet cloth."
         }
       ],
-      "correct": "a"
+      "correct": "b"
     },
     {
       "id": "en7",
-      "topic": "payment",
-      "text": "How do you confirm payment and consent?",
+      "topic": "emergency",
+      "text": "The patient suddenly cannot breathe. What do you say first?",
       "options": [
         {
           "key": "a",
-          "text": "The treatment costs 30 euros. Do you agree?"
+          "text": "Please wait outside."
         },
         {
           "key": "b",
-          "text": "I will take your money."
+          "text": "Drink some water and rest."
         },
         {
           "key": "c",
-          "text": "Sign here without reading."
+          "text": "Stay calm, I am calling an ambulance now."
         },
         {
           "key": "d",
-          "text": "Pay later, maybe."
+          "text": "Come back tomorrow."
+        }
+      ],
+      "correct": "c"
+    },
+    {
+      "id": "en8",
+      "topic": "payment",
+      "text": "The visit costs 300 pounds. How do you confirm the payment?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Pay me later, maybe."
+        },
+        {
+          "key": "b",
+          "text": "The price is a secret."
+        },
+        {
+          "key": "c",
+          "text": "You do not need to pay."
+        },
+        {
+          "key": "d",
+          "text": "The visit is 300 pounds, please pay now."
+        }
+      ],
+      "correct": "d"
+    },
+    {
+      "id": "en9",
+      "topic": "greeting",
+      "text": "How do you introduce yourself to a new patient?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Hello, my name is Sara, I am your nurse."
+        },
+        {
+          "key": "b",
+          "text": "I do not like new patients."
+        },
+        {
+          "key": "c",
+          "text": "Hurry up, please."
+        },
+        {
+          "key": "d",
+          "text": "I am going home now."
         }
       ],
       "correct": "a"
     },
     {
-      "id": "en8",
+      "id": "en10",
       "topic": "symptoms",
-      "text": "The patient says: “I feel dizzy.” What does that mean?",
+      "text": "The patient says: “I feel sick and I want to vomit.” What does that mean?",
       "options": [
         {
           "key": "a",
-          "text": "He feels dizzy."
+          "text": "He is very hungry."
         },
         {
           "key": "b",
-          "text": "He is hungry."
+          "text": "He feels nauseous and may vomit."
         },
         {
           "key": "c",
-          "text": "He is very tired."
+          "text": "He has a broken arm."
         },
         {
           "key": "d",
-          "text": "He is happy."
+          "text": "He wants to go for a walk."
         }
       ],
-      "correct": "a"
+      "correct": "b"
+    },
+    {
+      "id": "en11",
+      "topic": "procedure",
+      "text": "You need to take a blood sample. What do you explain?",
+      "options": [
+        {
+          "key": "a",
+          "text": "You must run fast first."
+        },
+        {
+          "key": "b",
+          "text": "Do not eat for a week."
+        },
+        {
+          "key": "c",
+          "text": "I will take a small blood sample from your arm."
+        },
+        {
+          "key": "d",
+          "text": "The test is not important."
+        }
+      ],
+      "correct": "c"
+    },
+    {
+      "id": "en12",
+      "topic": "medication",
+      "text": "The patient says: “I forgot my morning medicine.” What do you tell him?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Take three doses at once."
+        },
+        {
+          "key": "b",
+          "text": "Never take it again."
+        },
+        {
+          "key": "c",
+          "text": "Give it to your friend."
+        },
+        {
+          "key": "d",
+          "text": "Take it now, and do not double the next dose."
+        }
+      ],
+      "correct": "d"
     }
   ],
   "de": [
     {
       "id": "de1",
       "topic": "greeting",
-      "text": "Wie begrüßen Sie einen Patienten?",
+      "text": "Ein Patient kommt an die Tür. Was sagen Sie zuerst?",
       "options": [
         {
           "key": "a",
-          "text": "Guten Tag, ich bin Ihre Krankenschwester / Ihr Krankenpfleger."
-        },
-        {
-          "key": "b",
           "text": "Gehen Sie weg."
         },
         {
+          "key": "b",
+          "text": "Guten Morgen, bitte kommen Sie herein."
+        },
+        {
           "key": "c",
-          "text": "Seien Sie still."
+          "text": "Ich habe keine Zeit."
         },
         {
           "key": "d",
-          "text": "Bezahlen Sie sofort."
+          "text": "Warum sind Sie hier?"
         }
       ],
-      "correct": "a"
+      "correct": "b"
     },
     {
       "id": "de2",
       "topic": "symptoms",
-      "text": "Der Patient sagt: „Ich habe starke Schmerzen im Bein.“ Was bedeutet das?",
+      "text": "Der Patient sagt: „Mein Bauch tut sehr weh.“ Was bedeutet das?",
       "options": [
         {
           "key": "a",
-          "text": "Er hat starke Schmerzen im Bein."
-        },
-        {
-          "key": "b",
-          "text": "Er ist sehr glücklich."
-        },
-        {
-          "key": "c",
           "text": "Er hat Hunger."
         },
         {
+          "key": "b",
+          "text": "Er ist sehr müde."
+        },
+        {
+          "key": "c",
+          "text": "Er hat starke Bauchschmerzen."
+        },
+        {
           "key": "d",
-          "text": "Er will schlafen."
+          "text": "Er freut sich."
         }
       ],
-      "correct": "a"
+      "correct": "c"
     },
     {
       "id": "de3",
       "topic": "procedure",
-      "text": "Wie erklären Sie einen Verbandswechsel?",
+      "text": "Bevor Sie einen Verband wechseln, was sagen Sie dem Patienten?",
       "options": [
         {
           "key": "a",
-          "text": "Ich wechsle jetzt Ihren Verband. Das kann kurz weh tun."
+          "text": "Schlafen Sie jetzt."
         },
         {
           "key": "b",
-          "text": "Ich gehe jetzt nach Hause."
+          "text": "Bezahlen Sie zuerst."
         },
         {
           "key": "c",
-          "text": "Sie müssen sofort bezahlen."
+          "text": "Gehen Sie nach Hause."
         },
         {
           "key": "d",
-          "text": "Ich weiß es nicht."
+          "text": "Das kann ein bisschen wehtun, bitte bleiben Sie ruhig liegen."
         }
       ],
-      "correct": "a"
+      "correct": "d"
     },
     {
       "id": "de4",
       "topic": "allergies",
-      "text": "Wie fragen Sie nach Allergien?",
+      "text": "Was fragen Sie, bevor Sie ein neues Medikament geben?",
       "options": [
         {
           "key": "a",
-          "text": "Haben Sie Allergien gegen Medikamente?"
+          "text": "Sind Sie gegen ein Medikament allergisch?"
         },
         {
           "key": "b",
-          "text": "Mögen Sie Schokolade?"
-        },
-        {
-          "key": "c",
           "text": "Wo wohnen Sie?"
         },
         {
+          "key": "c",
+          "text": "Was ist Ihr Beruf?"
+        },
+        {
           "key": "d",
-          "text": "Wie alt sind Sie?"
+          "text": "Mögen Sie die Farbe?"
         }
       ],
       "correct": "a"
     },
     {
       "id": "de5",
-      "topic": "aftercare",
-      "text": "Was sagen Sie nach dem Verbandswechsel?",
+      "topic": "medication",
+      "text": "Der Patient fragt: „Wie viele Tabletten nehme ich?“ Was antworten Sie?",
       "options": [
         {
           "key": "a",
-          "text": "Halten Sie den Verband trocken und rufen Sie uns bei Fieber an."
+          "text": "Nehmen Sie alle Tabletten jetzt."
         },
         {
           "key": "b",
-          "text": "Gehen Sie schwimmen."
+          "text": "Nehmen Sie eine Tablette nach dem Frühstück."
         },
         {
           "key": "c",
-          "text": "Essen Sie nichts mehr."
+          "text": "Nehmen Sie keine Tabletten mehr."
         },
         {
           "key": "d",
-          "text": "Schlafen Sie nie wieder."
+          "text": "Geben Sie die Tabletten jemand anderem."
         }
       ],
-      "correct": "a"
+      "correct": "b"
     },
     {
       "id": "de6",
-      "topic": "emergency",
-      "text": "Der Patient hat plötzlich Atemnot. Was sagen Sie?",
+      "topic": "postcare",
+      "text": "Nach dem Besuch, was sagen Sie dem Patienten über die Wunde?",
       "options": [
         {
           "key": "a",
-          "text": "Bleiben Sie ruhig, ich rufe sofort den Notarzt."
+          "text": "Waschen Sie sie mit schmutzigem Wasser."
         },
         {
           "key": "b",
-          "text": "Warten Sie bis morgen."
+          "text": "Berühren Sie sie oft mit den Händen."
         },
         {
           "key": "c",
-          "text": "Trinken Sie Wasser und gehen Sie."
+          "text": "Halten Sie sie sauber und trocken, und rufen Sie uns, wenn sie schlimmer wird."
         },
         {
           "key": "d",
-          "text": "Das ist nicht wichtig."
+          "text": "Decken Sie sie mit einem nassen Tuch ab."
         }
       ],
-      "correct": "a"
+      "correct": "c"
     },
     {
       "id": "de7",
-      "topic": "payment",
-      "text": "Wie bestätigen Sie die Zahlung und die Einwilligung?",
+      "topic": "emergency",
+      "text": "Der Patient kann plötzlich nicht atmen. Was sagen Sie zuerst?",
       "options": [
         {
           "key": "a",
-          "text": "Die Behandlung kostet 30 Euro. Sind Sie einverstanden?"
+          "text": "Bitte warten Sie draußen."
         },
         {
           "key": "b",
-          "text": "Ich nehme Ihr Geld."
+          "text": "Trinken Sie Wasser und ruhen Sie sich aus."
         },
         {
           "key": "c",
-          "text": "Unterschreiben Sie hier, ohne zu lesen."
+          "text": "Kommen Sie morgen wieder."
         },
         {
           "key": "d",
+          "text": "Bleiben Sie ruhig, ich rufe jetzt einen Krankenwagen."
+        }
+      ],
+      "correct": "d"
+    },
+    {
+      "id": "de8",
+      "topic": "payment",
+      "text": "Der Besuch kostet 300 Pfund. Wie bestätigen Sie die Zahlung?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Der Besuch kostet 300 Pfund, bitte zahlen Sie jetzt."
+        },
+        {
+          "key": "b",
           "text": "Bezahlen Sie später, vielleicht."
+        },
+        {
+          "key": "c",
+          "text": "Der Preis ist ein Geheimnis."
+        },
+        {
+          "key": "d",
+          "text": "Sie müssen nicht zahlen."
         }
       ],
       "correct": "a"
     },
     {
-      "id": "de8",
-      "topic": "symptoms",
-      "text": "Der Patient sagt: „Mir ist schwindelig.“ Was bedeutet das?",
+      "id": "de9",
+      "topic": "greeting",
+      "text": "Wie stellen Sie sich einem neuen Patienten vor?",
       "options": [
         {
           "key": "a",
-          "text": "Ihm ist schwindlig."
+          "text": "Ich mag keine neuen Patienten."
         },
         {
           "key": "b",
-          "text": "Er hat Hunger."
+          "text": "Hallo, ich heiße Sara, ich bin Ihre Krankenschwester."
         },
         {
           "key": "c",
-          "text": "Er ist sehr müde."
+          "text": "Beeilen Sie sich, bitte."
         },
         {
           "key": "d",
-          "text": "Er freut sich."
+          "text": "Ich gehe jetzt nach Hause."
+        }
+      ],
+      "correct": "b"
+    },
+    {
+      "id": "de10",
+      "topic": "symptoms",
+      "text": "Der Patient sagt: „Mir ist übel und ich muss mich übergeben.“ Was bedeutet das?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Er hat einen gebrochenen Arm."
+        },
+        {
+          "key": "b",
+          "text": "Er hat großen Hunger."
+        },
+        {
+          "key": "c",
+          "text": "Ihm ist übel und er muss sich vielleicht übergeben."
+        },
+        {
+          "key": "d",
+          "text": "Er möchte spazieren gehen."
+        }
+      ],
+      "correct": "c"
+    },
+    {
+      "id": "de11",
+      "topic": "procedure",
+      "text": "Sie müssen eine Blutprobe nehmen. Was erklären Sie?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Sie müssen zuerst schnell laufen."
+        },
+        {
+          "key": "b",
+          "text": "Essen Sie eine Woche lang nichts."
+        },
+        {
+          "key": "c",
+          "text": "Der Test ist nicht wichtig."
+        },
+        {
+          "key": "d",
+          "text": "Ich nehme eine kleine Blutprobe aus Ihrem Arm."
+        }
+      ],
+      "correct": "d"
+    },
+    {
+      "id": "de12",
+      "topic": "medication",
+      "text": "Der Patient sagt: „Ich habe mein Medikament am Morgen vergessen.“ Was sagen Sie ihm?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Nehmen Sie es jetzt, und verdoppeln Sie die nächste Dosis nicht."
+        },
+        {
+          "key": "b",
+          "text": "Nehmen Sie drei Dosen auf einmal."
+        },
+        {
+          "key": "c",
+          "text": "Nehmen Sie es nie wieder."
+        },
+        {
+          "key": "d",
+          "text": "Geben Sie es Ihrem Freund."
         }
       ],
       "correct": "a"
@@ -979,71 +1173,71 @@ const LANGUAGE_TESTS = {
     {
       "id": "ru1",
       "topic": "greeting",
-      "text": "Как вы поздороваетесь с пациентом?",
+      "text": "Пациент пришёл к двери. Что вы скажете сначала?",
       "options": [
         {
           "key": "a",
-          "text": "Здравствуйте, я ваша медсестра / ваш медбрат."
-        },
-        {
-          "key": "b",
           "text": "Уходите."
         },
         {
+          "key": "b",
+          "text": "У меня нет времени."
+        },
+        {
           "key": "c",
-          "text": "Молчите."
+          "text": "Доброе утро, пожалуйста, проходите."
         },
         {
           "key": "d",
-          "text": "Платите сейчас."
+          "text": "Зачем вы пришли?"
         }
       ],
-      "correct": "a"
+      "correct": "c"
     },
     {
       "id": "ru2",
       "topic": "symptoms",
-      "text": "Пациент говорит: «У меня сильно болит нога». Что это значит?",
+      "text": "Пациент говорит: «У меня сильно болит голова». Что это значит?",
       "options": [
         {
           "key": "a",
-          "text": "У него сильно болит нога."
+          "text": "У него болит живот."
         },
         {
           "key": "b",
-          "text": "Он очень счастлив."
+          "text": "Он очень голоден."
         },
         {
           "key": "c",
-          "text": "Он хочет есть."
+          "text": "Он хочет спать."
         },
         {
           "key": "d",
-          "text": "Он хочет спать."
+          "text": "У него сильная головная боль."
         }
       ],
-      "correct": "a"
+      "correct": "d"
     },
     {
       "id": "ru3",
       "topic": "procedure",
-      "text": "Как объяснить перевязку?",
+      "text": "Перед сменой повязки что вы скажете пациенту?",
       "options": [
         {
           "key": "a",
-          "text": "Сейчас я сменю вам повязку. Это может немного болеть."
+          "text": "Это может немного болеть, пожалуйста, лежите спокойно."
         },
         {
           "key": "b",
-          "text": "Я сейчас ухожу домой."
+          "text": "Закройте глаза и спите."
         },
         {
           "key": "c",
-          "text": "Платите немедленно."
+          "text": "Сначала заплатите."
         },
         {
           "key": "d",
-          "text": "Я не знаю."
+          "text": "Идите домой."
         }
       ],
       "correct": "a"
@@ -1051,153 +1245,249 @@ const LANGUAGE_TESTS = {
     {
       "id": "ru4",
       "topic": "allergies",
-      "text": "Как спросить об аллергии?",
+      "text": "Что вы спросите, прежде чем дать новое лекарство?",
       "options": [
         {
           "key": "a",
-          "text": "У вас есть аллергия на лекарства?"
-        },
-        {
-          "key": "b",
-          "text": "Вы любите шоколад?"
-        },
-        {
-          "key": "c",
           "text": "Где вы живёте?"
         },
         {
+          "key": "b",
+          "text": "Есть ли у вас аллергия на лекарства?"
+        },
+        {
+          "key": "c",
+          "text": "Какая у вас работа?"
+        },
+        {
           "key": "d",
-          "text": "Сколько вам лет?"
+          "text": "Вам нравится этот цвет?"
         }
       ],
-      "correct": "a"
+      "correct": "b"
     },
     {
       "id": "ru5",
-      "topic": "aftercare",
-      "text": "Что сказать после перевязки?",
+      "topic": "medication",
+      "text": "Пациент спрашивает: «Сколько таблеток мне принимать?» Что вы ответите?",
       "options": [
         {
           "key": "a",
-          "text": "Держите повязку сухой и позвоните нам при температуре."
+          "text": "Примите все таблетки сразу."
         },
         {
           "key": "b",
-          "text": "Идите плавать."
+          "text": "Больше не принимайте их."
         },
         {
           "key": "c",
-          "text": "Больше ничего не ешьте."
+          "text": "Принимайте одну таблетку после завтрака."
         },
         {
           "key": "d",
-          "text": "Больше не спите."
+          "text": "Отдайте таблетки другому человеку."
         }
       ],
-      "correct": "a"
+      "correct": "c"
     },
     {
       "id": "ru6",
-      "topic": "emergency",
-      "text": "У пациента внезапно одышка. Что вы скажете?",
+      "topic": "postcare",
+      "text": "После визита что вы скажете пациенту о ране?",
       "options": [
         {
           "key": "a",
-          "text": "Спокойно, я сейчас вызову скорую помощь."
+          "text": "Мойте её грязной водой."
         },
         {
           "key": "b",
-          "text": "Подождите до завтра."
+          "text": "Трогайте её руками почаще."
         },
         {
           "key": "c",
-          "text": "Выпейте воды и идите."
+          "text": "Накройте её мокрой тканью."
         },
         {
           "key": "d",
-          "text": "Это неважно."
+          "text": "Держите её чистой и сухой и позвоните нам, если станет хуже."
         }
       ],
-      "correct": "a"
+      "correct": "d"
     },
     {
       "id": "ru7",
-      "topic": "payment",
-      "text": "Как подтвердить оплату и согласие?",
+      "topic": "emergency",
+      "text": "Пациент вдруг не может дышать. Что вы скажете сначала?",
       "options": [
         {
           "key": "a",
-          "text": "Лечение стоит 30 евро. Вы согласны?"
+          "text": "Сохраняйте спокойствие, я сейчас вызываю скорую помощь."
         },
         {
           "key": "b",
-          "text": "Я заберу ваши деньги."
+          "text": "Подождите снаружи."
         },
         {
           "key": "c",
-          "text": "Подпишите здесь, не читая."
+          "text": "Выпейте воды и отдохните."
         },
         {
           "key": "d",
-          "text": "Заплатите потом, может быть."
+          "text": "Приходите завтра."
         }
       ],
       "correct": "a"
     },
     {
       "id": "ru8",
-      "topic": "symptoms",
-      "text": "Пациент говорит: «У меня кружится голова». Что это значит?",
+      "topic": "payment",
+      "text": "Визит стоит 300 фунтов. Как вы подтвердите оплату?",
       "options": [
         {
           "key": "a",
-          "text": "У него кружится голова."
+          "text": "Заплатите позже, может быть."
         },
         {
           "key": "b",
-          "text": "Он хочет есть."
+          "text": "Визит стоит 300 фунтов, пожалуйста, заплатите сейчас."
         },
         {
           "key": "c",
-          "text": "Он очень устал."
+          "text": "Цена — это секрет."
         },
         {
           "key": "d",
-          "text": "Он радуется."
+          "text": "Вам не нужно платить."
+        }
+      ],
+      "correct": "b"
+    },
+    {
+      "id": "ru9",
+      "topic": "greeting",
+      "text": "Как вы представитесь новому пациенту?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Я не люблю новых пациентов."
+        },
+        {
+          "key": "b",
+          "text": "Поторопитесь, пожалуйста."
+        },
+        {
+          "key": "c",
+          "text": "Здравствуйте, меня зовут Сара, я ваша медсестра."
+        },
+        {
+          "key": "d",
+          "text": "Я сейчас ухожу домой."
+        }
+      ],
+      "correct": "c"
+    },
+    {
+      "id": "ru10",
+      "topic": "symptoms",
+      "text": "Пациент говорит: «Меня тошнит». Что это значит?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Он очень голоден."
+        },
+        {
+          "key": "b",
+          "text": "У него сломана рука."
+        },
+        {
+          "key": "c",
+          "text": "Он хочет гулять."
+        },
+        {
+          "key": "d",
+          "text": "Его тошнит, и его может вырвать."
+        }
+      ],
+      "correct": "d"
+    },
+    {
+      "id": "ru11",
+      "topic": "procedure",
+      "text": "Вам нужно взять анализ крови. Что вы объясните?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Я возьму немного крови из вашей руки."
+        },
+        {
+          "key": "b",
+          "text": "Сначала быстро побегайте."
+        },
+        {
+          "key": "c",
+          "text": "Не ешьте целую неделю."
+        },
+        {
+          "key": "d",
+          "text": "Этот анализ не важен."
         }
       ],
       "correct": "a"
+    },
+    {
+      "id": "ru12",
+      "topic": "medication",
+      "text": "Пациент говорит: «Я забыл принять утреннее лекарство». Что вы ему скажете?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Примите три дозы сразу."
+        },
+        {
+          "key": "b",
+          "text": "Примите его сейчас и не удваивайте следующую дозу."
+        },
+        {
+          "key": "c",
+          "text": "Больше никогда его не принимайте."
+        },
+        {
+          "key": "d",
+          "text": "Отдайте его другу."
+        }
+      ],
+      "correct": "b"
     }
   ],
   "pl": [
     {
       "id": "pl1",
       "topic": "greeting",
-      "text": "Jak przywitasz pacjenta?",
+      "text": "Pacjent stoi w drzwiach. Co mówisz najpierw?",
       "options": [
         {
           "key": "a",
-          "text": "Dzień dobry, jestem twoją pielęgniarką / twoim pielęgniarzem."
-        },
-        {
-          "key": "b",
           "text": "Idź sobie."
         },
         {
+          "key": "b",
+          "text": "Nie mam czasu."
+        },
+        {
           "key": "c",
-          "text": "Bądź cicho."
+          "text": "Po co tu przyszedłeś?"
         },
         {
           "key": "d",
-          "text": "Zapłać teraz."
+          "text": "Dzień dobry, proszę wejść."
         }
       ],
-      "correct": "a"
+      "correct": "d"
     },
     {
       "id": "pl2",
       "topic": "symptoms",
-      "text": "Pacjent mówi: „Bardzo boli mnie noga”. Co to znaczy?",
+      "text": "Pacjent mówi: „Bardzo boli mnie noga“. Co to znaczy?",
       "options": [
         {
           "key": "a",
@@ -1209,11 +1499,11 @@ const LANGUAGE_TESTS = {
         },
         {
           "key": "c",
-          "text": "Jest głodny."
+          "text": "Jest bardzo głodny."
         },
         {
           "key": "d",
-          "text": "Chce spać."
+          "text": "Chce iść na spacer."
         }
       ],
       "correct": "a"
@@ -1221,157 +1511,253 @@ const LANGUAGE_TESTS = {
     {
       "id": "pl3",
       "topic": "procedure",
-      "text": "Jak wyjaśnisz zmianę opatrunku?",
+      "text": "Zanim zmienisz opatrunek, co mówisz pacjentowi?",
       "options": [
         {
           "key": "a",
-          "text": "Teraz zmienię opatrunek. To może chwilę boleć."
+          "text": "Zamknij oczy i śpij."
         },
         {
           "key": "b",
-          "text": "Teraz idę do domu."
+          "text": "To może trochę boleć, proszę leżeć spokojnie."
         },
         {
           "key": "c",
-          "text": "Musisz zapłacić natychmiast."
+          "text": "Zapłać najpierw."
         },
         {
           "key": "d",
-          "text": "Nie wiem."
+          "text": "Idź do domu."
         }
       ],
-      "correct": "a"
+      "correct": "b"
     },
     {
       "id": "pl4",
       "topic": "allergies",
-      "text": "Jak zapytasz o alergie?",
+      "text": "O co pytasz, zanim podasz nowy lek?",
       "options": [
         {
           "key": "a",
-          "text": "Czy ma Pan/Pani alergię na leki?"
-        },
-        {
-          "key": "b",
-          "text": "Czy lubisz czekoladę?"
-        },
-        {
-          "key": "c",
           "text": "Gdzie mieszkasz?"
         },
         {
+          "key": "b",
+          "text": "Jaki jest twój zawód?"
+        },
+        {
+          "key": "c",
+          "text": "Czy masz uczulenie na jakieś leki?"
+        },
+        {
           "key": "d",
-          "text": "Ile masz lat?"
+          "text": "Czy podoba ci się ten kolor?"
         }
       ],
-      "correct": "a"
+      "correct": "c"
     },
     {
       "id": "pl5",
-      "topic": "aftercare",
-      "text": "Co powiesz po zmianie opatrunku?",
+      "topic": "medication",
+      "text": "Pacjent pyta: „Ile tabletek mam brać?“ Co odpowiadasz?",
       "options": [
         {
           "key": "a",
-          "text": "Trzymaj opatrunek suchy i zadzwoń do nas, jeśli masz gorączkę."
+          "text": "Weź wszystkie tabletki naraz."
         },
         {
           "key": "b",
-          "text": "Idź popływać."
+          "text": "Nie bierz ich więcej."
         },
         {
           "key": "c",
-          "text": "Nic więcej nie jedz."
+          "text": "Daj tabletki komuś innemu."
         },
         {
           "key": "d",
-          "text": "Nigdy więcej nie śpij."
+          "text": "Bierz jedną tabletkę po śniadaniu."
         }
       ],
-      "correct": "a"
+      "correct": "d"
     },
     {
       "id": "pl6",
-      "topic": "emergency",
-      "text": "Pacjent nagle ma duszności. Co powiesz?",
+      "topic": "postcare",
+      "text": "Po wizycie, co mówisz pacjentowi o ranie?",
       "options": [
         {
           "key": "a",
-          "text": "Proszę się uspokoić, wzywam natychmiast pogotowie."
+          "text": "Trzymaj ją czystą i suchą, i zadzwoń do nas, jeśli będzie gorzej."
         },
         {
           "key": "b",
-          "text": "Poczekaj do jutra."
+          "text": "Myj ją brudną wodą."
         },
         {
           "key": "c",
-          "text": "Napij się wody i idź."
+          "text": "Dotykaj jej często rękami."
         },
         {
           "key": "d",
-          "text": "To nieważne."
+          "text": "Przykryj ją mokrą szmatką."
         }
       ],
       "correct": "a"
     },
     {
       "id": "pl7",
-      "topic": "payment",
-      "text": "Jak potwierdzisz płatność i zgodę?",
+      "topic": "emergency",
+      "text": "Pacjent nagle nie może oddychać. Co mówisz najpierw?",
       "options": [
         {
           "key": "a",
-          "text": "Leczenie kosztuje 30 euro. Czy się zgadzasz?"
+          "text": "Proszę poczekać na zewnątrz."
         },
         {
           "key": "b",
-          "text": "Wezmę twoje pieniądze."
+          "text": "Zachowaj spokój, dzwonię teraz po karetkę."
         },
         {
           "key": "c",
-          "text": "Podpisz tutaj bez czytania."
+          "text": "Napij się wody i odpocznij."
         },
         {
           "key": "d",
+          "text": "Przyjdź jutro."
+        }
+      ],
+      "correct": "b"
+    },
+    {
+      "id": "pl8",
+      "topic": "payment",
+      "text": "Wizyta kosztuje 300 funtów. Jak potwierdzasz płatność?",
+      "options": [
+        {
+          "key": "a",
           "text": "Zapłać później, może."
+        },
+        {
+          "key": "b",
+          "text": "Cena to tajemnica."
+        },
+        {
+          "key": "c",
+          "text": "Wizyta kosztuje 300 funtów, proszę zapłacić teraz."
+        },
+        {
+          "key": "d",
+          "text": "Nie musisz płacić."
+        }
+      ],
+      "correct": "c"
+    },
+    {
+      "id": "pl9",
+      "topic": "greeting",
+      "text": "Jak przedstawiasz się nowemu pacjentowi?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Nie lubię nowych pacjentów."
+        },
+        {
+          "key": "b",
+          "text": "Pospiesz się, proszę."
+        },
+        {
+          "key": "c",
+          "text": "Idę teraz do domu."
+        },
+        {
+          "key": "d",
+          "text": "Dzień dobry, nazywam się Sara, jestem twoją pielęgniarką."
+        }
+      ],
+      "correct": "d"
+    },
+    {
+      "id": "pl10",
+      "topic": "symptoms",
+      "text": "Pacjent mówi: „Jest mi niedobrze i chce mi się wymiotować“. Co to znaczy?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Jest mu niedobrze i może zwymiotować."
+        },
+        {
+          "key": "b",
+          "text": "Jest bardzo głodny."
+        },
+        {
+          "key": "c",
+          "text": "Ma złamaną rękę."
+        },
+        {
+          "key": "d",
+          "text": "Chce iść na spacer."
         }
       ],
       "correct": "a"
     },
     {
-      "id": "pl8",
-      "topic": "symptoms",
-      "text": "Pacjent mówi: „Kręci mi się w głowie”. Co to znaczy?",
+      "id": "pl11",
+      "topic": "procedure",
+      "text": "Musisz pobrać próbkę krwi. Co wyjaśniasz?",
       "options": [
         {
           "key": "a",
-          "text": "Kręci mu się w głowie."
+          "text": "Musisz najpierw szybko pobiegać."
         },
         {
           "key": "b",
-          "text": "Jest głodny."
+          "text": "Pobiorę małą próbkę krwi z twojej ręki."
         },
         {
           "key": "c",
-          "text": "Jest bardzo zmęczony."
+          "text": "Nie jedz przez tydzień."
         },
         {
           "key": "d",
-          "text": "Cieszy się."
+          "text": "To badanie nie jest ważne."
         }
       ],
-      "correct": "a"
+      "correct": "b"
+    },
+    {
+      "id": "pl12",
+      "topic": "medication",
+      "text": "Pacjent mówi: „Zapomniałem porannego leku“. Co mu mówisz?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Weź trzy dawki naraz."
+        },
+        {
+          "key": "b",
+          "text": "Nigdy więcej go nie bierz."
+        },
+        {
+          "key": "c",
+          "text": "Weź go teraz i nie podwajaj następnej dawki."
+        },
+        {
+          "key": "d",
+          "text": "Daj go przyjacielowi."
+        }
+      ],
+      "correct": "c"
     }
   ],
   "nl": [
     {
       "id": "nl1",
       "topic": "greeting",
-      "text": "Hoe begroet u een patiënt?",
+      "text": "Een patiënt staat aan de deur. Wat zegt u eerst?",
       "options": [
         {
           "key": "a",
-          "text": "Goedendag, ik ben uw verpleegkundige."
+          "text": "Goedemorgen, kom alstublieft binnen."
         },
         {
           "key": "b",
@@ -1379,11 +1765,11 @@ const LANGUAGE_TESTS = {
         },
         {
           "key": "c",
-          "text": "Wees stil."
+          "text": "Ik heb geen tijd."
         },
         {
           "key": "d",
-          "text": "Betaal nu."
+          "text": "Waarom bent u hier?"
         }
       ],
       "correct": "a"
@@ -1391,241 +1777,337 @@ const LANGUAGE_TESTS = {
     {
       "id": "nl2",
       "topic": "symptoms",
-      "text": "De patiënt zegt: „Ik heb veel pijn in mijn been.” Wat betekent dat?",
+      "text": "De patiënt zegt: „Mijn buik doet erg pijn.“ Wat betekent dat?",
       "options": [
         {
           "key": "a",
-          "text": "Hij heeft veel pijn in zijn been."
-        },
-        {
-          "key": "b",
-          "text": "Hij is erg gelukkig."
-        },
-        {
-          "key": "c",
           "text": "Hij heeft honger."
         },
         {
-          "key": "d",
-          "text": "Hij wil slapen."
-        }
-      ],
-      "correct": "a"
-    },
-    {
-      "id": "nl3",
-      "topic": "procedure",
-      "text": "Hoe legt u een verbandwissel uit?",
-      "options": [
-        {
-          "key": "a",
-          "text": "Ik ga nu uw verband verwisselen. Dat kan even pijn doen."
-        },
-        {
           "key": "b",
-          "text": "Ik ga nu naar huis."
-        },
-        {
-          "key": "c",
-          "text": "U moet nu meteen betalen."
-        },
-        {
-          "key": "d",
-          "text": "Ik weet het niet."
-        }
-      ],
-      "correct": "a"
-    },
-    {
-      "id": "nl4",
-      "topic": "allergies",
-      "text": "Hoe vraagt u naar allergieën?",
-      "options": [
-        {
-          "key": "a",
-          "text": "Heeft u allergieën voor medicijnen?"
-        },
-        {
-          "key": "b",
-          "text": "Houdt u van chocolade?"
-        },
-        {
-          "key": "c",
-          "text": "Waar woont u?"
-        },
-        {
-          "key": "d",
-          "text": "Hoe oud bent u?"
-        }
-      ],
-      "correct": "a"
-    },
-    {
-      "id": "nl5",
-      "topic": "aftercare",
-      "text": "Wat zegt u na de verbandwissel?",
-      "options": [
-        {
-          "key": "a",
-          "text": "Houd het verband droog en bel ons bij koorts."
-        },
-        {
-          "key": "b",
-          "text": "Ga zwemmen."
-        },
-        {
-          "key": "c",
-          "text": "Eet niets meer."
-        },
-        {
-          "key": "d",
-          "text": "Slaap nooit meer."
-        }
-      ],
-      "correct": "a"
-    },
-    {
-      "id": "nl6",
-      "topic": "emergency",
-      "text": "De patiënt krijgt plotseling ademnood. Wat zegt u?",
-      "options": [
-        {
-          "key": "a",
-          "text": "Blijf rustig, ik bel meteen een ambulance."
-        },
-        {
-          "key": "b",
-          "text": "Wacht tot morgen."
-        },
-        {
-          "key": "c",
-          "text": "Drink water en ga."
-        },
-        {
-          "key": "d",
-          "text": "Dat is niet belangrijk."
-        }
-      ],
-      "correct": "a"
-    },
-    {
-      "id": "nl7",
-      "topic": "payment",
-      "text": "Hoe bevestigt u betaling en toestemming?",
-      "options": [
-        {
-          "key": "a",
-          "text": "De behandeling kost 30 euro. Gaat u akkoord?"
-        },
-        {
-          "key": "b",
-          "text": "Ik neem uw geld."
-        },
-        {
-          "key": "c",
-          "text": "Teken hier zonder te lezen."
-        },
-        {
-          "key": "d",
-          "text": "Betaal later, misschien."
-        }
-      ],
-      "correct": "a"
-    },
-    {
-      "id": "nl8",
-      "topic": "symptoms",
-      "text": "De patiënt zegt: „Ik ben duizelig.” Wat betekent dat?",
-      "options": [
-        {
-          "key": "a",
-          "text": "Hij is duizelig."
-        },
-        {
-          "key": "b",
-          "text": "Hij heeft honger."
-        },
-        {
-          "key": "c",
           "text": "Hij is erg moe."
+        },
+        {
+          "key": "c",
+          "text": "Hij heeft erge buikpijn."
         },
         {
           "key": "d",
           "text": "Hij is blij."
         }
       ],
+      "correct": "c"
+    },
+    {
+      "id": "nl3",
+      "topic": "procedure",
+      "text": "Voordat u een verband verwisselt, wat zegt u tegen de patiënt?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Sluit uw ogen en slaap."
+        },
+        {
+          "key": "b",
+          "text": "Dit kan een beetje pijn doen, blijf alstublieft stil liggen."
+        },
+        {
+          "key": "c",
+          "text": "Betaal eerst."
+        },
+        {
+          "key": "d",
+          "text": "Ga naar huis."
+        }
+      ],
+      "correct": "b"
+    },
+    {
+      "id": "nl4",
+      "topic": "allergies",
+      "text": "Wat vraagt u voordat u een nieuw medicijn geeft?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Waar woont u?"
+        },
+        {
+          "key": "b",
+          "text": "Wat is uw beroep?"
+        },
+        {
+          "key": "c",
+          "text": "Vindt u deze kleur mooi?"
+        },
+        {
+          "key": "d",
+          "text": "Bent u allergisch voor een medicijn?"
+        }
+      ],
+      "correct": "d"
+    },
+    {
+      "id": "nl5",
+      "topic": "medication",
+      "text": "De patiënt vraagt: „Hoeveel tabletten moet ik nemen?“ Wat antwoordt u?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Neem één tablet na het ontbijt."
+        },
+        {
+          "key": "b",
+          "text": "Neem alle tabletten nu."
+        },
+        {
+          "key": "c",
+          "text": "Stop ermee vandaag."
+        },
+        {
+          "key": "d",
+          "text": "Geef de tabletten aan iemand anders."
+        }
+      ],
       "correct": "a"
+    },
+    {
+      "id": "nl6",
+      "topic": "postcare",
+      "text": "Na het bezoek, wat zegt u tegen de patiënt over de wond?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Was de wond met vuil water."
+        },
+        {
+          "key": "b",
+          "text": "Raak de wond vaak aan met uw handen."
+        },
+        {
+          "key": "c",
+          "text": "Houd de wond schoon en droog, en bel ons als het erger wordt."
+        },
+        {
+          "key": "d",
+          "text": "Bedek de wond met een natte doek."
+        }
+      ],
+      "correct": "c"
+    },
+    {
+      "id": "nl7",
+      "topic": "emergency",
+      "text": "De patiënt kan plotseling niet ademen. Wat zegt u eerst?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Wacht alstublieft buiten."
+        },
+        {
+          "key": "b",
+          "text": "Blijf kalm, ik bel nu een ambulance."
+        },
+        {
+          "key": "c",
+          "text": "Drink wat water en rust uit."
+        },
+        {
+          "key": "d",
+          "text": "Kom morgen terug."
+        }
+      ],
+      "correct": "b"
+    },
+    {
+      "id": "nl8",
+      "topic": "payment",
+      "text": "Het bezoek kost 300 pond. Hoe bevestigt u de betaling?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Betaal later, misschien."
+        },
+        {
+          "key": "b",
+          "text": "De prijs is geheim."
+        },
+        {
+          "key": "c",
+          "text": "U hoeft niet te betalen."
+        },
+        {
+          "key": "d",
+          "text": "Het bezoek kost 300 pond, betaal alstublieft nu."
+        }
+      ],
+      "correct": "d"
+    },
+    {
+      "id": "nl9",
+      "topic": "greeting",
+      "text": "Hoe stelt u zich voor aan een nieuwe patiënt?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Hallo, mijn naam is Sara, ik ben uw verpleegkundige."
+        },
+        {
+          "key": "b",
+          "text": "Ik houd niet van nieuwe patiënten."
+        },
+        {
+          "key": "c",
+          "text": "Schiet alstublieft op."
+        },
+        {
+          "key": "d",
+          "text": "Ik ga nu naar huis."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "nl10",
+      "topic": "symptoms",
+      "text": "De patiënt zegt: „Ik voel me misselijk en ik moet overgeven.“ Wat betekent dat?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Hij heeft een gebroken arm."
+        },
+        {
+          "key": "b",
+          "text": "Hij heeft erg veel honger."
+        },
+        {
+          "key": "c",
+          "text": "Hij voelt zich misselijk en moet misschien overgeven."
+        },
+        {
+          "key": "d",
+          "text": "Hij wil een wandeling maken."
+        }
+      ],
+      "correct": "c"
+    },
+    {
+      "id": "nl11",
+      "topic": "procedure",
+      "text": "U moet een bloedmonster nemen. Wat legt u uit?",
+      "options": [
+        {
+          "key": "a",
+          "text": "U moet eerst hard rennen."
+        },
+        {
+          "key": "b",
+          "text": "Ik neem een klein bloedmonster uit uw arm."
+        },
+        {
+          "key": "c",
+          "text": "Eet een week lang niets."
+        },
+        {
+          "key": "d",
+          "text": "De test is niet belangrijk."
+        }
+      ],
+      "correct": "b"
+    },
+    {
+      "id": "nl12",
+      "topic": "medication",
+      "text": "De patiënt zegt: „Ik ben mijn ochtendmedicijn vergeten.“ Wat zegt u tegen hem?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Neem drie doses tegelijk."
+        },
+        {
+          "key": "b",
+          "text": "Neem het nooit meer."
+        },
+        {
+          "key": "c",
+          "text": "Geef het aan uw vriend."
+        },
+        {
+          "key": "d",
+          "text": "Neem het nu, en verdubbel de volgende dosis niet."
+        }
+      ],
+      "correct": "d"
     }
   ],
   "zh": [
     {
       "id": "zh1",
       "topic": "greeting",
-      "text": "你怎么向病人问好？",
+      "text": "病人到了门口，你先说什么？",
       "options": [
         {
           "key": "a",
-          "text": "您好，我是您的护士。"
-        },
-        {
-          "key": "b",
           "text": "走开。"
         },
         {
+          "key": "b",
+          "text": "早上好，请进来。"
+        },
+        {
           "key": "c",
-          "text": "安静。"
+          "text": "我今天很忙。"
         },
         {
           "key": "d",
-          "text": "马上付钱。"
+          "text": "你为什么来这里？"
         }
       ],
-      "correct": "a"
+      "correct": "b"
     },
     {
       "id": "zh2",
       "topic": "symptoms",
-      "text": "病人说：“我的腿很疼。”这是什么意思？",
+      "text": "病人说：“我的肚子很疼。”这是什么意思？",
       "options": [
         {
           "key": "a",
-          "text": "他的腿很疼。"
+          "text": "他很饿。"
         },
         {
           "key": "b",
-          "text": "他很开心。"
+          "text": "他很累。"
         },
         {
           "key": "c",
-          "text": "他饿了。"
+          "text": "他很高兴。"
         },
         {
           "key": "d",
-          "text": "他想睡觉。"
+          "text": "他的肚子很疼。"
         }
       ],
-      "correct": "a"
+      "correct": "d"
     },
     {
       "id": "zh3",
       "topic": "procedure",
-      "text": "你怎么解释换药？",
+      "text": "换药之前，你对病人说什么？",
       "options": [
         {
           "key": "a",
-          "text": "现在我要给您换药，可能会有点疼。"
+          "text": "可能会有一点疼，请不要动。"
         },
         {
           "key": "b",
-          "text": "我现在回家。"
+          "text": "闭上眼睛睡觉。"
         },
         {
           "key": "c",
-          "text": "你必须马上付钱。"
+          "text": "请先付钱。"
         },
         {
           "key": "d",
-          "text": "我不知道。"
+          "text": "现在回家吧。"
         }
       ],
       "correct": "a"
@@ -1633,301 +2115,253 @@ const LANGUAGE_TESTS = {
     {
       "id": "zh4",
       "topic": "allergies",
-      "text": "你怎么问过敏史？",
+      "text": "给新药之前，你应该问什么？",
       "options": [
         {
           "key": "a",
-          "text": "您对药物过敏吗？"
-        },
-        {
-          "key": "b",
-          "text": "你喜欢巧克力吗？"
-        },
-        {
-          "key": "c",
           "text": "你住在哪里？"
         },
         {
+          "key": "b",
+          "text": "你的工作是什么？"
+        },
+        {
+          "key": "c",
+          "text": "你对什么药过敏吗？"
+        },
+        {
           "key": "d",
-          "text": "你多大了？"
+          "text": "你喜欢这个颜色吗？"
         }
       ],
-      "correct": "a"
+      "correct": "c"
     },
     {
       "id": "zh5",
-      "topic": "aftercare",
-      "text": "换药后你说什么？",
+      "topic": "medication",
+      "text": "病人问：“我应该吃几片药？”你怎么回答？",
       "options": [
         {
           "key": "a",
-          "text": "请保持敷料干燥，如果发烧请打电话给我们。"
+          "text": "现在把所有的药都吃掉。"
         },
         {
           "key": "b",
-          "text": "去游泳吧。"
+          "text": "早饭后吃一片药。"
         },
         {
           "key": "c",
-          "text": "不要再吃东西。"
+          "text": "今天不要吃药。"
         },
         {
           "key": "d",
-          "text": "再也不要睡觉。"
+          "text": "把药给别人。"
         }
       ],
-      "correct": "a"
+      "correct": "b"
     },
     {
       "id": "zh6",
-      "topic": "emergency",
-      "text": "病人突然呼吸困难。你说什么？",
+      "topic": "postcare",
+      "text": "看完病人以后，你对伤口说什么？",
       "options": [
         {
           "key": "a",
-          "text": "请冷静，我马上叫救护车。"
+          "text": "用脏水洗伤口。"
         },
         {
           "key": "b",
-          "text": "等到明天吧。"
+          "text": "经常用手摸伤口。"
         },
         {
           "key": "c",
-          "text": "喝点水然后走吧。"
+          "text": "用湿布盖住伤口。"
         },
         {
           "key": "d",
-          "text": "这不重要。"
+          "text": "保持伤口干净干燥，如果变严重请打电话给我们。"
         }
       ],
-      "correct": "a"
+      "correct": "d"
     },
     {
       "id": "zh7",
-      "topic": "payment",
-      "text": "你怎么确认付款和同意？",
+      "topic": "emergency",
+      "text": "病人突然不能呼吸了，你先说什么？",
       "options": [
         {
           "key": "a",
-          "text": "治疗费用是30欧元，您同意吗？"
+          "text": "请不要着急，我现在叫救护车。"
         },
         {
           "key": "b",
-          "text": "我拿走你的钱。"
+          "text": "请在外面等。"
         },
         {
           "key": "c",
-          "text": "在这里签字，不要读。"
+          "text": "喝点水，休息一下。"
         },
         {
           "key": "d",
-          "text": "以后再付，也许。"
+          "text": "明天再来。"
         }
       ],
       "correct": "a"
     },
     {
       "id": "zh8",
-      "topic": "symptoms",
-      "text": "病人说：“我头晕。”这是什么意思？",
+      "topic": "payment",
+      "text": "这次看病要300镑，你怎么确认付款？",
       "options": [
         {
           "key": "a",
-          "text": "他头晕。"
+          "text": "以后再付吧。"
         },
         {
           "key": "b",
-          "text": "他饿了。"
+          "text": "价格是秘密。"
         },
         {
           "key": "c",
-          "text": "他很累。"
+          "text": "这次看病是300镑，请现在付款。"
         },
         {
           "key": "d",
-          "text": "他很高兴。"
+          "text": "你不用付钱。"
+        }
+      ],
+      "correct": "c"
+    },
+    {
+      "id": "zh9",
+      "topic": "greeting",
+      "text": "你怎么向新病人介绍自己？",
+      "options": [
+        {
+          "key": "a",
+          "text": "我不喜欢新病人。"
+        },
+        {
+          "key": "b",
+          "text": "你好，我叫莎拉，我是你的护士。"
+        },
+        {
+          "key": "c",
+          "text": "请快一点。"
+        },
+        {
+          "key": "d",
+          "text": "我现在要回家了。"
+        }
+      ],
+      "correct": "b"
+    },
+    {
+      "id": "zh10",
+      "topic": "symptoms",
+      "text": "病人说：“我想吐。”这是什么意思？",
+      "options": [
+        {
+          "key": "a",
+          "text": "他很饿。"
+        },
+        {
+          "key": "b",
+          "text": "他的手臂断了。"
+        },
+        {
+          "key": "c",
+          "text": "他想去散步。"
+        },
+        {
+          "key": "d",
+          "text": "他觉得恶心，可能会吐。"
+        }
+      ],
+      "correct": "d"
+    },
+    {
+      "id": "zh11",
+      "topic": "procedure",
+      "text": "你需要抽血，你怎么解释？",
+      "options": [
+        {
+          "key": "a",
+          "text": "我会从你的手臂抽一点血。"
+        },
+        {
+          "key": "b",
+          "text": "你先快跑一下。"
+        },
+        {
+          "key": "c",
+          "text": "一个星期不要吃东西。"
+        },
+        {
+          "key": "d",
+          "text": "这个检查不重要。"
         }
       ],
       "correct": "a"
+    },
+    {
+      "id": "zh12",
+      "topic": "medication",
+      "text": "病人说：“我忘了吃早上的药。”你对他说什么？",
+      "options": [
+        {
+          "key": "a",
+          "text": "一次吃三份药。"
+        },
+        {
+          "key": "b",
+          "text": "以后再也不要吃。"
+        },
+        {
+          "key": "c",
+          "text": "现在吃药，下一次不要吃双倍。"
+        },
+        {
+          "key": "d",
+          "text": "把药给你的朋友。"
+        }
+      ],
+      "correct": "c"
     }
   ],
   "cs": [
     {
       "id": "cs1",
       "topic": "greeting",
-      "text": "Jak pozdravíte pacienta?",
+      "text": "Pacient stojí u dveří. Co řeknete nejdřív?",
       "options": [
         {
           "key": "a",
-          "text": "Dobrý den, jsem vaše zdravotní sestra / váš zdravotník."
-        },
-        {
-          "key": "b",
           "text": "Jděte pryč."
         },
         {
+          "key": "b",
+          "text": "Nemám čas."
+        },
+        {
           "key": "c",
-          "text": "Buďte zticha."
+          "text": "Dobré ráno, prosím, pojďte dál."
         },
         {
           "key": "d",
-          "text": "Zaplaťte hned."
+          "text": "Proč jste tady?"
         }
       ],
-      "correct": "a"
+      "correct": "c"
     },
     {
       "id": "cs2",
       "topic": "symptoms",
-      "text": "Pacient říká: „Moc mě bolí noha.” Co to znamená?",
+      "text": "Pacient říká: „Hodně mě bolí břicho.“ Co to znamená?",
       "options": [
         {
           "key": "a",
-          "text": "Moc ho bolí noha."
-        },
-        {
-          "key": "b",
-          "text": "Je velmi šťastný."
-        },
-        {
-          "key": "c",
-          "text": "Má hlad."
-        },
-        {
-          "key": "d",
-          "text": "Chce spát."
-        }
-      ],
-      "correct": "a"
-    },
-    {
-      "id": "cs3",
-      "topic": "procedure",
-      "text": "Jak vysvětlíte převaz?",
-      "options": [
-        {
-          "key": "a",
-          "text": "Teď vám vyměním obvaz. Může to chvíli bolet."
-        },
-        {
-          "key": "b",
-          "text": "Teď jdu domů."
-        },
-        {
-          "key": "c",
-          "text": "Musíte zaplatit okamžitě."
-        },
-        {
-          "key": "d",
-          "text": "Nevím."
-        }
-      ],
-      "correct": "a"
-    },
-    {
-      "id": "cs4",
-      "topic": "allergies",
-      "text": "Jak se zeptáte na alergie?",
-      "options": [
-        {
-          "key": "a",
-          "text": "Máte alergii na nějaké léky?"
-        },
-        {
-          "key": "b",
-          "text": "Máte rád čokoládu?"
-        },
-        {
-          "key": "c",
-          "text": "Kde bydlíte?"
-        },
-        {
-          "key": "d",
-          "text": "Kolik je vám let?"
-        }
-      ],
-      "correct": "a"
-    },
-    {
-      "id": "cs5",
-      "topic": "aftercare",
-      "text": "Co řeknete po převazu?",
-      "options": [
-        {
-          "key": "a",
-          "text": "Udržujte obvaz v suchu a při horečce nám zavolejte."
-        },
-        {
-          "key": "b",
-          "text": "Jděte plavat."
-        },
-        {
-          "key": "c",
-          "text": "Nic víc nejezte."
-        },
-        {
-          "key": "d",
-          "text": "Už nikdy nespěte."
-        }
-      ],
-      "correct": "a"
-    },
-    {
-      "id": "cs6",
-      "topic": "emergency",
-      "text": "Pacient najednou nemůže dýchat. Co řeknete?",
-      "options": [
-        {
-          "key": "a",
-          "text": "Zůstaňte v klidu, hned volám sanitku."
-        },
-        {
-          "key": "b",
-          "text": "Počkejte do zítřka."
-        },
-        {
-          "key": "c",
-          "text": "Napijte se vody a jděte."
-        },
-        {
-          "key": "d",
-          "text": "To není důležité."
-        }
-      ],
-      "correct": "a"
-    },
-    {
-      "id": "cs7",
-      "topic": "payment",
-      "text": "Jak potvrdíte platbu a souhlas?",
-      "options": [
-        {
-          "key": "a",
-          "text": "Ošetření stojí 30 eur. Souhlasíte?"
-        },
-        {
-          "key": "b",
-          "text": "Vezmu si vaše peníze."
-        },
-        {
-          "key": "c",
-          "text": "Podepište zde, aniž byste četl."
-        },
-        {
-          "key": "d",
-          "text": "Zaplaťte později, možná."
-        }
-      ],
-      "correct": "a"
-    },
-    {
-      "id": "cs8",
-      "topic": "symptoms",
-      "text": "Pacient říká: „Točí se mi hlava.” Co to znamená?",
-      "options": [
-        {
-          "key": "a",
-          "text": "Točí se mu hlava."
+          "text": "Hodně ho bolí břicho."
         },
         {
           "key": "b",
@@ -1943,6 +2377,246 @@ const LANGUAGE_TESTS = {
         }
       ],
       "correct": "a"
+    },
+    {
+      "id": "cs3",
+      "topic": "procedure",
+      "text": "Než vyměníte obvaz, co řeknete pacientovi?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Zavřete oči a spěte."
+        },
+        {
+          "key": "b",
+          "text": "Zaplaťte nejdřív."
+        },
+        {
+          "key": "c",
+          "text": "Jděte domů."
+        },
+        {
+          "key": "d",
+          "text": "Může to trochu bolet, prosím, ležte klidně."
+        }
+      ],
+      "correct": "d"
+    },
+    {
+      "id": "cs4",
+      "topic": "allergies",
+      "text": "Na co se zeptáte, než dáte nový lék?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Kde bydlíte?"
+        },
+        {
+          "key": "b",
+          "text": "Máte alergii na nějaký lék?"
+        },
+        {
+          "key": "c",
+          "text": "Jaké je vaše povolání?"
+        },
+        {
+          "key": "d",
+          "text": "Líbí se vám tato barva?"
+        }
+      ],
+      "correct": "b"
+    },
+    {
+      "id": "cs5",
+      "topic": "medication",
+      "text": "Pacient se ptá: „Kolik tablet mám brát?“ Co odpovíte?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Vezměte všechny tablety najednou."
+        },
+        {
+          "key": "b",
+          "text": "Už je neberte."
+        },
+        {
+          "key": "c",
+          "text": "Vezměte jednu tabletu po snídani."
+        },
+        {
+          "key": "d",
+          "text": "Dejte tablety někomu jinému."
+        }
+      ],
+      "correct": "c"
+    },
+    {
+      "id": "cs6",
+      "topic": "postcare",
+      "text": "Po návštěvě, co řeknete pacientovi o ráně?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Udržujte ji čistou a suchou a zavolejte nám, když se zhorší."
+        },
+        {
+          "key": "b",
+          "text": "Myjte ji špinavou vodou."
+        },
+        {
+          "key": "c",
+          "text": "Často se jí dotýkejte rukama."
+        },
+        {
+          "key": "d",
+          "text": "Přikryjte ji mokrým hadrem."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "cs7",
+      "topic": "emergency",
+      "text": "Pacient najednou nemůže dýchat. Co řeknete nejdřív?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Počkejte prosím venku."
+        },
+        {
+          "key": "b",
+          "text": "Napijte se vody a odpočiňte si."
+        },
+        {
+          "key": "c",
+          "text": "Přijďte zítra."
+        },
+        {
+          "key": "d",
+          "text": "Zůstaňte klidný, teď volám záchranku."
+        }
+      ],
+      "correct": "d"
+    },
+    {
+      "id": "cs8",
+      "topic": "procedure",
+      "text": "Musíte odebrat vzorek krve. Co vysvětlíte?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Musíte nejdřív rychle běžet."
+        },
+        {
+          "key": "b",
+          "text": "Odeberu malý vzorek krve z vaší paže."
+        },
+        {
+          "key": "c",
+          "text": "Nejezte celý týden."
+        },
+        {
+          "key": "d",
+          "text": "Test není důležitý."
+        }
+      ],
+      "correct": "b"
+    },
+    {
+      "id": "cs9",
+      "topic": "greeting",
+      "text": "Jak se představíte novému pacientovi?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Nemám rád nové pacienty."
+        },
+        {
+          "key": "b",
+          "text": "Pospěšte si, prosím."
+        },
+        {
+          "key": "c",
+          "text": "Dobrý den, jmenuji se Sara, jsem vaše sestra."
+        },
+        {
+          "key": "d",
+          "text": "Teď jdu domů."
+        }
+      ],
+      "correct": "c"
+    },
+    {
+      "id": "cs10",
+      "topic": "symptoms",
+      "text": "Pacient říká: „Je mi špatně a chci zvracet.“ Co to znamená?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Je mu špatně a možná bude zvracet."
+        },
+        {
+          "key": "b",
+          "text": "Má velký hlad."
+        },
+        {
+          "key": "c",
+          "text": "Má zlomenou ruku."
+        },
+        {
+          "key": "d",
+          "text": "Chce jít na procházku."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "cs11",
+      "topic": "payment",
+      "text": "Návštěva stojí 300 liber. Jak potvrdíte platbu?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Zaplaťte později, možná."
+        },
+        {
+          "key": "b",
+          "text": "Cena je tajemství."
+        },
+        {
+          "key": "c",
+          "text": "Nemusíte platit."
+        },
+        {
+          "key": "d",
+          "text": "Návštěva stojí 300 liber, prosím, zaplaťte teď."
+        }
+      ],
+      "correct": "d"
+    },
+    {
+      "id": "cs12",
+      "topic": "medication",
+      "text": "Pacient říká: „Zapomněl jsem ranní lék.“ Co mu řeknete?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Vezměte tři dávky najednou."
+        },
+        {
+          "key": "b",
+          "text": "Vezměte ho teď a další dávku nezdvojujte."
+        },
+        {
+          "key": "c",
+          "text": "Už ho nikdy neberte."
+        },
+        {
+          "key": "d",
+          "text": "Dejte ho kamarádovi."
+        }
+      ],
+      "correct": "b"
     }
   ]
 };

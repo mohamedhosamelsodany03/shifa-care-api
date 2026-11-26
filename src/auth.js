@@ -21,8 +21,14 @@ const ISS = 'shifa-care';
 const SIGN_OPTS = { expiresIn: config.jwtAccessTtl, audience: AUD, issuer: ISS };
 const VERIFY_OPTS = { algorithms: ['HS256'], audience: AUD, issuer: ISS };
 
-function issueTokens(user, familyId) {
+function issueTokens(user, familyId, opts = {}) {
   // user: { phone, role, providerId? }
+  // opts.refreshTtlDays: v2.1.6 (C1 interim) — phone-only logins get a
+  // SHORT refresh lifetime (24h) because no OTP verified the caller;
+  // OTP-verified logins keep the normal 7 days. opts.authMethod is
+  // stored on the refresh record so rotation keeps the same TTL.
+  const refreshTtlDays = Number.isFinite(opts.refreshTtlDays) && opts.refreshTtlDays > 0 ? opts.refreshTtlDays : config.refreshTtlDays;
+  const authMethod = opts.authMethod || null;
   const access = jwt.sign(
     { sub: user.phone, role: user.role, providerId: user.providerId || null },
     config.jwtSecret,
@@ -38,9 +44,10 @@ function issueTokens(user, familyId) {
     role: user.role,
     providerId: user.providerId || null,
     hash: sha256(refreshPlain),
-    expiresAt: new Date(Date.now() + config.refreshTtlDays * 24 * 60 * 60 * 1000).toISOString(),
+    expiresAt: new Date(Date.now() + refreshTtlDays * 24 * 60 * 60 * 1000).toISOString(),
     revoked: false,
     createdAt: new Date().toISOString(),
+    authMethod,
   };
   store.save();
   return { accessToken: access, refreshToken: `${refreshId}.${refreshPlain}`, expiresInSeconds: 15 * 60, familyId: fam };

@@ -206,6 +206,13 @@ class Store {
     if (!this.data.doctors) this.data.doctors = [];
     if (!('settlementNotifiedOn' in this.data)) this.data.settlementNotifiedOn = null;
     if (!Array.isArray(this.data.settlements)) this.data.settlements = [];
+    // v2.1.6 (C4): reversing settlement adjustments — when a settled
+    // booking is refunded (complaint accepted after settlement, or a
+    // confirmed circumvention), the refunded shares are recorded here
+    // and deducted from the provider's NEXT settlement record.
+    // {id, providerId, bookingId, reason, providerShareEgp, appShareEgp,
+    //  cash, createdAt, appliedSettlementId}
+    if (!Array.isArray(this.data.settlementAdjustments)) this.data.settlementAdjustments = [];
     if (!this.data.medicalFileInterest) this.data.medicalFileInterest = { count: 0, phones: [], lastAt: null };
     if (!this.data.adminPinAttempts) this.data.adminPinAttempts = {};
     if (!this.data.favorites) this.data.favorites = {};

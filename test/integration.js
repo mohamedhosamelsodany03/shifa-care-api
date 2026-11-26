@@ -17,6 +17,7 @@ process.env.PORT = String(PORT);
 const TEST_ADMIN_PIN = require('crypto').randomInt(100000, 1000000).toString();
 process.env.ADMIN_PIN = TEST_ADMIN_PIN;
 process.env.BOOKING_LIMIT_MAX = '500'; // v2.0.8: test run makes many booking calls
+process.env.MIN_VISIT_MS = '2000'; // v2.1.6 (C8): the 10-min accept->complete floor is 2s here so the guard is testable without a 10-min wait
 try { fs.unlinkSync(DATA); } catch (e) { /* ignore */ }
 
 const { createApp } = require('../src/app');
@@ -142,8 +143,10 @@ const server = app.listen(PORT, async () => {
     check('booking has service/total aliases', r.body.service === 'standard' && r.body.total === 350);
 
     // assistant band mapping
+    const RECEIPT_JPEG = 'data:image/jpeg;base64,' + Buffer.from('fake-receipt-jpeg-bytes').toString('base64');
     r = await call('POST', '/api/bookings', { ...TERMS,
       name: 'Test Patient', service: 'asst_5_9', km: 2, paymentMethod: 'instapay', charterAccepted: true,
+      receiptImage: RECEIPT_JPEG, // v2.1.6 (C6): online payment requires a receipt at creation
     }, patTokenEarly);
     check('assistant band asst_5_9 -> 235 EGP', r.status === 201 && r.body.total === 235, JSON.stringify(r.body).slice(0, 200));
 
@@ -161,6 +164,10 @@ const server = app.listen(PORT, async () => {
     check('provider accept (interview passed + admin verified)', r.status === 200, JSON.stringify(r.body).slice(0, 200));
     r = await call('POST', `/api/bookings/${bkId}/vitals`, { bpSystolic: 120, bpDiastolic: 80, pulse: 72, glucose: 110, oxygen: 98, temp: 36.6 }, provToken);
     check('vitals recorded', r.status === 200, JSON.stringify(r.body).slice(0, 200));
+    // v2.1.6 (C8): completing <2s after acceptance is rejected (too fast).
+    r = await call('POST', `/api/bookings/${bkId}/provider-complete`, {}, provToken);
+    check('complete <2s after accept -> 409 visit too short', r.status === 409 && JSON.stringify(r.body).includes('too short'), JSON.stringify(r.body).slice(0, 200));
+    await new Promise((res) => setTimeout(res, 2100));
     r = await call('POST', `/api/bookings/${bkId}/provider-complete`, {}, provToken);
     check('legacy provider-complete works', r.status === 200 && r.body.status === 'provider_confirmed', JSON.stringify(r.body).slice(0, 200));
 
@@ -271,10 +278,12 @@ const server = app.listen(PORT, async () => {
     // overtime extra days (4x690), all unreleased — as if the month ran.
     const intBk = store.data.bookings[intPkg];
     for (let i = 0; i < 26; i++) {
-      intBk.daysLog.push({ date: pkgDay(i), type: 'regular', providerId: 'prov_demo_starter', rateEgp: i < 25 ? 485 : 475, loggedAt: seedNow, released: false, releasedAt: null, weekKey: null });
+      // v2.1.6 (C7): the fast-forwarded days are patient-confirmed (the
+      // patient confirmed each day during the month), so they release.
+      intBk.daysLog.push({ date: pkgDay(i), type: 'regular', providerId: 'prov_demo_starter', rateEgp: i < 25 ? 485 : 475, loggedAt: seedNow, released: false, releasedAt: null, weekKey: null, vitals: null, patientConfirmed: true, patientConfirmedAt: seedNow, confirmedBy: 'patient' });
     }
     for (let i = 0; i < 4; i++) {
-      intBk.daysLog.push({ date: pkgDay(26 + i), type: 'extra', providerId: 'prov_demo_starter', rateEgp: 690, loggedAt: seedNow, released: false, releasedAt: null, weekKey: null });
+      intBk.daysLog.push({ date: pkgDay(26 + i), type: 'extra', providerId: 'prov_demo_starter', rateEgp: 690, loggedAt: seedNow, released: false, releasedAt: null, weekKey: null, vitals: null, patientConfirmed: true, patientConfirmedAt: seedNow, confirmedBy: 'patient' });
     }
     intBk.daysCompleted = 26;
     intBk.extraDaysCompleted = 4;
@@ -324,10 +333,10 @@ const server = app.listen(PORT, async () => {
     const expApp2 = regApp2 + 2 * dayApp2(690);
     const intBk2 = store.data.bookings[intPkg2];
     for (let i = 0; i < 26; i++) {
-      intBk2.daysLog.push({ date: pkgDay(i), type: 'regular', providerId: 'prov_demo_starter', rateEgp: i < 25 ? 485 : 475, loggedAt: seedNow, released: false, releasedAt: null, weekKey: null });
+      intBk2.daysLog.push({ date: pkgDay(i), type: 'regular', providerId: 'prov_demo_starter', rateEgp: i < 25 ? 485 : 475, loggedAt: seedNow, released: false, releasedAt: null, weekKey: null, vitals: null, patientConfirmed: true, patientConfirmedAt: seedNow, confirmedBy: 'patient' });
     }
     for (let i = 0; i < 2; i++) {
-      intBk2.daysLog.push({ date: pkgDay(26 + i), type: 'extra', providerId: 'prov_demo_starter', rateEgp: 690, loggedAt: seedNow, released: false, releasedAt: null, weekKey: null });
+      intBk2.daysLog.push({ date: pkgDay(26 + i), type: 'extra', providerId: 'prov_demo_starter', rateEgp: 690, loggedAt: seedNow, released: false, releasedAt: null, weekKey: null, vitals: null, patientConfirmed: true, patientConfirmedAt: seedNow, confirmedBy: 'patient' });
     }
     intBk2.daysCompleted = 26;
     intBk2.extraDaysCompleted = 2;
@@ -360,8 +369,13 @@ const server = app.listen(PORT, async () => {
     // test-only — the API never leaks them) and pass 8/8.
     const { LANGUAGE_TESTS } = require('../src/catalog');
     const ltSt = await call('POST', '/api/me/language-tests/en/start', null, provToken);
+    // v2.1.6 (C5): answers are POSITIONS into the published options.
     const ltAns = {};
-    for (const q of ltSt.body.questions || []) ltAns[q.id] = LANGUAGE_TESTS.en.find((x) => x.id === q.id)?.correct;
+    for (const q of ltSt.body.questions || []) {
+      const bankQ = LANGUAGE_TESTS.en.find((x) => x.id === q.id);
+      const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+      ltAns[q.id] = q.options.findIndex((o) => o.text === correctText);
+    }
     r = await call('POST', '/api/me/language-tests/en/submit', { attemptId: ltSt.body.attemptId, answers: ltAns }, provToken);
     check('English test all-correct -> passed 8/8, badge earned', r.status === 200 && r.body.passed === true && r.body.score === 8, JSON.stringify(r.body).slice(0, 200));
     r = await call('POST', `/api/admin/package-requests/${intPkrT}/quote`, { finalPrice: 800, providerId: 'prov_demo_starter', extraDaysOption: 'none' }, adminToken);
@@ -377,7 +391,7 @@ const server = app.listen(PORT, async () => {
     // 25x31 + 25 remainder day USD), all unreleased.
     const intBkT = store.data.bookings[intPkgT];
     for (let i = 0; i < 26; i++) {
-      intBkT.daysLog.push({ date: pkgDay(i), type: 'regular', providerId: 'prov_demo_starter', rateEgp: i < 25 ? 1477 : 1475, rate: i < 25 ? 31 : 25, currency: 'USD', loggedAt: seedNow, released: false, releasedAt: null, weekKey: null });
+      intBkT.daysLog.push({ date: pkgDay(i), type: 'regular', providerId: 'prov_demo_starter', rateEgp: i < 25 ? 1477 : 1475, rate: i < 25 ? 31 : 25, currency: 'USD', loggedAt: seedNow, released: false, releasedAt: null, weekKey: null, vitals: null, patientConfirmed: true, patientConfirmedAt: seedNow, confirmedBy: 'patient' });
     }
     intBkT.daysCompleted = 26;
     intBkT.extraDaysCompleted = 0;
@@ -390,6 +404,62 @@ const server = app.listen(PORT, async () => {
     r = await call('GET', '/api/providers/wallet', null, provToken);
     const intLinesT = (r.body.ledger || []).filter((l) => l.bookingId === intPkgT);
     check('wallet: tourist final package-day line (26 days) held for the 24h complaint window', intLinesT.some((l) => l.kind === 'package-day' && l.days === 26 && l.finalRelease === true && l.direction === 'complaint_hold' && l.amountEgp === expAppT), JSON.stringify(intLinesT));
+
+    // 12. v2.1.6 (C7): bulk day registration forces an admin review.
+    // Create a package via the API, then backdate its period in the
+    // store (a real package that started 5 days ago) so 4 past dates
+    // are loggable in one day.
+    r = await call('POST', '/api/package-requests', { ...TERMS,
+      patientName: 'Bulk Patient', packageType: 'package_technician_12',
+      condition: 'Recovery', conditionItems: ['post_surgery'],
+      diagnosis: 'Post-op', treatment: 'Painkillers',
+      needs: ['mobility'], startDate: pkgToday,
+      address: 'Quseir', distanceKm: 3, notes: '',
+    }, patTokenEarly);
+    check('bulk package request -> 201', r.status === 201 && !!r.body.id, JSON.stringify(r.body).slice(0, 200));
+    const bulkPkr = r.body.id;
+    r = await call('POST', `/api/admin/package-requests/${bulkPkr}/quote`, { finalPriceEgp: 12600, providerId: 'prov_demo_starter', extraDaysOption: 'none' }, adminToken);
+    r = await call('POST', `/api/package-requests/${bulkPkr}/accept`, { ...TERMS, paymentMethod: 'cash_receipt' }, patTokenEarly);
+    check('bulk package accept cash -> 201', r.status === 201 && !!r.body.id, JSON.stringify(r.body).slice(0, 200));
+    const bulkPkg = r.body.id;
+    const bulkBk = store.data.bookings[bulkPkg];
+    bulkBk.startDate = pkgDay(-5);
+    bulkBk.endDate = pkgDay(24);
+    store.save();
+    let bulkOk = true;
+    for (let i = 0; i < 4; i++) {
+      r = await call('POST', `/api/bookings/${bulkPkg}/package-day`, { date: pkgDay(-4 + i), type: 'regular' }, provToken);
+      if (r.status !== 200) bulkOk = false;
+    }
+    check('bulk: 4 past days logged in one day -> 200 each', bulkOk);
+    r = await call('GET', '/api/admin/dashboard', null, adminToken);
+    check('bulk flag: dashboard packageReviewRequired lists the package', r.status === 200 && (r.body.packageReviewRequired || []).some((x) => x.id === bulkPkg), JSON.stringify(r.body.packageReviewRequired));
+    r = await call('POST', '/api/jobs/sweep', {}, adminToken);
+    r = await call('GET', `/api/bookings/${bulkPkg}`, null, patTokenEarly);
+    check('bulk flag: sweep releases NOTHING while review is pending', (r.body.daysLog || []).every((d) => d.released === false), JSON.stringify(r.body.daysLog));
+    r = await call('POST', `/api/admin/bookings/${bulkPkg}/package-review/clear`, {}, adminToken);
+    check('admin clears the bulk review -> 200', r.status === 200 && r.body.packageReviewRequired === false, JSON.stringify(r.body).slice(0, 200));
+    for (let i = 0; i < 4; i++) {
+      await call('POST', `/api/bookings/${bulkPkg}/package-day/${pkgDay(-4 + i)}/confirm`, null, patTokenEarly);
+    }
+    r = await call('POST', '/api/jobs/sweep', {}, adminToken);
+    r = await call('GET', `/api/bookings/${bulkPkg}`, null, patTokenEarly);
+    check('after clear + patient confirm: 4 bulk days release on sweep', (r.body.daysLog || []).filter((d) => d.released === true).length === 4, JSON.stringify(r.body.daysLog));
+
+    // 13. v2.1.6 (C1 interim): phone-only login from a new deviceId
+    // flags newDevice + uses a 24h refresh; the same device again does
+    // not flag; a second device flags again; the admin dashboard lists
+    // the new-device logins (audit-backed).
+    const c1Phone = '01099999999'; // already registered in §1 (login-phone at line 74, no deviceId)
+    r = await call('POST', '/api/auth/login-phone', { phone: c1Phone, deviceId: 'int-device-c1-a' });
+    check('C1 login from a new deviceId -> 200, newDevice true, authMethod phone-only', r.status === 200 && r.body?.newDevice === true && r.body?.authMethod === 'phone-only', JSON.stringify(r.body)?.slice(0, 200));
+    r = await call('POST', '/api/auth/login-phone', { phone: c1Phone, deviceId: 'int-device-c1-a' });
+    check('C1 same deviceId again -> newDevice false', r.status === 200 && r.body?.newDevice === false, JSON.stringify(r.body)?.slice(0, 200));
+    r = await call('POST', '/api/auth/login-phone', { phone: c1Phone, deviceId: 'int-device-c1-b' });
+    check('C1 a second deviceId -> newDevice true again', r.status === 200 && r.body?.newDevice === true, JSON.stringify(r.body)?.slice(0, 200));
+    r = await call('GET', '/api/admin/dashboard', null, adminToken);
+    const nd = (r.body?.newDeviceLogins || []).filter((x) => x.phone === c1Phone);
+    check('C1 dashboard newDeviceLogins lists the new-device logins', r.status === 200 && nd.length >= 2, JSON.stringify(nd?.slice(0, 2)));
   } catch (e) {
     fail++;
     results.push(`  FAIL exception: ${e && e.stack || e}`);

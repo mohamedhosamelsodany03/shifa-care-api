@@ -73,12 +73,17 @@ function computePoints(provider, bookings) {
   const ratingAvg = rated.length
     ? Math.round((rated.reduce((s, b) => s + Number(b.review.rating), 0) / rated.length) * 10) / 10
     : null;
+  // v2.1.6 (C8): ONE 5-star review must not grant the full 20 rating
+  // points (fake-visit farming: one fake visit + one fake review = a
+  // Pro tier). Rating points count only with >=5 rated visits; the
+  // average is still shown (ratingAvg) so the provider sees it.
+  const ratingCounted = rated.length >= 5;
 
   const interview = Math.max(0, Math.min(P.interview.excellentPts, provider.interviewPoints || 0));
   const certificates = Math.min(P.certificateMax, countVerified(provider.certificates, provider.verifiedCertificates) * P.certificateEach);
   const courses = Math.min(P.courseMax, countVerified(provider.courses) * P.courseEach);
   const cases = Math.min(P.casesMax, Math.floor((totalCases + extraWeekly) / 10) * P.casesPer10);
-  const rating = ratingAvg == null ? 0 : Math.min(P.ratingMax, Math.round(ratingAvg * P.ratingMultiplier * 10) / 10);
+  const rating = (ratingAvg == null || !ratingCounted) ? 0 : Math.min(P.ratingMax, Math.round(ratingAvg * P.ratingMultiplier * 10) / 10);
   const total = interview + certificates + courses + cases + rating;
   const tier = total >= 70 ? 'Elite' : total >= 40 ? 'Pro' : 'Starter';
   const nextTier = tier === 'Elite' ? null : tier === 'Pro' ? 'Elite' : 'Pro';
@@ -88,6 +93,7 @@ function computePoints(provider, bookings) {
     tier, nextTier, pointsToNextTier: nextMin == null ? null : Math.max(0, nextMin - total),
     weeklyDoubleActive: weeklyCases >= cat.WEEKLY_DOUBLE_THRESHOLD,
     weeklyCases, totalCases, extraWeekly, ratingAvg,
+    ratedCount: rated.length, ratingCounted,
     casesByWeek,
   };
 }

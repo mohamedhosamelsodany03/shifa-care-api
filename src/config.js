@@ -155,6 +155,15 @@ const config = {
   // (POST /api/admin/package-offer); the admin setting wins while it is
   // set and unexpired. Env is the fallback / initial value.
   packageOvertimePremiumWaived: process.env.PACKAGE_OVERTIME_WAIVED === 'true',
+  // v2.1.6 (C8): a visit cannot be completed less than 10 minutes
+  // after acceptance — instant accept→complete cycles are the signature
+  // of fake-visit farming. Overridable by MIN_VISIT_MS (tests set 0).
+  minVisitMs: envInt('MIN_VISIT_MS', 10 * 60 * 1000),
+  // v2.1.6 (C7): a package day with vitals but no patient confirmation
+  // becomes releasable after 72h of silence (no dispute). Patient
+  // confirmation releases it at once; admin can confirm on the
+  // patient's behalf. Overridable by PACKAGE_DAY_AUTO_RELEASE_MS.
+  packageDayAutoReleaseMs: envInt('PACKAGE_DAY_AUTO_RELEASE_MS', 72 * 60 * 60 * 1000),
   // v2.0.8 — Terms & Conditions version. Registration and booking
   // creation require acceptedTerms=true AND termsVersion to match this
   // value; bumping it forces every user to re-accept (see /api/me/terms).
@@ -167,6 +176,17 @@ const config = {
 config.smsConfigured = function () {
   return config.sms.provider === 'together'
     && !!config.sms.user && !!config.sms.password && !!config.sms.sender;
+};
+// WhatsApp (Meta) is configured when provider='meta' AND the access
+// token + phone number id are both set.
+config.whatsappConfigured = function () {
+  return config.whatsapp.provider === 'meta'
+    && !!config.whatsapp.accessToken && !!config.whatsapp.phoneNumberId;
+};
+// v2.1.6 (C1 interim): phone-only login is disabled in production when
+// ANY real OTP provider is configured (SMS or WhatsApp), not SMS only.
+config.anyOtpConfigured = function () {
+  return config.smsConfigured() || config.whatsappConfigured();
 };
 // FCM is configured when a project id + service-account credentials exist.
 config.fcmConfigured = function () {

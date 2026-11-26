@@ -171,8 +171,42 @@ function receiptFromBody(body, paymentMethod) {
 function attachReceipt(booking, parsed) {
   booking.receipt = parsed && parsed.receipt ? parsed.receipt : null;
   if (parsed && parsed.image) store.data.receiptImages[booking.id] = parsed.image;
+  booking.receiptStatus = receiptStatusOf(booking);
 }
 function receiptPending(b) { return !!(b.receipt && b.receipt.status === 'pending'); }
+// v2.1.6 (C6): an online payment (InstaPay / card) is one that is NOT
+// cash-with-receipt. Cash bookings never need a receipt photo.
+function isOnlinePayment(b) {
+  return !!(b && b.paymentMethod && b.paymentMethod !== 'cash_receipt');
+}
+// v2.1.6 (C6): a booking is receipt-blocked when its receipt is under
+// review OR when an online payment has NO receipt at all (the old code
+// only blocked the "pending" case, so a booking created without a
+// receipt slipped through the radar/accept gates). Cash is never blocked.
+function receiptBlocked(b) {
+  if (!b) return false;
+  if (receiptPending(b)) return true;
+  if (isOnlinePayment(b) && !b.receipt) return true;
+  return false;
+}
+// v2.1.6 (C6): receipt status flag, kept in sync with b.receipt so the
+// admin UI and the gates can tell "no receipt" from "under review".
+// 'not_required' (cash) | 'missing' (online, no receipt) | 'pending' |
+// 'approved' | 'rejected'.
+function receiptStatusOf(b) {
+  if (!isOnlinePayment(b)) return 'not_required';
+  if (!b.receipt) return 'missing';
+  return b.receipt.status || 'pending';
+}
+// v2.1.6 (C6): receipt is MANDATORY for online payment at booking
+// creation — call after receiptFromBody in every creation path. Returns
+// an error string when the receipt is missing (the caller sends 400),
+// or null when the payment is cash or the receipt is present.
+function receiptRequiredError(paymentMethod, parsed) {
+  if (paymentMethod === 'cash_receipt') return null;
+  if (!parsed || !parsed.receipt) return 'Online payment (InstaPay / card) requires a receipt photo — upload it at booking.';
+  return null;
+}
 // Re-run the CV/certificate evaluation after anything that changes the
 // inputs (document upload, admin credential verify).
 function refreshCvEvaluation(p) {
@@ -217,49 +251,192 @@ function stayBonusState(p) {
     amountEgp: cat.STAY_BONUS_EGP, earned, paid: !!p.stayBonusPaid, daysSinceJoin: days,
   };
 }
+// v2.1.6 (C3): the volume bonus is paid ONCE per month — only the
+// INCREASE over what was already paid this month is due. The paid
+// amount is tracked on the provider record (volumeBonusPaid {month,
+// amountEgp}); older records are recovered by summing this month's
+// settlement records (self-heal for data written before v2.1.6).
+function volumeBonusPaidThisMonth(p, key) {
+  if (p.volumeBonusPaid && p.volumeBonusPaid.month === key) return p.volumeBonusPaid.amountEgp || 0;
+  let sum = 0;
+  for (const s of (store.data.settlements || [])) {
+    if (s.providerId === p.id && (s.generatedAt || '').slice(0, 7) === key) sum += s.totals?.volumeBonusEgp || 0;
+  }
+  return sum;
+}
+function volumeBonusDue(p, key) {
+  const vb = volumeBonusFor(p.id, key);
+  if (vb.paused) return { ...vb, paidEgp: 0, dueEgp: 0 };
+  const paid = volumeBonusPaidThisMonth(p, key);
+  return { ...vb, paidEgp: paid, dueEgp: Math.max(0, (vb.bonusEgp || 0) - paid) };
+}
+// v2.1.6 (C4): a standard booking is settleable only once it is
+// released, past its 24h complaint window (settleableAt), with no open
+// complaint and no circumvention hold.
+function isSettleableBooking(b, nowMs) {
+  if (!['released', 'auto_released'].includes(b.status)) return false;
+  if (b.complaintStatus === 'open' || b.circumventionHold) return false;
+  if (b.settleableAt && nowMs < new Date(b.settleableAt).getTime()) return false;
+  return true;
+}
+// v2.1.6 (C4): when a SETTLED booking is later refunded (complaint
+// accepted after its settlement, or a confirmed circumvention report),
+// the refunded shares become a reversing adjustment deducted from the
+// provider's NEXT settlement record — money already "paid" on paper is
+// clawed back instead of vanishing.
+function createSettlementAdjustment(providerId, booking, reason) {
+  if (!providerId || !booking) return null;
+  const shares = booking.refundedShares || { providerShareEgp: booking.providerShareEgp || 0, appShareEgp: booking.appShareEgp || 0 };
+  const adj = {
+    id: newId('adj'), providerId, bookingId: booking.id, reason,
+    providerShareEgp: shares.providerShareEgp || 0,
+    appShareEgp: shares.appShareEgp || 0,
+    cash: !!booking.cashCollectedByProvider,
+    createdAt: nowIso(), appliedSettlementId: null,
+  };
+  store.data.settlementAdjustments = store.data.settlementAdjustments || [];
+  store.data.settlementAdjustments.push(adj);
+  store.audit('settlement.adjustment_created', providerId, { adjustmentId: adj.id, bookingId: booking.id, reason, providerShareEgp: adj.providerShareEgp, appShareEgp: adj.appShareEgp, cash: adj.cash });
+  return adj;
+}
+// v2.1.6 (C7): a package day is releasable when the patient confirmed
+// it, OR when vitals were recorded and 72h passed with no dispute
+// (the provider's vitals are evidence the visit happened; the admin
+// can also confirm a day on the patient's behalf). A day that is
+// neither confirmed nor vitals-backed is NEVER releasable — its value
+// stays in the refundable remainder.
+function packageDayReleasable(d) {
+  if (!d || d.released) return false;
+  if (d.patientConfirmed) return true;
+  if (d.vitals && d.loggedAt) {
+    const loggedMs = new Date(d.loggedAt).getTime();
+    if (Number.isFinite(loggedMs) && Date.now() - loggedMs >= config.packageDayAutoReleaseMs) return true;
+  }
+  return false;
+}
 // Weekly settlement records (audit #5): one per provider per ISO week.
 // RECORDS ONLY — no money moves (that needs a bank account).
+// v2.1.6 (C2/C3/C4): the record is a SNAPSHOT generated at the first
+// sweep that finds activity in the week. A booking/bonus that becomes
+// settleable AFTER the week's record was generated is settled in the
+// FOLLOWING week's record (up to ~1 week lag) — it is never lost. The
+// old code had a worse bug: it filtered by release week AND skipped
+// when a record existed, so mid-week releases were NEVER recorded.
+// Cash is split out (C2): a cash booking contributes ONLY its app share
+// to providerOwesAppEgp — the provider already holds the cash, so the
+// app never "owes" the provider's share. Non-cash contributes the
+// provider share to appOwesProviderEgp. Amounts inside the 24h
+// complaint window (or under an open complaint) sit in the
+// complaint_hold bucket and are NOT payable from this record.
 function generateSettlements() {
   const weekKey = currentWeekKey();
+  const nowMs = Date.now();
   const made = [];
   for (const p of Object.values(store.data.providers)) {
     if (p.demo) continue;
-    // v2.1.3 — package bookings are EXCLUDED from the lump-sum below:
-    // their providerShareEgp is the aggregate of ALL day releases (which
-    // may span several weeks), so adding it here would double-count the
-    // weekly releases. Day releases are summed per week instead.
-    const weekBookings = Object.values(store.data.bookings).filter((b) =>
-      b.kind !== 'package' && b.providerId === p.id && b.releasedAt && isoWeekKey(new Date(b.releasedAt)) === weekKey);
-    // v2.1.3 — completed package days released this week, per provider
-    // (main provider AND substitute: each release entry carries its own
-    // providerId). Cash package bookings: the provider holds the cash, so
-    // the app share of released days is owed BY the provider.
+    const key = monthKey();
+    // Standard bookings: payable (settleable, never settled) vs held
+    // (released but inside the complaint window / open complaint).
+    // Payable has NO release-week filter — a booking released last week
+    // that only just became settleable is paid now, not lost.
+    const payable = [];
+    const held = [];
+    for (const b of Object.values(store.data.bookings)) {
+      if (b.kind === 'package' || b.providerId !== p.id) continue;
+      if (!['released', 'auto_released'].includes(b.status)) continue;
+      if (b.settledWeekKey) continue; // settled in an earlier week
+      if (isSettleableBooking(b, nowMs)) payable.push(b);
+      else held.push(b);
+    }
+    // Package day releases: payable vs held, per release entry. A
+    // weekly release is settleable at once (terms §12); a FINAL release
+    // waits out the booking's 24h complaint window (rel.settleableAt).
     let packageDays = 0, packageProviderShare = 0, packageAppShare = 0, packageCashAppShare = 0;
+    let packageHoldDays = 0, packageHoldEgp = 0;
+    const payableRels = [];
     for (const b of Object.values(store.data.bookings)) {
       if (b.kind !== 'package') continue;
       for (const rel of (b.packageDayReleases || [])) {
-        if (rel.providerId !== p.id || rel.weekKey !== weekKey) continue;
-        packageDays += rel.days;
-        packageProviderShare += rel.providerShareEgp || 0;
-        packageAppShare += rel.appShareEgp || 0;
-        if (b.cashCollectedByProvider) packageCashAppShare += rel.appShareEgp || 0;
+        if (rel.providerId !== p.id || rel.settledWeekKey) continue;
+        const relSettleable = (!rel.settleableAt || nowMs >= new Date(rel.settleableAt).getTime())
+          && b.complaintStatus !== 'open' && !b.circumventionHold;
+        if (relSettleable) payableRels.push({ booking: b, rel });
+        else {
+          packageHoldDays += rel.days;
+          packageHoldEgp += b.cashCollectedByProvider ? (rel.appShareEgp || 0) : (rel.providerShareEgp || 0);
+        }
       }
     }
+    for (const { booking: b, rel } of payableRels) {
+      packageDays += rel.days;
+      if (b.cashCollectedByProvider) packageCashAppShare += rel.appShareEgp || 0;
+      else { packageProviderShare += rel.providerShareEgp || 0; packageAppShare += rel.appShareEgp || 0; }
+    }
+    // Bonuses (C3: volume bonus pays only the monthly increase).
     const stay = stayBonusState(p);
-    const vb = volumeBonusFor(p.id, monthKey());
     const stayDue = stay.earned && !stay.paid ? cat.STAY_BONUS_EGP : 0;
-    if (!weekBookings.length && !stayDue && !(vb.bonusEgp > 0) && !packageDays) continue;
+    const vbDue = volumeBonusDue(p, key);
+    const bonusDue = p.permanentBan ? 0 : vbDue.dueEgp;
+    // Reversing adjustments (C4) for refunds of already-settled bookings.
+    const pendingAdj = (store.data.settlementAdjustments || []).filter((a) => a.providerId === p.id && !a.appliedSettlementId);
+    // Totals (C2): cash contributes ONLY the app share, as a debt the
+    // provider owes the app; the provider's cash share is never owed
+    // by the app because the provider already holds the cash.
+    let appOwes = 0, provOwes = 0;
+    for (const b of payable) {
+      if (b.cashCollectedByProvider) provOwes += b.appShareEgp || 0;
+      else appOwes += b.providerShareEgp || 0;
+    }
+    appOwes += packageProviderShare + bonusDue + stayDue;
+    provOwes += packageCashAppShare;
+    // Hold bucket (C4): amounts not yet settleable, shown separately
+    // and never paid from this record.
+    let holdEgp = packageHoldEgp;
+    const holdBookingIds = [];
+    for (const b of held) {
+      holdEgp += b.cashCollectedByProvider ? (b.appShareEgp || 0) : (b.providerShareEgp || 0);
+      holdBookingIds.push(b.id);
+    }
+    // Apply reversing adjustments: a refunded provider share reduces
+    // what the app owes; a refunded cash app-share reduces what the
+    // provider owes. An excess nets to the other side (a debt).
+    let adjProviderShare = 0, adjCashAppShare = 0;
+    for (const a of pendingAdj) {
+      if (a.cash) adjCashAppShare += a.appShareEgp || 0;
+      else adjProviderShare += a.providerShareEgp || 0;
+    }
+    let appOwes2 = appOwes - adjProviderShare;
+    let provOwes2 = provOwes - adjCashAppShare;
+    if (appOwes2 < 0) { provOwes2 += -appOwes2; appOwes2 = 0; }
+    if (provOwes2 < 0) { appOwes2 += -provOwes2; provOwes2 = 0; }
+    const adjustmentsEgp = adjProviderShare + adjCashAppShare;
+    const hasActivity = payable.length || held.length || packageDays || packageHoldDays || stayDue || bonusDue > 0 || pendingAdj.length;
+    if (!hasActivity) continue;
     const exists = (store.data.settlements || []).some((x) => x.providerId === p.id && x.weekKey === weekKey);
     if (exists) continue;
     const totals = {
-      appOwesProviderEgp: weekBookings.reduce((sum, b) => sum + (b.providerShareEgp || 0), 0) + vb.bonusEgp + stayDue + packageProviderShare,
-      providerOwesAppEgp: weekBookings.filter((b) => b.cashCollectedByProvider).reduce((sum, b) => sum + (b.appShareEgp || 0), 0) + packageCashAppShare,
-      volumeBonusEgp: vb.bonusEgp, stayBonusEgp: stayDue,
-      releasedCases: weekBookings.length,
+      appOwesProviderEgp: appOwes2, providerOwesAppEgp: provOwes2,
+      volumeBonusEgp: bonusDue, volumeBonusMonth: key, volumeBonusPaidCumulative: (vbDue.paidEgp || 0) + bonusDue,
+      stayBonusEgp: stayDue,
+      releasedCases: payable.length,
       packageDays, packageProviderShareEgp: packageProviderShare, packageAppShareEgp: packageAppShare,
+      packageCashAppShareEgp: packageCashAppShare,
+      cashAppShareEgp: payable.filter((b) => b.cashCollectedByProvider).reduce((s, b) => s + (b.appShareEgp || 0), 0),
+      complaintHoldEgp: holdEgp, complaintHoldBookingIds: holdBookingIds, packageHoldDays,
+      adjustmentsEgp, adjustmentsApplied: pendingAdj.map((a) => a.id),
+      payable: holdEgp === 0,
+      settledBookingIds: payable.map((b) => b.id),
     };
     const rec = { id: newId('stl'), providerId: p.id, weekKey, generatedAt: nowIso(), totals };
     store.data.settlements.push(rec);
+    // Mark what this record settled so a later week never pays it again.
+    for (const b of payable) { b.settledWeekKey = weekKey; b.settledAt = nowIso(); }
+    for (const { rel } of payableRels) { rel.settledWeekKey = weekKey; rel.settledAt = nowIso(); }
+    for (const a of pendingAdj) a.appliedSettlementId = rec.id;
+    if (bonusDue > 0) {
+      p.volumeBonusPaid = { month: key, amountEgp: (vbDue.paidEgp || 0) + bonusDue };
+      store.audit('bonus.paid', p.id, { settlementId: rec.id, month: key, amountEgp: bonusDue, cumulativeEgp: p.volumeBonusPaid.amountEgp });
+    }
     if (stayDue > 0) {
       p.stayBonusPaid = true;
       store.audit('stay_bonus.paid', p.id, { settlementId: rec.id, amountEgp: stayDue });
@@ -327,6 +504,61 @@ function circumventionFlags() {
     })
     .filter((f) => f.reasons.length > 0 || f.suspended || f.permanentBan)
     .sort((a, b) => (b.circumventionReports - a.circumventionReports) || (b.oneTimeClients - a.oneTimeClients));
+}
+// v2.1.6 (C8): cheap anomaly flags for fake-visit farming — NO full
+// anomaly engine in this build, just the high-value signals, computed
+// live for the admin dashboard (like circumventionFlags). A flag is a
+// REVIEW prompt, never an automatic ban.
+//   - instantVisits: >=2 visits completed <20 min after acceptance
+//     in the last 30 days (the 10-min hard floor at complete-provider
+//     blocks the fastest ones; 10–20 min stays suspicious).
+//   - newPatientBurst: >=5 DISTINCT patient phones whose FIRST booking
+//     with this provider was in the last 7 days (a farm spins up new
+//     patient numbers; a real provider's new patients trickle in).
+//   - tooFastAttempts: >=2 rejected too-fast completion attempts
+//     (audit 'booking.complete_too_fast') in the last 30 days.
+function anomalyFlags() {
+  const nowMs = Date.now();
+  const out = [];
+  const fastAttempts = {};
+  for (const a of (store.data.audit || [])) {
+    if (a.action === 'booking.complete_too_fast' && a.ts && nowMs - new Date(a.ts).getTime() <= 30 * 24 * 60 * 60 * 1000) {
+      const pid = a.details?.providerId || a.actor;
+      fastAttempts[pid] = (fastAttempts[pid] || 0) + 1;
+    }
+  }
+  // First booking per (provider, patient phone) — a "new patient" is a
+  // phone whose FIRST booking with this provider was in the last 7 days.
+  const firstSeen = {};
+  for (const b of Object.values(store.data.bookings)) {
+    if (!b.providerId || !b.patientPhone || !b.createdAt) continue;
+    const k = `${b.providerId}:${b.patientPhone}`;
+    const t = new Date(b.createdAt).getTime();
+    if (Number.isFinite(t) && (!firstSeen[k] || t < firstSeen[k])) firstSeen[k] = t;
+  }
+  for (const p of Object.values(store.data.providers)) {
+    if (p.demo) continue;
+    const reasons = [];
+    let instantVisits = 0;
+    const newPatients = new Set();
+    for (const b of Object.values(store.data.bookings)) {
+      if (b.providerId !== p.id || !b.acceptedAt) continue;
+      const accMs = new Date(b.acceptedAt).getTime();
+      if (b.providerConfirmedAt) {
+        const durMs = new Date(b.providerConfirmedAt).getTime() - accMs;
+        if (durMs >= 0 && durMs < 20 * 60 * 1000 && nowMs - accMs <= 30 * 24 * 60 * 60 * 1000) instantVisits += 1;
+      }
+    }
+    for (const [k, t] of Object.entries(firstSeen)) {
+      if (k.startsWith(`${p.id}:`) && nowMs - t <= 7 * 24 * 60 * 60 * 1000) newPatients.add(k.slice(p.id.length + 1));
+    }
+    if (instantVisits >= 2) reasons.push(`${instantVisits} visits completed <20 min after acceptance in 30 days`);
+    if (newPatients.size >= 5) reasons.push(`${newPatients.size} new patient phones in 7 days`);
+    const tooFast = fastAttempts[p.id] || fastAttempts[p.phone] || 0;
+    if (tooFast >= 2) reasons.push(`${tooFast} too-fast completion attempts rejected in 30 days`);
+    if (reasons.length) out.push({ providerId: p.id, name: p.name, phone: p.phone, tier: p.tier, instantVisits, newPatients7d: newPatients.size, tooFastAttempts: tooFast, reasons });
+  }
+  return out.sort((a, b) => (b.instantVisits + b.newPatients7d) - (a.instantVisits + a.newPatients7d));
 }
 // ---------------------------------------------------------------- v2.0.9 — reversed commissions + volume bonus + promo months + loyalty vouchers
 // Owner decision 26 Nov 2026 ("da awwal iqtirah ba'akkidlak 'aleih"):
@@ -553,7 +785,11 @@ function releasePackageDays(booking, days, providerId) {
     appShareEgp += app;
     d.released = true; d.releasedAt = nowIso(); d.weekKey = currentWeekKey();
   }
-  const entry = { weekKey: currentWeekKey(), providerId, days: days.length, providerShareEgp, appShareEgp, releasedAt: nowIso(), final: false };
+  const entry = { weekKey: currentWeekKey(), providerId, days: days.length, providerShareEgp, appShareEgp, releasedAt: nowIso(), final: false,
+    // v2.1.6 (C4/C7): a WEEKLY release is settleable at once (terms
+    // §12); a FINAL release waits out the booking's 24h complaint
+    // window — releasePackageBooking sets settleableAt below.
+    settleableAt: null, settledWeekKey: null, settledAt: null };
   booking.packageDayReleases = booking.packageDayReleases || [];
   booking.packageDayReleases.push(entry);
   booking.daysReleased = (booking.daysReleased || 0) + days.length;
@@ -568,8 +804,16 @@ function settlePackageDays() {
   const released = [];
   for (const b of Object.values(store.data.bookings)) {
     if (b.kind !== 'package' || b.status !== 'accepted') continue;
+    // v2.1.6 (C7): a package flagged for bulk-registration review
+    // releases NOTHING until the admin clears it.
+    if (b.packageReviewRequired) continue;
     const byProvider = {};
+    // v2.1.6 (C7): only EVIDENCED days release — patient-confirmed,
+    // or vitals-backed and 72h old (see packageDayReleasable). A
+    // self-recorded day with no confirmation and no vitals stays
+    // unreleased; its value stays in the refundable remainder.
     for (const d of packageUnreleasedDays(b)) {
+      if (!packageDayReleasable(d)) continue;
       byProvider[d.providerId] = byProvider[d.providerId] || [];
       byProvider[d.providerId].push(d);
     }
@@ -588,15 +832,25 @@ function settlePackageDays() {
 // A package counts as ONE completed case for the main provider (points +
 // volume bonus) — the same as a standard visit.
 function releasePackageBooking(b, mode) {
+  // v2.1.6 (C7): a package under bulk-registration review does NOT
+  // final-release until the admin clears it; and only EVIDENCED days
+  // release (confirmed, or vitals + 72h). Unconfirmed days stay
+  // unreleased and their value stays refundable to the patient.
+  if (b.packageReviewRequired) return;
   const byProvider = {};
   for (const d of packageUnreleasedDays(b)) {
+    if (!packageDayReleasable(d)) continue;
     if (providerBlocked(store.data.providers[d.providerId])) continue; // hold: banned provider's days stay unreleased
     byProvider[d.providerId] = byProvider[d.providerId] || [];
     byProvider[d.providerId].push(d);
   }
   for (const [providerId, days] of Object.entries(byProvider)) {
     const entry = releasePackageDays(b, days, providerId);
-    if (entry) entry.final = true;
+    if (entry) {
+      entry.final = true;
+      // The final release waits out the booking's 24h complaint window.
+      entry.settleableAt = b.settleableAt || b.complaintDeadline || null;
+    }
   }
   const totals = packageDayTotals(b);
   b.providerShareEgp = totals.providerShareEgp;
@@ -1203,12 +1457,20 @@ router.post('/me/language-tests/:lang/start', requireAuth, requireRole('provider
   if (existing && new Date(existing.deadlineAt).getTime() > Date.now()) {
     return res.status(409).json({ error: 'conflict', message: 'A language test attempt is already in progress.', deadlineAt: existing.deadlineAt });
   }
-  const questions = shuffle([...bank]);
+  // v2.1.6 (C5): the bank is 12 questions per language and each attempt
+  // SAMPLES 8 of them at random — the old code published the whole bank,
+  // so the compromised bank (all answers "a", in the public repo) made
+  // the test trivially passable. The published options carry NO keys:
+  // the client answers by POSITION (0-3) and the server scores the
+  // position against the position it stored at start. A raw key letter
+  // ("a"–"d") is rejected at submit — it can only come from someone
+  // reading the bank, not from the app UI.
+  const questions = shuffle([...bank]).slice(0, cat.LANGUAGE_TEST_QUESTIONS);
   const answerKey = {};
   const pub = questions.map((q) => {
-    const opts = shuffle(q.options);
-    answerKey[q.id] = q.correct;
-    return { id: q.id, topic: q.topic, text: q.text, options: opts };
+    const opts = shuffle([...q.options]);
+    answerKey[q.id] = opts.findIndex((o) => o.key === q.correct);
+    return { id: q.id, topic: q.topic, text: q.text, options: opts.map((o) => ({ text: o.text })) };
   });
   const attemptId = newId('lt');
   const deadlineAt = new Date(Date.now() + cat.LANGUAGE_TEST_MINUTES * 60 * 1000).toISOString();
@@ -1233,20 +1495,28 @@ router.post('/me/language-tests/:lang/submit', requireAuth, requireRole('provide
     store.save();
     return res.status(410).json({ error: 'expired', message: 'The language test deadline passed (server time). Start a new attempt.' });
   }
-  const mapAnswers = (raw, pub) => {
-    const out = {};
-    for (const [qid, v] of Object.entries(raw || {})) {
-      const q = (pub || []).find((x) => x.id === qid);
-      if (!q) { out[qid] = v; continue; }
-      const idx = Number(v);
-      out[qid] = Number.isInteger(idx) && q.options[idx] ? q.options[idx].key : v;
+  // v2.1.6 (C5): answers are POSITIONS (0-3) into the options the start
+  // call published — scored against the position stored at start. A raw
+  // key letter ("a"–"d"), a non-integer, an out-of-range index, or an
+  // answer for a question that was not in this attempt is rejected with
+  // 400 (it can only come from someone reading the bank, not the app).
+  // A missing answer simply scores 0 for that question.
+  const rawAnswers = req.body?.answers || {};
+  const sampledIds = new Set((active.pub || []).map((q) => q.id));
+  const answers = {};
+  for (const [qid, v] of Object.entries(rawAnswers)) {
+    if (!sampledIds.has(qid)) {
+      return bad(res, 400, `Answer for question ${qid} is not part of this attempt.`, { questionId: qid });
     }
-    return out;
-  };
-  const answers = mapAnswers(req.body?.answers, active.pub);
+    const idx = Number(v);
+    if (!Number.isInteger(idx) || idx < 0 || idx > 3) {
+      return bad(res, 400, 'Answers must be option positions (0-3) — key letters are not accepted.', { questionId: qid });
+    }
+    answers[qid] = idx;
+  }
   let score = 0;
-  for (const q of cat.LANGUAGE_TESTS[lang] || []) {
-    if (answers[q.id] === active.answerKey[q.id]) score += 1;
+  for (const q of (active.pub || [])) {
+    if (answers[q.id] != null && answers[q.id] === active.answerKey[q.id]) score += 1;
   }
   const total = cat.LANGUAGE_TEST_QUESTIONS;
   const passed = score >= cat.LANGUAGE_TEST_PASS_MIN;
@@ -1428,6 +1698,7 @@ router.post('/admin/bookings/:id/receipt/approve', requireAdmin, (req, res) => {
   b.receipt.status = 'approved';
   b.receipt.reviewedAt = nowIso();
   b.receipt.note = String(req.body?.note || '').slice(0, 500) || null;
+  b.receiptStatus = 'approved'; // v2.1.6 (C6)
   // v2.1.3 — a package booking held for receipt review starts once the
   // receipt is approved (the month's escrow is then real).
   if (b.kind === 'package' && b.status === 'held') b.status = 'accepted';
@@ -1446,6 +1717,7 @@ router.post('/admin/bookings/:id/receipt/reject', requireAdmin, (req, res) => {
   b.receipt.status = 'rejected';
   b.receipt.reviewedAt = nowIso();
   b.receipt.note = note;
+  b.receiptStatus = 'rejected'; // v2.1.6 (C6)
   store.audit('admin.receipt_rejected', 'admin', { bookingId: b.id, note });
   store.save();
   res.json({ ok: true, bookingId: b.id, receipt: b.receipt, note: 'The patient can upload a new receipt photo while the booking is still held.' });
@@ -1662,12 +1934,13 @@ router.post('/auth/login-phone', (req, res) => {
   const phone = normalizePhone(req.body?.phone);
   if (!phone) return bad(res, 400, 'Valid Egyptian phone number required (01xxxxxxxxx).');
   // v2.1.0 — phone-only login is ONLY a fallback while no real OTP
-  // provider is configured. Once SMS OTP is switched on (owner decision
-  // 26 Nov 2026: code-ready now, activation later), phone-only login is
-  // disabled in production — anyone who knows a number could otherwise
-  // enter as that account. Dev/test are unaffected (mock OTP there).
-  if (config.isProd && config.smsConfigured()) {
-    return res.status(410).json({ error: 'phone_login_disabled', message: 'Phone-only login is disabled now that SMS OTP login is active. Request a login code instead.' });
+  // provider is configured. Once ANY OTP provider is switched on (SMS
+  // or WhatsApp — owner decision 26 Nov 2026: code-ready now,
+  // activation later), phone-only login is disabled in production —
+  // anyone who knows a number could otherwise enter as that account.
+  // Dev/test are unaffected (mock OTP there).
+  if (config.isProd && config.anyOtpConfigured()) {
+    return res.status(410).json({ error: 'phone_login_disabled', message: 'Phone-only login is disabled now that OTP login is active. Request a login code instead.' });
   }
   const provider = store.getProviderByPhone(phone);
   if (req.body?.role === 'provider' && !provider) {
@@ -1684,16 +1957,40 @@ router.post('/auth/login-phone', (req, res) => {
   logins[phone] = rec;
   if (!store.data.users[phone]) store.data.users[phone] = { phone, createdAt: nowIso() };
   const role = provider ? 'provider' : 'patient';
-  const tokens = issueTokens({ phone, role, providerId: provider ? provider.id : null });
-  // v2.1.1 (audit #1): flag a login from a phone with NO prior login
-  // record — a new-device alert. Phone-only login stays the
-  // owner-authorized fallback (accepted residual risk, documented in
-  // SERVER-CHANGES-2.1.1.md); OTP is the real fix when unblocked.
-  const isNewDevice = !store.data.phoneLogins[phone] || (store.data.phoneLogins[phone].requests || []).length <= 1;
-  store.audit(isNewDevice ? 'auth.phone_login_new_device' : 'auth.phone_login', phone, { role, authMethod: 'phone-only-fallback', newDevice: isNewDevice });
+  // v2.1.6 (C1 interim): phone-only logins get a SHORT refresh token
+  // (24h instead of 7 days) because no OTP verified the caller — a
+  // stolen session from a known phone number dies within a day.
+  const tokens = issueTokens({ phone, role, providerId: provider ? provider.id : null }, undefined, { refreshTtlDays: 1, authMethod: 'phone-only' });
+  // v2.1.6 (C1 interim): REAL new-device detection. The app sends a
+  // persistent deviceId (web: localStorage; see web/app.js); when it is
+  // absent the fingerprint falls back to a hash of the User-Agent.
+  // A login from an unseen device alerts the user in-app and is
+  // audited + listed in the admin dashboard. (The old check only
+  // flagged the FIRST login ever — it compared the request count
+  // after pushing the current request.)
+  const userRec = store.data.users[phone];
+  userRec.devices = userRec.devices || [];
+  const rawDeviceId = typeof req.body?.deviceId === 'string' ? req.body.deviceId.trim().slice(0, 128) : '';
+  const deviceId = rawDeviceId || `ua:${sha256(req.headers['user-agent'] || 'unknown').slice(0, 12)}`;
+  const known = userRec.devices.find((d) => d.id === deviceId);
+  const isNewDevice = !known;
+  if (known) known.lastSeenAt = nowIso();
+  else userRec.devices.push({ id: deviceId, firstSeenAt: nowIso(), lastSeenAt: nowIso(), userAgent: String(req.headers['user-agent'] || '').slice(0, 200) });
+  store.audit(isNewDevice ? 'auth.phone_login_new_device' : 'auth.phone_login', phone, { role, authMethod: 'phone-only-fallback', newDevice: isNewDevice, deviceId: deviceId.slice(0, 24) });
+  if (isNewDevice && userRec.devices.length > 1) {
+    // Not the account's first login: warn the owner in-app (and by
+    // push if registered) — if it was not them, they can contact the
+    // admin. Best-effort: a failed notification never blocks login.
+    notify.notifyUser(phone, {
+      type: 'security', titleAr: 'دخول من جهاز جديد', titleEn: 'Login from a new device',
+      bodyAr: 'تم الدخول إلى حسابك من جهاز لم نره من قبل. إذا لم يكن هذا أنت، تواصل مع إدارة التطبيق فورًا.',
+      bodyEn: 'Your account was signed in from a device we have not seen before. If this was not you, contact the app admin right away.',
+      data: { type: 'new_device' }, critical: false,
+    }).catch(() => {});
+  }
   store.save();
   // `token` is the field the web frontend reads (alias of accessToken).
-  res.json({ ...tokens, token: tokens.accessToken, role, providerId: provider ? provider.id : null, phone, authMethod: 'phone-only' });
+  res.json({ ...tokens, token: tokens.accessToken, role, providerId: provider ? provider.id : null, phone, authMethod: 'phone-only', newDevice: isNewDevice });
 });
 
 // ---------------------------------------------------------------- auth
@@ -1708,7 +2005,10 @@ router.post('/auth/refresh', (req, res) => {
     return res.status(401).json({ error: 'unauthorized', message: 'Invalid or expired refresh token.' });
   }
   // Rotate within the SAME family; revoke the old token.
-  const tokens = issueTokens({ phone: rec.phone, role: rec.role, providerId: rec.providerId }, rec.familyId);
+  // v2.1.6 (C1 interim): a phone-only family keeps its short 24h
+  // refresh lifetime on rotation; OTP families keep 7 days.
+  const tokens = issueTokens({ phone: rec.phone, role: rec.role, providerId: rec.providerId }, rec.familyId,
+    rec.authMethod === 'phone-only' ? { refreshTtlDays: 1, authMethod: 'phone-only' } : { authMethod: rec.authMethod || null });
   rec.revoked = true;
   store.save();
   store.audit('auth.refresh_used', rec.phone, { familyId: rec.familyId });
@@ -1848,6 +2148,10 @@ router.post('/bookings', requireAuth, requireRole('patient'), (req, res) => {
   // reviews the receipt (see the accept gate).
   const receiptParsed = receiptFromBody(req.body, b.paymentMethod);
   if (receiptParsed.error) return bad(res, 400, receiptParsed.error);
+  // v2.1.6 (C6): an online payment without a receipt is rejected here —
+  // the receipt is the only proof the money exists.
+  const receiptErr = receiptRequiredError(b.paymentMethod, receiptParsed);
+  if (receiptErr) return bad(res, 400, receiptErr);
   const id = newId('bk');
   // v2.0.9 — auto-apply one loyalty voucher when the booking is >= 300 EGP.
   // The provider's share is computed on the FULL price at release; the
@@ -2371,6 +2675,11 @@ router.post('/package-requests/:id/accept', requireAuth, requireRole('patient'),
   if (!['cash_receipt', 'instapay'].includes(paymentMethod)) return bad(res, 400, 'paymentMethod must be cash_receipt or instapay.');
   const parsed = receiptFromBody(req.body, paymentMethod);
   if (parsed.error) return bad(res, 400, parsed.error);
+  // v2.1.6 (C6): a package is NEVER created 'accepted' without an
+  // approved receipt or explicitly recorded cash terms. Online payment
+  // without a receipt is rejected here; cash records its terms below.
+  const receiptErrPkg = receiptRequiredError(paymentMethod, parsed);
+  if (receiptErrPkg) return bad(res, 400, receiptErrPkg);
   const p = store.data.providers[r.quote.providerId];
   if (!p) return bad(res, 409, 'The assigned provider no longer exists.');
   const blocked = providerBlocked(p);
@@ -2408,6 +2717,12 @@ router.post('/package-requests/:id/accept', requireAuth, requireRole('patient'),
     paymentMethod, status: parsed.receipt ? 'held' : 'accepted',
     commissionPct: pct, estimatedProviderShareEgp: Math.round(totalEgp * (1 - pct / 100)),
     cashCollectedByProvider: paymentMethod === 'cash_receipt',
+    // v2.1.6 (C6): a cash package is 'accepted' ONLY with explicitly
+    // recorded cash terms (the patient chose cash-with-receipt at the
+    // first visit); an online package without a receipt never reaches
+    // here (rejected above) and stays 'held' until admin approval.
+    cashTerms: paymentMethod === 'cash_receipt' ? { method: 'cash_receipt', recordedAt: nowIso(), note: 'Cash with receipt, collected by the provider at the first visit; the full month is held in escrow until then.' } : null,
+    receiptStatus: receiptStatusOf({ paymentMethod, receipt: parsed.receipt || null }),
     createdAt: nowIso(),
     vitals: null, review: null, providerReview: null, complaint: false,
     appShareEgp: null, providerShareEgp: null,
@@ -2495,13 +2810,104 @@ router.post('/bookings/:id/package-day', requireAuth, requireRole('provider'), (
   const rate = type === 'regular'
     ? ((b.daysCompleted || 0) + 1 >= cat.PACKAGE_DAYS ? (b.basePackage ?? b.basePackageEgp ?? 0) - (cat.PACKAGE_DAYS - 1) * (b.dailyRate ?? packageDailyRate(b)) : (b.dailyRate ?? packageDailyRate(b)))
     : (b.extraDays.dailyRate ?? b.extraDays.dailyRateEgp);
-  const entry = { date, type, providerId: req.user.providerId, rateEgp, rate, currency: b.currency || 'EGP', loggedAt: nowIso(), released: false, releasedAt: null, weekKey: null };
+  // v2.1.6 (C7): a day carries its EVIDENCE — optional vitals recorded
+  // at the visit (BP/pulse/temp/SpO2, same ranges as visit vitals) and
+  // the patient's confirmation (default false). A day becomes releasable
+  // only when the patient confirms it, or when vitals exist and 72h
+  // pass with no dispute (see packageDayReleasable). The admin can
+  // confirm a day on the patient's behalf.
+  let vitals = null;
+  if (req.body?.vitals && typeof req.body.vitals === 'object') {
+    const v = req.body.vitals;
+    const num = (k, min, max) => {
+      const n = Number(v[k]);
+      return Number.isFinite(n) && n >= min && n <= max ? n : null;
+    };
+    const parsedVitals = {
+      bpSystolic: num('bpSystolic', 50, 300), bpDiastolic: num('bpDiastolic', 30, 200),
+      pulse: num('pulse', 20, 250), temp: num('temp', 30, 45), oxygen: num('oxygen', 50, 100),
+    };
+    const given = ['bpSystolic', 'bpDiastolic', 'pulse', 'temp', 'oxygen'].filter((k) => v[k] !== undefined && v[k] !== null && v[k] !== '');
+    if (given.length && given.some((k) => parsedVitals[k] == null)) {
+      return bad(res, 400, `Day vitals out of range: ${given.filter((k) => parsedVitals[k] == null).join(', ')}`);
+    }
+    if (given.length) vitals = { ...parsedVitals, at: nowIso(), notes: String(v.notes || '').slice(0, 500) };
+  }
+  const entry = { date, type, providerId: req.user.providerId, rateEgp, rate, currency: b.currency || 'EGP', loggedAt: nowIso(), released: false, releasedAt: null, weekKey: null,
+    vitals, patientConfirmed: false, patientConfirmedAt: null, confirmedBy: null };
   b.daysLog.push(entry);
   if (type === 'regular') b.daysCompleted = (b.daysCompleted || 0) + 1;
   else b.extraDaysCompleted = (b.extraDaysCompleted || 0) + 1;
-  store.audit('package.day_logged', req.user.phone, { bookingId: b.id, date, type, rateEgp });
+  store.audit('package.day_logged', req.user.phone, { bookingId: b.id, date, type, rateEgp, vitals: !!vitals });
+  // v2.1.6 (C7): bulk registration — more than 3 days logged in ONE
+  // calendar day for this package forces an admin review before ANY
+  // day of the package releases (a provider filling 26 days at once
+  // must not be paid from a silent record).
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const loggedToday = (b.daysLog || []).filter((d) => (d.loggedAt || '').slice(0, 10) === todayStr).length;
+  if (loggedToday > 3 && !b.packageReviewRequired) {
+    b.packageReviewRequired = true;
+    b.packageReviewReason = `${loggedToday} days logged on ${todayStr} — bulk registration, admin review required before release.`;
+    store.audit('package.bulk_days_flagged', req.user.phone, { bookingId: b.id, loggedToday, date: todayStr });
+  }
   store.save();
   res.json(pubBooking(req, b, { includePaymentNumber: true }));
+});
+
+// v2.1.6 (C7): the patient confirms a logged package day (the visit
+// happened). A confirmed day is releasable at the next weekly sweep.
+// Only the patient who owns the booking can confirm; the date must be
+// a logged, unreleased day, not in the future.
+router.post('/bookings/:id/package-day/:date/confirm', requireAuth, requireRole('patient'), (req, res) => {
+  const b = loadBooking(req, res);
+  if (!b) return;
+  if (b.kind !== 'package') return bad(res, 400, 'This endpoint is for monthly package bookings only.');
+  if (b.patientPhone !== req.user.phone) return res.status(403).json({ error: 'forbidden', message: 'Not your package booking.' });
+  const date = String(req.params.date || '').trim();
+  const d = (b.daysLog || []).find((x) => x.date === date);
+  if (!d) return res.status(404).json({ error: 'not_found', message: 'No logged day for this date.' });
+  if (d.released) return bad(res, 409, 'This day is already released.');
+  if (d.patientConfirmed) return bad(res, 409, 'This day is already confirmed.');
+  d.patientConfirmed = true;
+  d.patientConfirmedAt = nowIso();
+  d.confirmedBy = 'patient';
+  store.audit('package.day_confirmed', req.user.phone, { bookingId: b.id, date, by: 'patient' });
+  store.save();
+  res.json({ ok: true, bookingId: b.id, date, patientConfirmed: true });
+});
+
+// v2.1.6 (C7): the admin confirms a day on the patient's behalf (e.g.
+// an elderly patient who called by phone, or a patient who cannot use
+// the app). Audited with the admin as the actor.
+router.post('/admin/bookings/:id/package-day/:date/confirm', requireAdmin, (req, res) => {
+  const b = store.data.bookings[req.params.id];
+  if (!b) return res.status(404).json({ error: 'not_found', message: 'Booking not found.' });
+  if (b.kind !== 'package') return bad(res, 400, 'This endpoint is for monthly package bookings only.');
+  const date = String(req.params.date || '').trim();
+  const d = (b.daysLog || []).find((x) => x.date === date);
+  if (!d) return res.status(404).json({ error: 'not_found', message: 'No logged day for this date.' });
+  if (d.released) return bad(res, 409, 'This day is already released.');
+  if (d.patientConfirmed) return bad(res, 409, 'This day is already confirmed.');
+  d.patientConfirmed = true;
+  d.patientConfirmedAt = nowIso();
+  d.confirmedBy = 'admin';
+  store.audit('package.day_confirmed', 'admin', { bookingId: b.id, date, by: 'admin' });
+  store.save();
+  res.json({ ok: true, bookingId: b.id, date, patientConfirmed: true, confirmedBy: 'admin' });
+});
+
+// v2.1.6 (C7): the admin clears the bulk-registration review flag
+// after reviewing the package (the days then release normally).
+router.post('/admin/bookings/:id/package-review/clear', requireAdmin, (req, res) => {
+  const b = store.data.bookings[req.params.id];
+  if (!b) return res.status(404).json({ error: 'not_found', message: 'Booking not found.' });
+  if (b.kind !== 'package') return bad(res, 400, 'This endpoint is for monthly package bookings only.');
+  if (!b.packageReviewRequired) return bad(res, 409, 'This package has no pending review.');
+  b.packageReviewRequired = false;
+  b.packageReviewClearedAt = nowIso();
+  store.audit('package.review_cleared', 'admin', { bookingId: b.id, reason: b.packageReviewReason || null });
+  store.save();
+  res.json({ ok: true, bookingId: b.id, packageReviewRequired: false });
 });
 
 // Main provider completes the package: all 26 regular days logged, OR
@@ -2652,7 +3058,10 @@ router.get('/providers/radar', requireAuth, requireRole('provider'), (req, res) 
       && !(b.kind === 'tourist' && (!touristCompatibleFor(p, b.language) || englishBlocked(p)))
       // v2.1.2 — a booking whose receipt photo is still under admin
       // review cannot be accepted yet, so it stays off the radar too.
-      && !receiptPending(b)
+      // v2.1.6 (C6): an online booking with NO receipt at all is also
+      // hidden (it cannot exist after the creation fix, but older data
+      // and direct API calls must stay blocked).
+      && !receiptBlocked(b)
       // v2.1.1 — Elite early access: bookings created <30 min ago are
       // visible ONLY to Elite providers; everyone else sees them after
       // 30 minutes.
@@ -2690,9 +3099,13 @@ router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, 
     return res.status(403).json({ error: 'forbidden', message: `Tourist bookings in ${b.language || 'en'} require the in-app ${(b.language || 'en').toUpperCase()} language test (interview passed + test passed).` });
   }
   // v2.1.2 — a receipt photo under admin review blocks acceptance
-  // until the admin confirms or rejects it.
-  if (receiptPending(b)) {
-    return res.status(403).json({ error: 'receipt_pending_review', message: 'This booking has a receipt photo under admin review — it cannot be accepted until the admin confirms or rejects the receipt.' });
+  // until the admin confirms or rejects it. v2.1.6 (C6): an online
+  // booking with NO receipt at all is blocked the same way.
+  if (receiptBlocked(b)) {
+    const msg = receiptPending(b)
+      ? 'This booking has a receipt photo under admin review — it cannot be accepted until the admin confirms or rejects the receipt.'
+      : 'This booking has an online payment with no receipt photo — it cannot be accepted until the patient uploads a receipt.';
+    return res.status(403).json({ error: 'receipt_pending_review', message: msg });
   }
   if (b.category === 'physio' && p.providerType !== 'physio') {
     return res.status(403).json({ error: 'forbidden', message: 'Physiotherapy services can only be accepted by a physiotherapy specialist.' });
@@ -2819,6 +3232,19 @@ router.post('/bookings/:id/complete-provider', requireAuth, requireRole('provide
   if (store.data.providers[req.user.providerId]?.status !== 'verified') return res.status(403).json({ error: 'forbidden', message: 'Admin document verification is required (status=verified).' });
   if (b.status !== 'accepted') return bad(res, 409, `Cannot confirm completion while status is ${b.status}.`);
   if (!b.vitals) return bad(res, 409, 'Mandatory vitals must be recorded before completing the visit.');
+  // v2.1.6 (C8): a visit cannot be completed less than 10 minutes
+  // after acceptance — instant accept→complete cycles are the signature
+  // of fake-visit farming. The clock starts at acceptance (the provider
+  // accepts when they arrive on site). Rejected attempts are audited so
+  // repeated attempts flag the provider in the admin dashboard.
+  if (b.acceptedAt && config.minVisitMs > 0) {
+    const acceptMs = new Date(b.acceptedAt).getTime();
+    if (Number.isFinite(acceptMs) && Date.now() - acceptMs < config.minVisitMs) {
+      store.audit('booking.complete_too_fast', req.user.phone, { bookingId: b.id, providerId: req.user.providerId, acceptedAt: b.acceptedAt, minMinutes: Math.round(config.minVisitMs / 60000) });
+      store.save();
+      return bad(res, 409, `Visit too short: at least ${Math.round(config.minVisitMs / 60000)} minutes must pass between acceptance and completion.`, { minMinutes: Math.round(config.minVisitMs / 60000) });
+    }
+  }
   // v2.1.0 — suture removal: the provider must confirm seeing the written
   // doctor order before completing the visit (also accepted at vitals).
   if (b.serviceCode === 'suture_removal' && !b.doctorOrderSeenByProvider) {
@@ -2970,11 +3396,16 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
   // it is added to what the app owes the provider for this month.
   // During a 0%-commission promo month the cash bonus is PAUSED (titles
   // still awarded) — volumeBonus.paused says so, with bonusEgp 0.
+  // v2.1.6 (C3): the bonus is paid ONCE per month — the wallet shows
+  // only the INCREASE still due (volumeBonusDue), never the full amount
+  // again. `volumeBonus` (the full object) is kept for the title and
+  // the next target; `volumeBonusPaidEgp` shows what was already paid.
   const volumeBonus = volumeBonusFor(p.id, monthKey());
+  const vbDue = volumeBonusDue(p, monthKey());
   // A permanent ban forfeits pending settlement — including the bonus.
-  if (p.permanentBan) { volumeBonus.bonusEgp = 0; volumeBonus.note = 'Volume bonus forfeited (permanent ban).'; }
-  totals.volumeBonusEgp = volumeBonus.bonusEgp;
-  totals.appOwesProviderEgp += volumeBonus.bonusEgp;
+  if (p.permanentBan) { volumeBonus.bonusEgp = 0; volumeBonus.note = 'Volume bonus forfeited (permanent ban).'; vbDue.dueEgp = 0; }
+  totals.volumeBonusEgp = vbDue.dueEgp;
+  totals.appOwesProviderEgp += vbDue.dueEgp;
   const promoNow = activePromo();
   // v2.1.1 — points snapshot + 90-day stay bonus + buddy + days since join.
   const pts = recomputeProviderPoints(p, { auditTier: false });
@@ -2991,7 +3422,8 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
     buddy: buddy ? { id: buddy.id, name: buddy.name } : null,
     daysSinceJoin: stay.daysSinceJoin,
     promo: promoNow ? { active: true, commissionPct: promoNow.commissionPct, until: promoNow.until || null } : { active: false, commissionPct: null, until: null },
-    monthlyCases: volumeBonus.cases, volumeBonusEgp: volumeBonus.bonusEgp,
+    monthlyCases: volumeBonus.cases, volumeBonusEgp: vbDue.dueEgp,
+    volumeBonusPaidEgp: vbDue.paidEgp || 0,
     nextBonusAt: volumeBonus.nextBonusAt,
     volumeBonus,
     nextSettlementThursday: nextThursday(),
@@ -3423,6 +3855,9 @@ router.post('/tourist-bookings', requireAuth, requireRole('patient'), (req, res)
   // bookings reject a receipt image (receipt at the visit instead).
   const receiptParsedTourist = receiptFromBody(req.body, b.paymentMethod);
   if (receiptParsedTourist.error) return bad(res, 400, receiptParsedTourist.error);
+  // v2.1.6 (C6): online payment without a receipt is rejected here.
+  const receiptErrTourist = receiptRequiredError(b.paymentMethod, receiptParsedTourist);
+  if (receiptErrTourist) return bad(res, 400, receiptErrTourist);
   const id = newId('bk');
   // v2.0.9 — loyalty voucher (50 EGP, converted at this booking's fx rate).
   // Provider share is computed on the FULL pre-discount price at release.
@@ -3639,6 +4074,9 @@ router.post('/npwt/bookings', requireAuth, (req, res) => {
   // v2.1.2 — receipt photo for online payment (InstaPay); cash rejects it.
   const receiptParsedNpwt = receiptFromBody(req.body, b.paymentMethod);
   if (receiptParsedNpwt.error) return bad(res, 400, receiptParsedNpwt.error);
+  // v2.1.6 (C6): online payment without a receipt is rejected here.
+  const receiptErrNpwt = receiptRequiredError(b.paymentMethod, receiptParsedNpwt);
+  if (receiptErrNpwt) return bad(res, 400, receiptErrNpwt);
   const id = newId('bk');
   const vou = findVoucher(req.user.phone, totalEgp);
   const booking = {
@@ -3705,6 +4143,9 @@ router.post('/postop', requireAuth, requireRole('patient'), (req, res) => {
   // v2.1.2 — receipt photo for online payment (InstaPay); cash rejects it.
   const receiptParsedPostop = receiptFromBody(req.body, b.paymentMethod);
   if (receiptParsedPostop.error) return bad(res, 400, receiptParsedPostop.error);
+  // v2.1.6 (C6): online payment without a receipt is rejected here.
+  const receiptErrPostop = receiptRequiredError(b.paymentMethod, receiptParsedPostop);
+  if (receiptErrPostop) return bad(res, 400, receiptErrPostop);
   const id = newId('bk');
   // v2.0.9 — loyalty voucher (same rule as standard bookings).
   const vou = findVoucher(req.user.phone, priced.totalEgp);
@@ -3829,6 +4270,18 @@ router.get('/admin/dashboard', requireAdmin, (req, res) => {
     // numbers are ever returned.
     broadcastDevices: Object.values(store.data.devices || {}).reduce((n, list) => n + (Array.isArray(list) ? list.length : 0), 0),
     broadcastUsers: Object.values(store.data.devices || {}).filter((list) => Array.isArray(list) && list.length > 0).length,
+    // v2.1.6 — C8 anomaly flags (fake-visit farming signals) + C7
+    // package bulk-review queue + C1 new-device logins. Phones are
+    // shown here (admin-only endpoint) so the admin can act on them.
+    anomalyFlags: anomalyFlags(),
+    packageReviewRequired: Object.values(store.data.bookings).filter((b) => b.kind === 'package' && b.packageReviewRequired).map((b) => ({
+      id: b.id, providerId: b.providerId, status: b.status, reason: b.packageReviewReason || null,
+      daysLogged: (b.daysLog || []).length, daysConfirmed: (b.daysLog || []).filter((d) => d.patientConfirmed).length,
+      createdAt: b.createdAt,
+    })),
+    newDeviceLogins: (store.data.audit || []).filter((a) => a.action === 'auth.phone_login_new_device').slice(-20).reverse().map((a) => ({
+      phone: a.actor, at: a.ts, deviceId: a.details?.deviceId || null, role: a.details?.role || null,
+    })),
   });
 });
 
@@ -4194,6 +4647,10 @@ router.post('/admin/circumvention/:reportId/resolve', requireAdmin, (req, res) =
       b.appShareEgp = 0;
       b.providerShareEgp = 0;
       b.status = 'refunded';
+      // v2.1.6 (C4): if this booking was already settled, the refunded
+      // shares become a reversing adjustment on the next settlement —
+      // the money recorded as "paid" is clawed back, not lost.
+      if (b.settledWeekKey) createSettlementAdjustment(b.providerId, b, 'circumvention_confirmed');
       store.audit('circumvention.resolved_confirmed', 'admin', { bookingId: b.id, reportId: report.id, refundEgp: b.refundEgp });
     } else {
       store.audit('circumvention.resolved_rejected', 'admin', { bookingId: b.id, reportId: report.id });
@@ -4242,6 +4699,9 @@ router.post('/admin/complaints/:reportId/resolve', requireAdmin, (req, res) => {
       b.refundedShares = { appShareEgp: b.appShareEgp || 0, providerShareEgp: b.providerShareEgp || 0 };
       b.appShareEgp = 0;
       b.providerShareEgp = 0;
+      // v2.1.6 (C4): if this booking was already settled, the refunded
+      // shares become a reversing adjustment on the next settlement.
+      if (b.settledWeekKey) createSettlementAdjustment(b.providerId, b, 'complaint_accepted_refund');
     }
     b.refundedAt = nowIso();
     b.status = 'refunded';

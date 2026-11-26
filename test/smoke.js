@@ -9,7 +9,7 @@ const { spawn } = require('child_process');
 
 // v2.1.1: correct answers come from the server catalog (the test knows
 // the bank, not the API — the API never leaks 'correct' or red flags).
-const { MCQ, ENGLISH_CHECK, LANGUAGE_TESTS } = require('../src/catalog');
+const { MCQ, ENGLISH_CHECK, LANGUAGE_TESTS, LANGUAGE_TEST_TOPICS } = require('../src/catalog');
 const LANG_CORRECT = {}; for (const [lang, qs] of Object.entries(LANGUAGE_TESTS)) for (const q of qs) LANG_CORRECT[`${lang}:${q.id}`] = q.correct;
 const CORRECT = Object.fromEntries(MCQ.map((q) => [q.id, q.correct]));
 const RED_FLAG = Object.fromEntries(MCQ.filter((q) => q.redFlagOption).map((q) => [q.id, q.redFlagOption]));
@@ -55,6 +55,8 @@ async function main() {
     AUTO_RELEASE_MS: '1000', // shorten the 1h auto-release window for the test only
     BOOKING_LIMIT_MAX: '1000', // v2.0.9: volume-bonus cycles make ~200 booking-route calls
     CANCEL_WINDOW_MS: '5000', // shorten the 15-min cancel window for the test only
+    MIN_VISIT_MS: '0', // v2.1.6 (C8): disable the 10-min accept->complete floor — the test completes visits in seconds; the floor is tested in §27 with a dedicated flow
+    SWEEP_INTERVAL_MS: '3600000', // v2.1.6: the interval sweep never fires during tests — all sweeps are explicit via /api/jobs/sweep
   };
   const child = spawn('node', [path.join(__dirname, '..', 'server.js')], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '';
@@ -119,14 +121,19 @@ async function main() {
       const sub = await req('POST', '/api/providers/interview/submit', { token, body: { attemptId: st.json.attemptId, answers, englishAnswers: enAnswers } });
       return { start: st, submit: sub };
     }
-    // v2.1.2 — answer a language test in a given mode (keys come from
-    // the server catalog in the TEST ONLY — the API never leaks them).
+    // v2.1.2 — answer a language test in a given mode (the TEST knows
+    // the bank, not the API — the API never leaks keys). v2.1.6 (C5):
+    // answers are POSITIONS (0-3) into the published options, computed
+    // by matching the correct option TEXT — never a key letter.
     async function answerLanguageTest(token, lang, mode) {
       const st = await req('POST', `/api/me/language-tests/${lang}/start`, { token });
       if (st.status !== 200) return { start: st, submit: null };
       const answers = {};
       for (const q of st.json.questions) {
-        answers[q.id] = mode === 'all-correct' ? LANG_CORRECT[`${lang}:${q.id}`] : 'zzz';
+        const bankQ = LANGUAGE_TESTS[lang].find((x) => x.id === q.id);
+        const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+        const correctIdx = q.options.findIndex((o) => o.text === correctText);
+        answers[q.id] = mode === 'all-correct' ? correctIdx : (correctIdx + 1) % q.options.length;
       }
       const sub = await req('POST', `/api/me/language-tests/${lang}/submit`, { token, body: { attemptId: st.json.attemptId, answers } });
       return { start: st, submit: sub };
@@ -305,9 +312,13 @@ async function main() {
     r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Test Patient', serviceCode: 'dressing', paymentMethod: 'instapay',
       distanceKm: 8, respectCharterAccepted: true, triage: { dangerSigns: [] },
+      receiptImage: RECEIPT_JPEG, // v2.1.6 (C6): online payment requires a receipt at creation
     } });
     check('booking created held, total 275+100=375', r.status === 201 && r.json?.status === 'held' && r.json?.amountEgp === 375, JSON.stringify(r.json));
     const bkId = r.json?.id;
+    // v2.1.6 (C6): the receipt must be approved before the provider can accept.
+    r = await req('POST', `/api/admin/bookings/${bkId}/receipt/approve`, { token: adminToken, body: {} });
+    check('escrow booking receipt approved before accept', r.status === 200 && r.json?.receipt?.status === 'approved', JSON.stringify(r.json)?.slice(0, 200));
     // Provider 1 failed interview -> cannot accept (radar/accept locked).
     r = await req('POST', `/api/bookings/${bkId}/accept`, { token: prov1Token });
     check('interview-failed provider cannot accept -> 403', r.status === 403, JSON.stringify(r.json));
@@ -405,6 +416,7 @@ async function main() {
     r = await req('POST', '/api/postop', { token: patientToken2, body: { ...TERMS,
       patientName: 'Test Patient', surgeryType: 'Appendectomy', paymentMethod: 'instapay',
       distanceKm: 3, respectCharterAccepted: true,
+      receiptImage: RECEIPT_JPEG, // v2.1.6 (C6): online payment requires a receipt at creation
     } });
     check('post-op booking 1400', r.status === 201 && r.json?.amountEgp === 1400 && r.json?.kind === 'postop', JSON.stringify(r.json));
 
@@ -582,6 +594,40 @@ async function main() {
     r = await req('POST', `/api/admin/circumvention/${circReport.id}/resolve`, { token: adminToken, body: { decision: 'confirmed' } });
     check('admin confirms circumvention -> booking refunded', r.status === 200 && r.json?.booking?.status === 'refunded' && r.json?.booking?.refundEgp === 250, JSON.stringify(r.json));
 
+    // Full visit cycle helper (create -> accept -> vitals -> complete ->
+    // patient confirm -> review -> released). Moved up from §17 so §16
+    // can use it for the rating-points cycles below.
+    const completeVisit = async (patientTok, km) => {
+      const c = await req('POST', '/api/bookings', { token: patientTok, body: { ...TERMS,
+        patientName: 'Cycle Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+        distanceKm: km, respectCharterAccepted: true, triage: { dangerSigns: [] },
+      } });
+      if (c.status !== 201) return { ok: false, step: 'create', res: c };
+      const id = c.json.id;
+      const a = await req('POST', `/api/bookings/${id}/accept`, { token: provToken });
+      if (a.status !== 200) return { ok: false, step: 'accept', res: a };
+      const v = await req('POST', `/api/bookings/${id}/vitals`, { token: provToken, body: { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 } });
+      if (v.status !== 200) return { ok: false, step: 'vitals', res: v };
+      const cp = await req('POST', `/api/bookings/${id}/complete-provider`, { token: provToken });
+      if (cp.status !== 200) return { ok: false, step: 'complete-provider', res: cp };
+      const cf = await req('POST', `/api/bookings/${id}/confirm-patient`, { token: patientTok });
+      if (cf.status !== 200) return { ok: false, step: 'confirm-patient', res: cf };
+      const rv = await req('POST', `/api/bookings/${id}/review`, { token: patientTok, body: { rating: 5, comment: 'Good.' } });
+      if (rv.status !== 200 || rv.json?.status !== 'released') return { ok: false, step: 'review', res: rv };
+      return { ok: true, id, created: c.json, complete: cp.json, released: rv.json };
+    };
+    // v2.1.6 (C8): rating points count only with >=5 rated visits — so
+    // the provider needs 4 more 5-star rated visits here (bkId is the
+    // 1st) before the wallet check below can expect Pro (interview 20
+    // + rating 20 = 40). These 4 also count toward §17b's monthly cases
+    // (5 released before §17b, 29 more -> 34).
+    let ratingOk = true; let ratingFailStep = '';
+    for (let i = 0; i < 4; i++) {
+      const cyc = await completeVisit(patientToken2, 2);
+      if (!cyc.ok) { ratingOk = false; ratingFailStep = `${cyc.step} ${JSON.stringify(cyc.res?.json || cyc.res)}`; break; }
+    }
+    check('4 rating cycles complete (5 rated visits total)', ratingOk, ratingFailStep.slice(0, 300));
+
     // Graduated discipline: warn -> suspend blocks radar + accept -> unsuspend.
     r = await req('POST', '/api/admin/providers/prov_demo_pro/warn', { token: adminToken, body: { reason: 'Test warning: asked a patient to deal outside the app.' } });
     check('admin warn -> 200, warningCount 1', r.status === 200 && r.json?.warningCount === 1, JSON.stringify(r.json));
@@ -616,27 +662,6 @@ async function main() {
     // forced re-acceptance for a rates change).
     r = await req('GET', '/api/terms');
     check('terms text has reversed rates 15/12/8, no Elite 1,200 bonus', r.status === 200 && r.json?.textAr?.includes('Starter 15%') && r.json?.textAr?.includes('Elite 8%') && !r.json?.textAr?.includes('1,200 جنيه') && r.json?.version === '1.0', JSON.stringify(r.json)?.slice(0, 200));
-    // Full visit cycle helper (create -> accept -> vitals -> complete ->
-    // patient confirm -> review -> released).
-    const completeVisit = async (patientTok, km) => {
-      const c = await req('POST', '/api/bookings', { token: patientTok, body: { ...TERMS,
-        patientName: 'Cycle Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
-        distanceKm: km, respectCharterAccepted: true, triage: { dangerSigns: [] },
-      } });
-      if (c.status !== 201) return { ok: false, step: 'create', res: c };
-      const id = c.json.id;
-      const a = await req('POST', `/api/bookings/${id}/accept`, { token: provToken });
-      if (a.status !== 200) return { ok: false, step: 'accept', res: a };
-      const v = await req('POST', `/api/bookings/${id}/vitals`, { token: provToken, body: { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 } });
-      if (v.status !== 200) return { ok: false, step: 'vitals', res: v };
-      const cp = await req('POST', `/api/bookings/${id}/complete-provider`, { token: provToken });
-      if (cp.status !== 200) return { ok: false, step: 'complete-provider', res: cp };
-      const cf = await req('POST', `/api/bookings/${id}/confirm-patient`, { token: patientTok });
-      if (cf.status !== 200) return { ok: false, step: 'confirm-patient', res: cf };
-      const rv = await req('POST', `/api/bookings/${id}/review`, { token: patientTok, body: { rating: 5, comment: 'Good.' } });
-      if (rv.status !== 200 || rv.json?.status !== 'released') return { ok: false, step: 'review', res: rv };
-      return { ok: true, id, created: c.json, complete: cp.json, released: rv.json };
-    };
     // --- 17a. tier rates at accept: Starter 15 / Pro 12 / Elite 8 -------
     r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Starter' } });
     check('main provider reset to Starter for tier-rate checks', r.status === 200 && r.json?.tier === 'Starter', JSON.stringify(r.json));
@@ -673,7 +698,8 @@ async function main() {
     const volLogin = await req('POST', '/api/auth/login-phone', { body: { phone: '01022222222' } });
     const volToken = volLogin.json?.accessToken;
     check('volume-test patient login', volLogin.status === 200 && !!volToken, JSON.stringify(volLogin.json));
-    // Provider already has 1 released case this month (bkId); 29 more -> 30.
+    // Provider already has 5 released cases this month (bkId + 4 rating
+    // cycles from §16); 29 more -> 34 (still the 30-case bonus tier).
     let volOk = true; let volFailStep = '';
     let volPointsSeen = true; let volEarnedPositive = false;
     for (let i = 0; i < 29; i++) {
@@ -688,7 +714,7 @@ async function main() {
     check('every complete-provider response carries points {earned,total,tier}', volPointsSeen, 'a cycle completion lacked a valid points payload');
     check('a completion crossed a cases/weekly-double threshold (earned>=1)', volEarnedPositive, 'no completion in 29 cycles earned points');
     r = await req('GET', '/api/providers/wallet', { token: provToken });
-    check('wallet: 30 cases this month, bonus 1000 (new 15/30/60 thresholds), title الممرض الذهبي', r.status === 200 && r.json?.monthlyCases === 30 && r.json?.volumeBonusEgp === 1000 && r.json?.volumeBonus?.title === 'الممرض الذهبي' && r.json?.volumeBonus?.nextBonusAt === 60 && r.json?.volumeBonus?.casesToNextBonus === 30, JSON.stringify(r.json?.volumeBonus));
+    check('wallet: 34 cases this month, bonus 1000 (new 15/30/60 thresholds), title الممرض الذهبي', r.status === 200 && r.json?.monthlyCases === 34 && r.json?.volumeBonusEgp === 1000 && r.json?.volumeBonus?.title === 'الممرض الذهبي' && r.json?.volumeBonus?.nextBonusAt === 60 && r.json?.volumeBonus?.casesToNextBonus === 26, JSON.stringify(r.json?.volumeBonus));
     check('wallet totals carry the 1000 bonus into what app owes provider', r.json?.totals?.volumeBonusEgp === 1000 && r.json?.totals?.appOwesProviderEgp === 1000, JSON.stringify(r.json?.totals));
     r = await req('GET', '/api/me/vouchers', { token: volToken });
     check('volume patient earned vouchers (29 visits -> 7, next after 3 more)', r.status === 200 && r.json?.vouchers?.length === 7 && r.json?.completedPaidVisits === 29 && r.json?.visitsToNextVoucher === 3, JSON.stringify(r.json)?.slice(0, 300));
@@ -1235,8 +1261,15 @@ async function main() {
     r = await req('POST', '/api/me/language-tests/en/start', { token: phys.token });
     check('language test start -> 200, 8 questions, 15 min, no answers leaked', r.status === 200 && Array.isArray(r.json?.questions) && r.json.questions.length === 8 && r.json?.minutes === 15 && !JSON.stringify(r.json).includes('"correct"'), JSON.stringify(r.json)?.slice(0, 300));
     const ltAttempt = r.json?.attemptId;
+    // v2.1.6 (C5): wrong answers are VALID positions (the wrong option),
+    // not raw letters — raw letters are rejected with 400 (tested in §27).
     const ltWrong = {};
-    for (const q of r.json?.questions || []) ltWrong[q.id] = 'zzz';
+    for (const q of r.json?.questions || []) {
+      const bankQ = LANGUAGE_TESTS.en.find((x) => x.id === q.id);
+      const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+      const correctIdx = q.options.findIndex((o) => o.text === correctText);
+      ltWrong[q.id] = (correctIdx + 1) % q.options.length;
+    }
     r = await req('POST', '/api/me/language-tests/en/submit', { token: phys.token, body: { attemptId: ltAttempt, answers: ltWrong } });
     check('language test all-wrong -> 200, failed 0/8, retake in 7 days', r.status === 200 && r.json?.passed === false && r.json?.score === 0 && !!r.json?.canRetakeAt, JSON.stringify(r.json)?.slice(0, 300));
     r = await req('POST', '/api/me/language-tests/en/start', { token: phys.token });
@@ -1439,6 +1472,12 @@ async function main() {
     check('monitor pendingPackageRequests has F, no PII', r.status === 200 && (r.json?.pendingPackageRequests?.count || 0) >= 1 && (r.json?.pendingPackageRequests?.items || []).some((x) => x.id === pkrF && x.packageType === 'package_elderly_mobile') && !JSON.stringify(r.json?.pendingPackageRequests).includes('010'), JSON.stringify(r.json?.pendingPackageRequests));
     check('monitor activePackages has A + B', r.status === 200 && (r.json?.activePackages?.count || 0) >= 2 && (r.json?.activePackages?.items || []).some((x) => x.id === pkgA) && (r.json?.activePackages?.items || []).some((x) => x.id === pkgB), JSON.stringify(r.json?.activePackages));
     // 23g. weekly sweep releases the logged days; wallets show them.
+    // v2.1.6 (C7): a day releases only with EVIDENCE — the patient
+    // confirms both days here (pkgA regular + pkgB extra) before the sweep.
+    r = await req('POST', `/api/bookings/${pkgA}/package-day/${TODAY}/confirm`, { token: patientToken2 });
+    check('patient confirms package A day -> 200', r.status === 200 && r.json?.patientConfirmed === true, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${pkgB}/package-day/${TODAY}/confirm`, { token: patientToken2 });
+    check('patient confirms package B extra day -> 200', r.status === 200 && r.json?.patientConfirmed === true, JSON.stringify(r.json)?.slice(0, 200));
     r = await req('POST', '/api/jobs/sweep', { token: adminToken });
     check('sweep runs -> 200, 2 package days released', r.status === 200 && r.json?.packageDaysReleased === 2, JSON.stringify(r.json)?.slice(0, 300));
     r = await req('GET', '/api/providers/wallet', { token: provToken });
@@ -1454,7 +1493,7 @@ async function main() {
     // a REAL provider, not a demo seed — generateSettlements skips demos).
     r = await req('GET', `/api/admin/settlements?providerId=${manualProv.providerId}`, { token: adminToken });
     const stlB = (r.json?.settlements || [])[0];
-    check('settlement record for substitute: packageDays 1, package shares match locked %', !!stlB && stlB.totals.packageDays === 1 && stlB.totals.packageProviderShareEgp === 950 - appDayB && stlB.totals.packageAppShareEgp === appDayB, JSON.stringify(stlB?.totals));
+    check('settlement record for substitute: packageDays 1, cash day app share only (C2 — provider holds the cash, owes the app share)', !!stlB && stlB.totals.packageDays === 1 && stlB.totals.packageProviderShareEgp === 0 && stlB.totals.packageCashAppShareEgp === appDayB && stlB.totals.providerOwesAppEgp === appDayB && stlB.totals.appOwesProviderEgp === 0, JSON.stringify(stlB?.totals));
     // 23h. package-complete guard (days incomplete, period not ended).
     r = await req('POST', `/api/bookings/${pkgA}/package-complete`, { token: provToken });
     check('package-complete with 1/26 days -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
@@ -1766,6 +1805,241 @@ async function main() {
     r = await req('GET', '/api/admin/audit', { token: adminToken });
     const bcAudit = Array.isArray(r.json) ? r.json.find((a) => a.action === 'admin.broadcast') : null;
     check('broadcast writes an admin.broadcast audit entry', !!bcAudit && bcAudit.details?.users === dryUsers && bcAudit.details?.sent === 0 && bcAudit.details?.failed === dryUsers, JSON.stringify(bcAudit));
+
+  // --- 27. v2.1.6: critical security fixes (C1-C8) --------------------
+  console.log('\n[v2.1.6 security fixes]');
+  // 27a. C5 — language bank rotated + position scoring.
+  {
+    let distOk = true;
+    for (const [lang, qs] of Object.entries(LANGUAGE_TESTS)) {
+      const dist = { a: 0, b: 0, c: 0, d: 0 };
+      const ids = new Set();
+      for (const q of qs) { dist[q.correct]++; ids.add(q.id); }
+      if (qs.length !== 12 || ids.size !== 12 || dist.a !== 3 || dist.b !== 3 || dist.c !== 3 || dist.d !== 3) distOk = false;
+      if (!qs.every((q) => LANGUAGE_TEST_TOPICS.includes(q.topic))) distOk = false;
+    }
+    check('C5 bank: 12 questions/language, correct keys exactly 3/3/3/3, topics match the constant', distOk, JSON.stringify(Object.keys(LANGUAGE_TESTS)));
+    // prov1 (failed interview) can still take a language test — use them
+    // so the main providers' badges are untouched.
+    r = await req('POST', '/api/me/language-tests/ru/start', { token: prov1Token });
+    check('C5 start publishes exactly 8 of 12, options carry NO keys and no correct field', r.status === 200 && Array.isArray(r.json?.questions) && r.json.questions.length === 8 && r.json.questions.every((q) => Array.isArray(q.options) && q.options.length === 4 && q.options.every((o) => !('key' in o) && !('correct' in o))), JSON.stringify(r.json?.questions?.length));
+    const c5Attempt = r.json?.attemptId;
+    const c5Qs = r.json?.questions || [];
+    const c5RawLetters = {};
+    for (const q of c5Qs) c5RawLetters[q.id] = 'a';
+    r = await req('POST', '/api/me/language-tests/ru/submit', { token: prov1Token, body: { attemptId: c5Attempt, answers: c5RawLetters } });
+    check('C5 raw key letters rejected -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    const c5OutOfRange = {};
+    for (const q of c5Qs) c5OutOfRange[q.id] = 4;
+    r = await req('POST', '/api/me/language-tests/ru/submit', { token: prov1Token, body: { attemptId: c5Attempt, answers: c5OutOfRange } });
+    check('C5 out-of-range position rejected -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/me/language-tests/ru/submit', { token: prov1Token, body: { attemptId: c5Attempt, answers: { nope_question: 0 } } });
+    check('C5 answer for a question outside this attempt rejected -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    const c5Correct = {};
+    for (const q of c5Qs) {
+      const bankQ = LANGUAGE_TESTS.ru.find((x) => x.id === q.id);
+      const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+      c5Correct[q.id] = q.options.findIndex((o) => o.text === correctText);
+    }
+    r = await req('POST', '/api/me/language-tests/ru/submit', { token: prov1Token, body: { attemptId: c5Attempt, answers: c5Correct } });
+    check('C5 all-correct by position -> 200, passed 8/8', r.status === 200 && r.json?.passed === true && r.json?.score === 8 && r.json?.total === 8, JSON.stringify(r.json));
+  }
+  // 27b. C6 — receipt mandatory for online payment at creation.
+  {
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'No Receipt', serviceCode: 'standard', paymentMethod: 'instapay',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    check('C6 instapay booking without receipt -> 400', r.status === 400 && /receipt/i.test(r.json?.message || ''), JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/tourist-bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Tourist No Receipt', serviceCode: 'tourist_iv', language: 'de', currency: 'eur',
+      paymentMethod: 'card', distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    check('C6 card tourist booking without receipt -> 400', r.status === 400 && /receipt/i.test(r.json?.message || ''), JSON.stringify(r.json)?.slice(0, 200));
+    // Package accept (instapay) without a receipt -> 400. pkrF is still
+    // 'quoted' from §23l (finalPrice 8000, prov_demo_pro) — it was never
+    // accepted, so no re-quote is possible or needed.
+    r = await req('POST', `/api/package-requests/${pkrF}/accept`, { token: patientToken2, body: { ...TERMS, paymentMethod: 'instapay' } });
+    check('C6 package accept instapay without receipt -> 400', r.status === 400 && /receipt/i.test(r.json?.message || ''), JSON.stringify(r.json)?.slice(0, 200));
+  }
+
+  // 27c. C2/C3/C4 — settlement math on a mixed cash/non-cash week.
+  // redProv (red-flag interview, retake already allowed by admin in §6)
+  // is the fresh provider: no released bookings, no settlement record.
+  {
+    await req('POST', '/api/otp/request', { body: { phone: '01016161616', channel: 'whatsapp' } });
+    const redCode = await mockCode('01016161616');
+    const redLogin = await req('POST', '/api/otp/verify', { body: { phone: '01016161616', code: redCode || '000000' } });
+    const redToken = redLogin.json?.accessToken;
+    check('C2 redProv fresh login via OTP', redLogin.status === 200 && !!redToken, JSON.stringify(redLogin.json)?.slice(0, 200));
+    // The retake attempt was already STARTED at line 307 (the §6 check
+    // that the retake is unblocked) and never submitted — so complete
+    // THAT attempt here (re-serve its questions, submit all-correct).
+    // Starting a fresh attempt would 409 ("already in progress").
+    const redQ = await req('GET', '/api/providers/interview/questions', { token: redToken });
+    const redAnswers = {};
+    for (const q of redQ.json?.questions || []) redAnswers[q.id] = CORRECT[q.id];
+    const redEn = {};
+    for (const q of redQ.json?.englishCheck?.questions || []) redEn[q.id] = EN_CORRECT[q.id];
+    const redRetake = await req('POST', '/api/providers/interview/submit', { token: redToken, body: { attemptId: redQ.json?.attemptId, answers: redAnswers, englishAnswers: redEn } });
+    check('C2 redProv retakes interview all-correct -> passed', redRetake.status === 200 && redRetake.json?.status === 'passed', JSON.stringify(redRetake.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/providers/${redProv.providerId}/verify`, { token: adminToken, body: { role: 'nurse' } });
+    check('C2 admin verifies redProv -> verified', r.status === 200 && r.json?.status === 'verified', JSON.stringify(r.json)?.slice(0, 200));
+    // Parameterised visit cycle (provider token + payment method).
+    const cycleAs = async (provTok, patientTok, km, pay) => {
+      const extra = pay === 'instapay' ? { receiptImage: RECEIPT_JPEG } : {};
+      const c = await req('POST', '/api/bookings', { token: patientTok, body: { ...TERMS,
+        patientName: 'Settle Patient', serviceCode: 'standard', paymentMethod: pay,
+        distanceKm: km, respectCharterAccepted: true, triage: { dangerSigns: [] }, ...extra,
+      } });
+      if (c.status !== 201) return { ok: false, step: 'create', res: c };
+      const id = c.json.id;
+      if (pay === 'instapay') {
+        const ap = await req('POST', `/api/admin/bookings/${id}/receipt/approve`, { token: adminToken, body: {} });
+        if (ap.status !== 200) return { ok: false, step: 'receipt-approve', res: ap };
+      }
+      const a = await req('POST', `/api/bookings/${id}/accept`, { token: provTok });
+      if (a.status !== 200) return { ok: false, step: 'accept', res: a };
+      const v = await req('POST', `/api/bookings/${id}/vitals`, { token: provTok, body: { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 } });
+      if (v.status !== 200) return { ok: false, step: 'vitals', res: v };
+      const cp = await req('POST', `/api/bookings/${id}/complete-provider`, { token: provTok });
+      if (cp.status !== 200) return { ok: false, step: 'complete-provider', res: cp };
+      const cf = await req('POST', `/api/bookings/${id}/confirm-patient`, { token: patientTok });
+      if (cf.status !== 200) return { ok: false, step: 'confirm-patient', res: cf };
+      const rv = await req('POST', `/api/bookings/${id}/review`, { token: patientTok, body: { rating: 5, comment: 'Good.' } });
+      if (rv.status !== 200 || rv.json?.status !== 'released') return { ok: false, step: 'review', res: rv };
+      if (pay === 'cash_receipt') {
+        // The provider collected the cash by hand and marks it — this
+        // sets cashCollectedByProvider, which is what the settlement
+        // (C2) keys the cash/non-cash split on. Without this call the
+        // booking looks like a non-cash booking to the ledger.
+        const cc = await req('POST', `/api/bookings/${id}/cash-collected`, { token: provTok });
+        if (cc.status !== 200) return { ok: false, step: 'cash-collected', res: cc };
+      }
+      return { ok: true, id, released: rv.json };
+    };
+    const rejectComplaint = async (bookingId) => {
+      const sr = await req('POST', `/api/bookings/${bookingId}/safety-report`, { token: patientToken2, body: { type: 'complaint', description: 'Settlement test complaint.' } });
+      if (sr.status !== 201) return { ok: false, step: 'complaint', res: sr };
+      const rr = await req('POST', `/api/admin/complaints/${sr.json?.reportId}/resolve`, { token: adminToken, body: { decision: 'rejected' } });
+      if (rr.status !== 200) return { ok: false, step: 'resolve', res: rr };
+      return { ok: true };
+    };
+    // 14 cash cycles + 1 instapay cycle = 15 cases -> 500 bonus.
+    const settleShares = { cash: [], instapay: null };
+    let settleOk = true; let settleFailStep = '';
+    for (let i = 0; i < 14; i++) {
+      const cyc = await cycleAs(redToken, patientToken2, 2, 'cash_receipt');
+      if (!cyc.ok) { settleOk = false; settleFailStep = `cash ${i} ${cyc.step} ${JSON.stringify(cyc.res?.json || cyc.res)}`; break; }
+      settleShares.cash.push({ id: cyc.id, providerShareEgp: cyc.released.providerShareEgp, appShareEgp: cyc.released.appShareEgp });
+    }
+    if (settleOk) {
+      const cyc = await cycleAs(redToken, patientToken2, 2, 'instapay');
+      if (!cyc.ok) { settleOk = false; settleFailStep = `instapay ${cyc.step} ${JSON.stringify(cyc.res?.json || cyc.res)}`; }
+      else settleShares.instapay = { id: cyc.id, providerShareEgp: cyc.released.providerShareEgp, appShareEgp: cyc.released.appShareEgp };
+    }
+    check('C2 15 settle cycles complete (14 cash + 1 instapay)', settleOk, settleFailStep.slice(0, 300));
+    // C3 — wallet shows the bonus as DUE (500) before any settlement.
+    r = await req('GET', '/api/providers/wallet', { token: redToken });
+    check('C3 wallet before settlement: 15 cases, bonus due 500, paid 0', r.status === 200 && r.json?.monthlyCases === 15 && r.json?.volumeBonusEgp === 500 && r.json?.volumeBonusPaidEgp === 0, JSON.stringify({ monthlyCases: r.json?.monthlyCases, volumeBonusEgp: r.json?.volumeBonusEgp, volumeBonusPaidEgp: r.json?.volumeBonusPaidEgp }));
+    // C4 — make 1 instapay + 1 cash booking settleable at once (complaint
+    // rejected sets settleableAt = now); the other 13 cash bookings stay
+    // inside the 24h window (hold bucket).
+    const cashSettle = settleShares.cash[0];
+    let rcOk = true;
+    if (settleShares.instapay) { const rc = await rejectComplaint(settleShares.instapay.id); if (!rc.ok) rcOk = false; }
+    if (cashSettle) { const rc = await rejectComplaint(cashSettle.id); if (!rc.ok) rcOk = false; }
+    check('C4 complaint-rejected makes 2 bookings settleable at once', rcOk);
+    r = await req('POST', '/api/jobs/sweep', { token: adminToken });
+    check('C4 sweep runs', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', `/api/admin/settlements?providerId=${redProv.providerId}`, { token: adminToken });
+    const stl = (r.json?.settlements || [])[0];
+    const expAppOwes = (settleShares.instapay?.providerShareEgp || 0) + 500; // non-cash provider share + bonus
+    const expProvOwes = cashSettle?.appShareEgp || 0; // cash contributes ONLY the app share
+    const expHold = settleShares.cash.slice(1).reduce((s, x) => s + (x.appShareEgp || 0), 0); // 13 held cash bookings: app share each
+    check('C2/C4 settlement: cash never owed by the app, non-cash + bonus owed, rest held',
+      !!stl && stl.totals.appOwesProviderEgp === expAppOwes && stl.totals.providerOwesAppEgp === expProvOwes
+      && stl.totals.complaintHoldEgp === expHold && stl.totals.releasedCases === 2
+      && stl.totals.volumeBonusEgp === 500 && stl.totals.volumeBonusPaidCumulative === 500
+      && stl.totals.payable === false, JSON.stringify(stl?.totals));
+    // C3 — after the settlement the wallet shows the bonus as PAID (due 0).
+    r = await req('GET', '/api/providers/wallet', { token: redToken });
+    check('C3 wallet after settlement: bonus due 0, paid 500 (paid once)', r.status === 200 && r.json?.volumeBonusEgp === 0 && r.json?.volumeBonusPaidEgp === 500, JSON.stringify({ volumeBonusEgp: r.json?.volumeBonusEgp, volumeBonusPaidEgp: r.json?.volumeBonusPaidEgp }));
+    // A second sweep must NOT create a second record (no double-pay).
+    await req('POST', '/api/jobs/sweep', { token: adminToken });
+    r = await req('GET', `/api/admin/settlements?providerId=${redProv.providerId}`, { token: adminToken });
+    check('C3 second sweep creates no second settlement record', r.status === 200 && (r.json?.settlements || []).length === 1, JSON.stringify({ count: (r.json?.settlements || []).length }));
+    // C4 — refunding a SETTLED booking creates a reversing adjustment.
+    if (settleShares.instapay) {
+      const sr = await req('POST', `/api/bookings/${settleShares.instapay.id}/safety-report`, { token: patientToken2, body: { type: 'complaint', description: 'Refund the settled visit.' } });
+      const repId = sr.json?.reportId;
+      r = await req('POST', `/api/admin/complaints/${repId}/resolve`, { token: adminToken, body: { decision: 'accepted_refund' } });
+      check('C4 settled booking refunded via complaint', r.status === 200 && r.json?.booking?.status === 'refunded', JSON.stringify(r.json?.booking)?.slice(0, 200));
+      r = await req('GET', '/api/admin/audit', { token: adminToken });
+      const adjAudit = Array.isArray(r.json) ? r.json.find((a) => a.action === 'settlement.adjustment_created' && a.details?.bookingId === settleShares.instapay.id) : null;
+      check('C4 reversing adjustment created + audited for the settled refund', !!adjAudit && adjAudit.details?.providerShareEgp === settleShares.instapay.providerShareEgp, JSON.stringify(adjAudit?.details));
+    }
+  }
+
+  // 27d. C7 — package days need evidence before they release.
+  {
+    const mkPkg = async () => {
+      const q = await pkgReq({ packageType: 'package_technician_12' });
+      if (q.status !== 201) return { ok: false, step: 'request', res: q };
+      const pkr = q.json?.id;
+      const qt = await req('POST', `/api/admin/package-requests/${pkr}/quote`, { token: adminToken, body: { finalPriceEgp: 12600, providerId: 'prov_demo_pro', extraDaysOption: 'none' } });
+      if (qt.status !== 200) return { ok: false, step: 'quote', res: qt };
+      const ac = await req('POST', `/api/package-requests/${pkr}/accept`, { token: patientToken2, body: { ...TERMS, paymentMethod: 'cash_receipt' } });
+      if (ac.status !== 201) return { ok: false, step: 'accept', res: ac };
+      return { ok: true, id: ac.json?.id };
+    };
+    const pkgD = await mkPkg();
+    check('C7 package D created (cash)', pkgD.ok, JSON.stringify(pkgD.res?.json || pkgD.res)?.slice(0, 200));
+    if (pkgD.ok) {
+      r = await req('POST', `/api/bookings/${pkgD.id}/package-day`, { token: provToken, body: { date: TODAY, type: 'regular' } });
+      check('C7 day logged without vitals/confirmation -> 200, unconfirmed', r.status === 200 && (r.json?.daysLog || [])[0]?.patientConfirmed === false, JSON.stringify(r.json?.daysLog)?.slice(0, 200));
+      r = await req('POST', '/api/jobs/sweep', { token: adminToken });
+      r = await req('GET', `/api/bookings/${pkgD.id}`, { token: patientToken2 });
+      check('C7 unconfirmed day does NOT release on sweep', r.status === 200 && (r.json?.daysLog || [])[0]?.released === false, JSON.stringify(r.json?.daysLog)?.slice(0, 200));
+      r = await req('POST', `/api/bookings/${pkgD.id}/package-day/${TODAY}/confirm`, { token: patientToken2 });
+      check('C7 patient confirms the day -> 200', r.status === 200 && r.json?.patientConfirmed === true, JSON.stringify(r.json)?.slice(0, 200));
+    }
+    const pkgE = await mkPkg();
+    check('C7 package E created (cash)', pkgE.ok, JSON.stringify(pkgE.res?.json || pkgE.res)?.slice(0, 200));
+    if (pkgE.ok) {
+      r = await req('POST', `/api/bookings/${pkgE.id}/package-day`, { token: provToken, body: { date: TODAY, type: 'regular', vitals: { bpSystolic: 120, bpDiastolic: 80, pulse: 78, temp: 36.6, oxygen: 98 } } });
+      check('C7 day logged with vitals -> 200, vitals stored', r.status === 200 && !!(r.json?.daysLog || [])[0]?.vitals && (r.json?.daysLog || [])[0]?.vitals?.pulse === 78, JSON.stringify(r.json?.daysLog)?.slice(0, 200));
+      r = await req('POST', `/api/bookings/${pkgE.id}/package-day/${TODAY}/confirm`, { token: provToken });
+      check('C7 patient cannot confirm a day (patient role only) -> 403', r.status === 403, JSON.stringify(r.json)?.slice(0, 200));
+      r = await req('POST', `/api/admin/bookings/${pkgE.id}/package-day/${TODAY}/confirm`, { token: adminToken });
+      check('C7 admin confirms a day on the patient behalf -> 200', r.status === 200 && r.json?.patientConfirmed === true && r.json?.confirmedBy === 'admin', JSON.stringify(r.json)?.slice(0, 200));
+    }
+    r = await req('POST', '/api/jobs/sweep', { token: adminToken });
+    if (pkgD.ok) {
+      r = await req('GET', `/api/bookings/${pkgD.id}`, { token: patientToken2 });
+      check('C7 patient-confirmed day releases on sweep', (r.json?.daysLog || [])[0]?.released === true && (r.json?.daysLog || [])[0]?.confirmedBy === 'patient', JSON.stringify(r.json?.daysLog)?.slice(0, 200));
+    }
+    if (pkgE.ok) {
+      r = await req('GET', `/api/bookings/${pkgE.id}`, { token: patientToken2 });
+      check('C7 admin-confirmed day releases on sweep', (r.json?.daysLog || [])[0]?.released === true && (r.json?.daysLog || [])[0]?.confirmedBy === 'admin', JSON.stringify(r.json?.daysLog)?.slice(0, 200));
+    }
+    // Dashboard lists the review queue (empty here — no bulk flag fired).
+    r = await req('GET', '/api/admin/dashboard', { token: adminToken });
+    check('C7/C8 dashboard carries anomalyFlags + packageReviewRequired + newDeviceLogins', r.status === 200 && Array.isArray(r.json?.anomalyFlags) && Array.isArray(r.json?.packageReviewRequired) && Array.isArray(r.json?.newDeviceLogins), JSON.stringify({ anomalyFlags: (r.json?.anomalyFlags || []).length, packageReviewRequired: (r.json?.packageReviewRequired || []).length, newDeviceLogins: (r.json?.newDeviceLogins || []).length }));
+  }
+  // 27e. C8 rating floor + C1 new-device alert.
+  {
+    // phys has exactly 1 rated visit (bkPhysio, 5 stars) -> rating
+    // points must be 0 (needs >=5 rated visits), average still shown.
+    r = await req('GET', '/api/providers/wallet', { token: phys.token });
+    check('C8 rating points are 0 with <5 rated visits (average still 5.0)', r.status === 200 && r.json?.points?.rating === 0 && r.json?.points?.ratedCount === 1 && r.json?.points?.ratingAvg === 5, JSON.stringify(r.json?.points));
+    // C1 (smoke): the dashboard exposes the new-device login list (the
+    // live newDevice true/false behaviour is tested in integration.js,
+    // because the smoke suite has already used all 20 IP login attempts
+    // by this point and any further login-phone call would 429).
+    r = await req('GET', '/api/admin/dashboard', { token: adminToken });
+    check('C1 dashboard exposes newDeviceLogins (new-device logins are audited)', r.status === 200 && Array.isArray(r.json?.newDeviceLogins) && (r.json?.newDeviceLogins || []).some((x) => x.phone === '01077777777'), JSON.stringify(r.json?.newDeviceLogins?.slice(0, 2)));
+  }
 
   // --- 14. logout / refresh revocation ---------------------------------
     console.log('\n[logout]');
