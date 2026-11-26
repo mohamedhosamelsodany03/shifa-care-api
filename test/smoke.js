@@ -1721,6 +1721,52 @@ async function main() {
     const afterExpiry = await completeShift('shift12', 2);
     check('after expiry: 12h shift provider 425, app 25 (75 - voucher 50), no offer lock', afterExpiry.ok && afterExpiry.released?.providerShareEgp === 425 && afterExpiry.released?.appShareEgp === 25 && afterExpiry.released?.voucherDiscountEgp === 50 && (afterExpiry.released?.launchOffer == null), JSON.stringify(afterExpiry.released)?.slice(0, 300));
 
+    // --- §26. admin broadcast (v2.1.5) ----------------------------------
+    // One message to every user: in-app record + FCM push, never SMS
+    // (non-critical). The test env has no Firebase vars, so every push
+    // lands as 'not_configured' — assert that, not 'sent'.
+    console.log('\n[§26 admin broadcast]');
+    const bcTitle = 'رسالة تجريبية من الإدارة';
+    const bcBody = 'هذه رسالة بث تجريبية من شفاء كير.';
+    r = await req('POST', '/api/admin/broadcast', { token: patientToken2, body: { title: bcTitle, body: bcBody } });
+    check('broadcast non-admin -> 403', r.status === 403, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/broadcast', { token: adminToken, body: { body: bcBody } });
+    check('broadcast missing title -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/broadcast', { token: adminToken, body: { title: bcTitle } });
+    check('broadcast missing body -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/broadcast', { token: adminToken, body: { title: 'x'.repeat(101), body: bcBody } });
+    check('broadcast title too long (101) -> 400', r.status === 400, JSON.stringify(r.json));
+    r = await req('POST', '/api/admin/broadcast', { token: adminToken, body: { title: bcTitle, body: 'y'.repeat(501) } });
+    check('broadcast body too long (501) -> 400', r.status === 400, JSON.stringify(r.json));
+    // Dry run: counts only, nothing sent / stored / audited.
+    const auditBefore = await req('GET', '/api/admin/audit', { token: adminToken });
+    const hadBcAuditBefore = Array.isArray(auditBefore.json) && auditBefore.json.some((a) => a.action === 'admin.broadcast');
+    r = await req('POST', '/api/admin/broadcast', { token: adminToken, body: { title: bcTitle, body: bcBody, dryRun: true } });
+    check('broadcast dry-run -> 200 with devices/users counts', r.status === 200 && r.json?.dryRun === true && typeof r.json?.devices === 'number' && typeof r.json?.users === 'number' && r.json.users >= 1, JSON.stringify(r.json));
+    const dryDevices = r.json?.devices, dryUsers = r.json?.users;
+    check('broadcast dry-run returns no phone numbers or tokens', !JSON.stringify(r.json).includes('01012345678') && !JSON.stringify(r.json).toLowerCase().includes('fcm'), JSON.stringify(r.json));
+    r = await req('GET', '/api/me/notifications', { token: patientToken2 });
+    check('broadcast dry-run stores NO notification', Array.isArray(r.json?.notifications) && !r.json.notifications.some((n) => n.type === 'broadcast'));
+    r = await req('GET', '/api/admin/audit', { token: adminToken });
+    check('broadcast dry-run writes NO audit entry', Array.isArray(r.json) && !r.json.some((a) => a.action === 'admin.broadcast') && !hadBcAuditBefore);
+    // Dashboard carries the same audience counts.
+    r = await req('GET', '/api/admin/dashboard', { token: adminToken });
+    check('dashboard has broadcastDevices/broadcastUsers matching dry-run', r.status === 200 && r.json?.broadcastDevices === dryDevices && r.json?.broadcastUsers >= 1, JSON.stringify({ broadcastDevices: r.json?.broadcastDevices, broadcastUsers: r.json?.broadcastUsers }));
+    // Real broadcast: every user gets an in-app 'broadcast' record;
+    // pushStatus is 'not_configured' (no Firebase in the test env), so
+    // sent is 0 and failed equals the audience size. No SMS ever fires.
+    r = await req('POST', '/api/admin/broadcast', { token: adminToken, body: { title: bcTitle, body: bcBody } });
+    check('broadcast real send -> 200 with sent/failed counts', r.status === 200 && r.json?.dryRun === false && typeof r.json?.sent === 'number' && typeof r.json?.failed === 'number' && r.json.sent + r.json.failed === r.json.users && r.json.users === dryUsers && r.json.devices === dryDevices, JSON.stringify(r.json));
+    check('broadcast with no FCM configured: sent 0, failed = users', r.json?.sent === 0 && r.json?.failed === dryUsers, JSON.stringify(r.json));
+    check('broadcast real send returns no phone numbers or tokens', !JSON.stringify(r.json).includes('01012345678') && !JSON.stringify(r.json).toLowerCase().includes('fcm'), JSON.stringify(r.json));
+    r = await req('GET', '/api/me/notifications', { token: patientToken2 });
+    const bcNotif = Array.isArray(r.json?.notifications) ? r.json.notifications.find((n) => n.type === 'broadcast') : null;
+    check('broadcast visible in-app for test user (type broadcast)', !!bcNotif, JSON.stringify(r.json?.notifications?.slice(0, 3)));
+    check('broadcast notification carries title/body, pushStatus not_configured, not critical', !!bcNotif && bcNotif.titleAr === bcTitle && bcNotif.bodyAr === bcBody && bcNotif.pushStatus === 'not_configured' && bcNotif.critical === false, JSON.stringify(bcNotif));
+    r = await req('GET', '/api/admin/audit', { token: adminToken });
+    const bcAudit = Array.isArray(r.json) ? r.json.find((a) => a.action === 'admin.broadcast') : null;
+    check('broadcast writes an admin.broadcast audit entry', !!bcAudit && bcAudit.details?.users === dryUsers && bcAudit.details?.sent === 0 && bcAudit.details?.failed === dryUsers, JSON.stringify(bcAudit));
+
   // --- 14. logout / refresh revocation ---------------------------------
     console.log('\n[logout]');
     r = await req('POST', '/api/auth/logout', { token: patientToken2, body: { refreshToken } });

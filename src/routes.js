@@ -3824,7 +3824,41 @@ router.get('/admin/dashboard', requireAdmin, (req, res) => {
     })),
     packageOffer: store.data.packageOffer || null,
     packageOvertimePremiumWaived: packageOvertimePremiumWaived(),
+    // v2.1.5 — broadcast audience: total registered FCM tokens, and how
+    // many distinct phones have at least one device. No tokens or phone
+    // numbers are ever returned.
+    broadcastDevices: Object.values(store.data.devices || {}).reduce((n, list) => n + (Array.isArray(list) ? list.length : 0), 0),
+    broadcastUsers: Object.values(store.data.devices || {}).filter((list) => Array.isArray(list) && list.length > 0).length,
   });
+});
+
+// v2.1.5 — admin broadcast: one message to every user (in-app record +
+// FCM push, never SMS — the notification is non-critical). dryRun=true
+// only counts the audience: it sends nothing, stores nothing and
+// audits nothing. FCM tokens and phone numbers are never returned.
+router.post('/admin/broadcast', requireAdmin, async (req, res) => {
+  const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+  const body = typeof req.body?.body === 'string' ? req.body.body.trim() : '';
+  if (!title || !body) return bad(res, 400, 'title and body are required.');
+  if (title.length > 100) return bad(res, 400, 'title must be at most 100 characters.');
+  if (body.length > 500) return bad(res, 400, 'body must be at most 500 characters.');
+  const users = store.data.users || {};
+  const devices = store.data.devices || {};
+  const phones = new Set([...Object.keys(users), ...Object.keys(devices)]);
+  const deviceCount = Object.values(devices).reduce((n, list) => n + (Array.isArray(list) ? list.length : 0), 0);
+  if (req.body?.dryRun === true) {
+    return res.json({ ok: true, dryRun: true, devices: deviceCount, users: phones.size });
+  }
+  let sent = 0, failed = 0;
+  for (const phone of phones) {
+    const rec = await notify.notifyUser(phone, {
+      type: 'broadcast', titleAr: title, titleEn: title, bodyAr: body, bodyEn: body,
+      data: { type: 'broadcast' }, critical: false,
+    });
+    if (rec.pushStatus === 'sent') sent += 1; else failed += 1;
+  }
+  store.audit('admin.broadcast', 'admin', { title, devices: deviceCount, users: phones.size, sent, failed });
+  res.json({ ok: true, dryRun: false, devices: deviceCount, users: phones.size, sent, failed });
 });
 
 // v2.1.0 — persistence status (admin only): which backend holds the data
