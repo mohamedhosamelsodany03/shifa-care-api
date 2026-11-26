@@ -121,6 +121,13 @@ const config = {
   interviewMaxAttempts: 3,
   interviewRetakeDays: 7,
   interviewRedFlagRetakeDays: 14,
+  // v2.1.2 — in-app language tests (one per claimed language, MCQ,
+  // 8 questions, pass >= 6/8, 15 minutes, retake after 7 days). The
+  // general tourist badge needs interview passed + English test passed.
+  languageTestMinutes: 15,
+  languageTestPassMin: 6,
+  languageTestQuestions: 8,
+  languageTestRetakeDays: 7,
   // v2.1.1 — Muse monitor token (read-only admin-oversight endpoint).
   // Set ONLY as an env var in the host dashboard; NEVER written to any
   // file, log or commit. Empty = the monitor endpoint looks disabled.

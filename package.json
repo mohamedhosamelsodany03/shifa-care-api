@@ -25,5 +25,5 @@
     "test:all": "node test/smoke.js && node test/integration.js && node test/test-otp-meta.js && node test/test-pgstore.js"
   },
   "type": "commonjs",
-  "version": "2.1.1"
+  "version": "2.1.2"
 }

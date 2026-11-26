@@ -39,7 +39,11 @@ function createApp() {
     hsts: config.isProd ? { maxAge: 31536000, includeSubDomains: true } : false,
     contentSecurityPolicy: false, // JSON API only
   }));
-  app.use(express.json({ limit: '200kb' }));
+  // v2.1.2: 10 MB — document uploads (max 5 MB/file) and receipt
+  // photos (max 3 MB) are base64 data URLs in JSON, so the old 200 KB
+  // limit would reject every upload. No other body grows: booking
+  // payloads stay small and length caps still apply (routes.js M11).
+  app.use(express.json({ limit: '10mb' }));
 
   // CORS (audit #9): '*' NO LONGER means any origin. A configured '*'
   // is treated as the app-origin set only (the Capacitor app origin is
@@ -87,6 +91,10 @@ function createApp() {
   app.use('/api/monitor/summary', rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many monitor requests from this IP.' } }));
   app.use('/api/medical-file-interest', rateLimit({ windowMs: 60 * 60 * 1000, max: 5, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many interest submissions from this IP.' } }));
   app.use('/api/admin/export', genericLimiter(5, 'Too many export requests from this IP.'));
+  // v2.1.2: language tests + document uploads. Receipt uploads ride
+  // the existing /api/bookings limiter above (60/hour).
+  app.use('/api/me/language-tests', genericLimiter(30, 'Too many language-test requests from this IP.'));
+  app.use('/api/me/documents', genericLimiter(20, 'Too many document uploads from this IP.'));
 
   app.get('/health', (req, res) => res.json({ ok: true, app: 'shifa-care', version: '1.0.0', city: 'El Quseir' }));
   // v2.1.0 — Postgres mode loads the document asynchronously; no /api

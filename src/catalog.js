@@ -302,7 +302,7 @@ const TERMS_UPDATED_AT = '2026-11-25';
 const TERMS_AR = `الشروط والأحكام — شفاء كير (الإصدار 1.0، 25 نوفمبر 2026)
 
 1) ما هو شفاء كير؟
-شفاء كير تطبيق مستقل للرعاية التمريضية المنزلية في مدينة القصير، محافظة البحر الأحمر. يربط التطبيق بين المرضى (أو أسرهم) ومقدمي رعاية صحية موثّقين (ممرض، مساعد تمريض، طبيب) لزيارات منزلية وفندقية. التطبيق ليس مستشفى ولا عيادة، ولا يغني عن الإسعاف أو الطوارئ: في أي حالة طارئة اتصل بالإسعاف 123 فورًا.
+شفاء كير تطبيق مستقل للرعاية التمريضية المنزلية في مدينة القصير، محافظة البحر الأحمر. يربط التطبيق بين المرضى (أو أسرهم) ومقدمي رعاية صحية موثّقين (ممرض، مساعد تمريض، طبيب) لزيارات منزلية وفندقية. عقد تقديم الخدمة الطبية يكون بين المريض ومقدم الخدمة مباشرة؛ وشفاء كير وسيط تقني يربط بينهما ويتقاضى عمولته فقط، ولا يقدّم الخدمة الطبية بنفسه. التطبيق ليس مستشفى ولا عيادة، ولا يغني عن الإسعاف أو الطوارئ: في أي حالة طارئة اتصل بالإسعاف 123 فورًا.
 
 2) الحساب والتسجيل
 - التسجيل برقم هاتف مصري صحيح. أنت مسؤول عن حسابك وعن صحة بياناتك.
@@ -346,7 +346,7 @@ const TERMS_AR = `الشروط والأحكام — شفاء كير (الإصد�
 - كل شهادة دورة موثّقة تضيف 5 نقاط تحقق (بحد أقصى 15) وتمنح شارة «مدرب معتمد».
 
 9) مسؤولية التطبيق
-- شفاء كير وسيط تقني بين العميل ومقدم الخدمة، ويراجع المستندات والشهادات قدر المستطاع، لكن القرار الطبي النهائي لمقدم الخدمة المعالج.
+- شفاء كير وسيط تقني فقط: عقد الخدمة الطبية بين العميل ومقدم الخدمة مباشرة، والتطبيق لا يقدّم الخدمة الطبية بنفسه ولا يتحمل مسؤولية تقديمها؛ ويراجع المستندات والشهادات قدر المستطاع، لكن القرار الطبي النهائي لمقدم الخدمة المعالج.
 - التطبيق غير مسؤول عن تأخر ناتج عن ظروف خارجة عن إرادته (طقس، طرق، إغلاقات).
 
 10) العقوبات المتدرجة
@@ -362,7 +362,7 @@ const TERMS_AR = `الشروط والأحكام — شفاء كير (الإصد�
 
 const TERMS_EN = `Terms & Conditions — Shifa Care (Version 1.0, 25 November 2026) — summary. The Arabic text is the binding version.
 
-1) Shifa Care is an independent home-nursing platform in El Quseir, Red Sea, connecting patients with verified providers (nurse, nursing assistant, doctor). It is not a hospital or clinic. In any emergency call the ambulance on 123 immediately.
+1) Shifa Care is an independent home-nursing platform in El Quseir, Red Sea, connecting patients with verified providers (nurse, nursing assistant, doctor). The medical service contract is between the patient and the provider directly; Shifa Care is a technical intermediary that connects them and takes its commission only, and does not itself provide the medical service. It is not a hospital or clinic. In any emergency call the ambulance on 123 immediately.
 2) Register with a real Egyptian phone number and true data. Forged documents mean a permanent ban. Your professional category is set from your certificates with human review.
 3) No circumvention: all bookings, payments and communication happen inside the app only. Exchanging personal phone numbers, agreeing visits or prices outside the app, or taking cash outside the app is forbidden. In-app chat closes 24 hours after the visit; messages containing phone numbers are rejected automatically.
 4) Fixed published prices, no bargaining. Payment is held in escrow and released to the provider only after completion, patient confirmation and review (or one hour after confirmation with no review and no complaint), and stays held for the 24-hour complaint window before final payout. Weekly settlement every Thursday. App commission (reversed: the more a provider develops, the lower their commission): Starter 15%, Pro 12%, Elite 8% + monthly volume bonus: 500 EGP at 15 completed cases, 1,000 EGP at 30, 1,500 EGP at 60 (highest tier only), paid with the Thursday settlement. In promo months (max 2 per year, announced in advance) the commission may be reduced or set to 0%; cash volume bonuses pause in 0%-commission months while titles continue. Patient loyalty vouchers: after every 4 completed paid visits the patient automatically receives a 50 EGP voucher for the next visit (valid 60 days, minimum booking 300 EGP, one voucher per booking), fully funded by the app; the provider's share is always computed on the full pre-discount price.
@@ -370,11 +370,1402 @@ const TERMS_EN = `Terms & Conditions — Shifa Care (Version 1.0, 25 November 20
 6) Cancellation only within 15 minutes of booking creation (full refund). Complaint window: 24 hours after completion; an accepted complaint is refunded in full.
 7) Safety and privacy: never photograph or share patient data outside the app. Infection control and vital-signs documentation are mandatory. In emergencies call 123. SOS button alerts admin during dangerous visits.
 8) Ratings affect tier and assignment priority. Reviews also ask whether the provider requested dealing outside the app — a "yes" goes to admin immediately and holds that visit's payout.
-9) Shifa Care is a technical intermediary; the treating provider holds final clinical responsibility.
+9) Shifa Care is a technical intermediary only: the medical service contract is between the patient and the provider directly, and the app does not itself provide the medical service; the treating provider holds final clinical responsibility.
 10) Graduated penalties: recorded warning, temporary suspension (radar, acceptance and wallet closed), permanent ban with forfeiture of pending settlement for repeated or grave violations. You may appeal to admin within 7 days.
 11) Terms may change with in-app notice; continued use means acceptance, and you will be asked to confirm a new version before any new booking or registration.
 
 By using the app you confirm you have read, understood and fully accepted these Terms & Conditions.`;
+
+// v2.1.2 — supported languages for tourist work (owner decision 26 Nov
+// 2026): English, German, Russian, Polish, Dutch, Chinese, Czech — the
+// languages of the tourist groups visiting Egypt. Data-driven: the admin
+// can add more languages (stored in data.languages, GET /api/languages);
+// a language only becomes testable once a question bank exists for it
+// (LANGUAGE_TESTS below). A certificate NEVER exempts anyone from a test.
+const DEFAULT_LANGUAGES = [
+  { code: 'en', nameAr: 'الإنجليزية', nameEn: 'English', nativeName: 'English' },
+  { code: 'de', nameAr: 'الألمانية', nameEn: 'German', nativeName: 'Deutsch' },
+  { code: 'ru', nameAr: 'الروسية', nameEn: 'Russian', nativeName: 'Русский' },
+  { code: 'pl', nameAr: 'البولندية', nameEn: 'Polish', nativeName: 'Polski' },
+  { code: 'nl', nameAr: 'الهولندية', nameEn: 'Dutch', nativeName: 'Nederlands' },
+  { code: 'zh', nameAr: 'الصينية', nameEn: 'Chinese', nativeName: '中文' },
+  { code: 'cs', nameAr: 'التشيكية', nameEn: 'Czech', nativeName: 'Čeština' },
+];
+// v2.1.2 — in-app language tests (owner decision 26 Nov 2026): one
+// separate MCQ test per language a provider claims. ONLY the basic
+// interactions needed for medical service delivery — NOT general
+// fluency. 8 questions per language, one per topic: greeting,
+// symptoms/pain, explaining the procedure, allergies/medications,
+// aftercare, emergency phrases, payment/consent (+ a second
+// symptoms question). Pass: >= 6/8. Questions are written IN the target
+// language; `correct` is NEVER sent to the client (the server shuffles
+// options at start, like the interview bank). A certificate never
+// exempts anyone from a test. Retake: allowed after 7 days.
+const LANGUAGE_TEST_QUESTIONS = 8;
+const LANGUAGE_TEST_PASS_MIN = 6;
+const LANGUAGE_TEST_MINUTES = 15;
+const LANGUAGE_TEST_RETAKE_DAYS = 7;
+const LANGUAGE_TEST_TOPICS = ['greeting', 'symptoms', 'procedure', 'allergies', 'aftercare', 'emergency', 'payment'];
+const LANGUAGE_TESTS = {
+  "en": [
+    {
+      "id": "en1",
+      "topic": "greeting",
+      "text": "How do you greet a patient?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Hello, I am your nurse."
+        },
+        {
+          "key": "b",
+          "text": "Go away."
+        },
+        {
+          "key": "c",
+          "text": "Be quiet."
+        },
+        {
+          "key": "d",
+          "text": "Pay me now."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "en2",
+      "topic": "symptoms",
+      "text": "The patient says: “I have a strong pain in my leg.” What does that mean?",
+      "options": [
+        {
+          "key": "a",
+          "text": "He has strong pain in his leg."
+        },
+        {
+          "key": "b",
+          "text": "He is very happy."
+        },
+        {
+          "key": "c",
+          "text": "He is hungry."
+        },
+        {
+          "key": "d",
+          "text": "He wants to sleep."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "en3",
+      "topic": "procedure",
+      "text": "How do you explain a dressing change?",
+      "options": [
+        {
+          "key": "a",
+          "text": "I will change your dressing now. It may hurt a little."
+        },
+        {
+          "key": "b",
+          "text": "I am going home now."
+        },
+        {
+          "key": "c",
+          "text": "You must pay right now."
+        },
+        {
+          "key": "d",
+          "text": "I do not know."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "en4",
+      "topic": "allergies",
+      "text": "How do you ask about allergies?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Are you allergic to any medicines?"
+        },
+        {
+          "key": "b",
+          "text": "Do you like chocolate?"
+        },
+        {
+          "key": "c",
+          "text": "Where do you live?"
+        },
+        {
+          "key": "d",
+          "text": "How old are you?"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "en5",
+      "topic": "aftercare",
+      "text": "What do you say after a dressing change?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Keep the dressing dry and call us if you have a fever."
+        },
+        {
+          "key": "b",
+          "text": "Go swimming."
+        },
+        {
+          "key": "c",
+          "text": "Do not eat anything more."
+        },
+        {
+          "key": "d",
+          "text": "Never sleep again."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "en6",
+      "topic": "emergency",
+      "text": "The patient suddenly cannot breathe. What do you say?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Stay calm, I am calling an ambulance right now."
+        },
+        {
+          "key": "b",
+          "text": "Wait until tomorrow."
+        },
+        {
+          "key": "c",
+          "text": "Drink water and go."
+        },
+        {
+          "key": "d",
+          "text": "That is not important."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "en7",
+      "topic": "payment",
+      "text": "How do you confirm payment and consent?",
+      "options": [
+        {
+          "key": "a",
+          "text": "The treatment costs 30 euros. Do you agree?"
+        },
+        {
+          "key": "b",
+          "text": "I will take your money."
+        },
+        {
+          "key": "c",
+          "text": "Sign here without reading."
+        },
+        {
+          "key": "d",
+          "text": "Pay later, maybe."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "en8",
+      "topic": "symptoms",
+      "text": "The patient says: “I feel dizzy.” What does that mean?",
+      "options": [
+        {
+          "key": "a",
+          "text": "He feels dizzy."
+        },
+        {
+          "key": "b",
+          "text": "He is hungry."
+        },
+        {
+          "key": "c",
+          "text": "He is very tired."
+        },
+        {
+          "key": "d",
+          "text": "He is happy."
+        }
+      ],
+      "correct": "a"
+    }
+  ],
+  "de": [
+    {
+      "id": "de1",
+      "topic": "greeting",
+      "text": "Wie begrüßen Sie einen Patienten?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Guten Tag, ich bin Ihre Krankenschwester / Ihr Krankenpfleger."
+        },
+        {
+          "key": "b",
+          "text": "Gehen Sie weg."
+        },
+        {
+          "key": "c",
+          "text": "Seien Sie still."
+        },
+        {
+          "key": "d",
+          "text": "Bezahlen Sie sofort."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "de2",
+      "topic": "symptoms",
+      "text": "Der Patient sagt: „Ich habe starke Schmerzen im Bein.“ Was bedeutet das?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Er hat starke Schmerzen im Bein."
+        },
+        {
+          "key": "b",
+          "text": "Er ist sehr glücklich."
+        },
+        {
+          "key": "c",
+          "text": "Er hat Hunger."
+        },
+        {
+          "key": "d",
+          "text": "Er will schlafen."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "de3",
+      "topic": "procedure",
+      "text": "Wie erklären Sie einen Verbandswechsel?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Ich wechsle jetzt Ihren Verband. Das kann kurz weh tun."
+        },
+        {
+          "key": "b",
+          "text": "Ich gehe jetzt nach Hause."
+        },
+        {
+          "key": "c",
+          "text": "Sie müssen sofort bezahlen."
+        },
+        {
+          "key": "d",
+          "text": "Ich weiß es nicht."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "de4",
+      "topic": "allergies",
+      "text": "Wie fragen Sie nach Allergien?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Haben Sie Allergien gegen Medikamente?"
+        },
+        {
+          "key": "b",
+          "text": "Mögen Sie Schokolade?"
+        },
+        {
+          "key": "c",
+          "text": "Wo wohnen Sie?"
+        },
+        {
+          "key": "d",
+          "text": "Wie alt sind Sie?"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "de5",
+      "topic": "aftercare",
+      "text": "Was sagen Sie nach dem Verbandswechsel?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Halten Sie den Verband trocken und rufen Sie uns bei Fieber an."
+        },
+        {
+          "key": "b",
+          "text": "Gehen Sie schwimmen."
+        },
+        {
+          "key": "c",
+          "text": "Essen Sie nichts mehr."
+        },
+        {
+          "key": "d",
+          "text": "Schlafen Sie nie wieder."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "de6",
+      "topic": "emergency",
+      "text": "Der Patient hat plötzlich Atemnot. Was sagen Sie?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Bleiben Sie ruhig, ich rufe sofort den Notarzt."
+        },
+        {
+          "key": "b",
+          "text": "Warten Sie bis morgen."
+        },
+        {
+          "key": "c",
+          "text": "Trinken Sie Wasser und gehen Sie."
+        },
+        {
+          "key": "d",
+          "text": "Das ist nicht wichtig."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "de7",
+      "topic": "payment",
+      "text": "Wie bestätigen Sie die Zahlung und die Einwilligung?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Die Behandlung kostet 30 Euro. Sind Sie einverstanden?"
+        },
+        {
+          "key": "b",
+          "text": "Ich nehme Ihr Geld."
+        },
+        {
+          "key": "c",
+          "text": "Unterschreiben Sie hier, ohne zu lesen."
+        },
+        {
+          "key": "d",
+          "text": "Bezahlen Sie später, vielleicht."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "de8",
+      "topic": "symptoms",
+      "text": "Der Patient sagt: „Mir ist schwindelig.“ Was bedeutet das?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Ihm ist schwindlig."
+        },
+        {
+          "key": "b",
+          "text": "Er hat Hunger."
+        },
+        {
+          "key": "c",
+          "text": "Er ist sehr müde."
+        },
+        {
+          "key": "d",
+          "text": "Er freut sich."
+        }
+      ],
+      "correct": "a"
+    }
+  ],
+  "ru": [
+    {
+      "id": "ru1",
+      "topic": "greeting",
+      "text": "Как вы поздороваетесь с пациентом?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Здравствуйте, я ваша медсестра / ваш медбрат."
+        },
+        {
+          "key": "b",
+          "text": "Уходите."
+        },
+        {
+          "key": "c",
+          "text": "Молчите."
+        },
+        {
+          "key": "d",
+          "text": "Платите сейчас."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "ru2",
+      "topic": "symptoms",
+      "text": "Пациент говорит: «У меня сильно болит нога». Что это значит?",
+      "options": [
+        {
+          "key": "a",
+          "text": "У него сильно болит нога."
+        },
+        {
+          "key": "b",
+          "text": "Он очень счастлив."
+        },
+        {
+          "key": "c",
+          "text": "Он хочет есть."
+        },
+        {
+          "key": "d",
+          "text": "Он хочет спать."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "ru3",
+      "topic": "procedure",
+      "text": "Как объяснить перевязку?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Сейчас я сменю вам повязку. Это может немного болеть."
+        },
+        {
+          "key": "b",
+          "text": "Я сейчас ухожу домой."
+        },
+        {
+          "key": "c",
+          "text": "Платите немедленно."
+        },
+        {
+          "key": "d",
+          "text": "Я не знаю."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "ru4",
+      "topic": "allergies",
+      "text": "Как спросить об аллергии?",
+      "options": [
+        {
+          "key": "a",
+          "text": "У вас есть аллергия на лекарства?"
+        },
+        {
+          "key": "b",
+          "text": "Вы любите шоколад?"
+        },
+        {
+          "key": "c",
+          "text": "Где вы живёте?"
+        },
+        {
+          "key": "d",
+          "text": "Сколько вам лет?"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "ru5",
+      "topic": "aftercare",
+      "text": "Что сказать после перевязки?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Держите повязку сухой и позвоните нам при температуре."
+        },
+        {
+          "key": "b",
+          "text": "Идите плавать."
+        },
+        {
+          "key": "c",
+          "text": "Больше ничего не ешьте."
+        },
+        {
+          "key": "d",
+          "text": "Больше не спите."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "ru6",
+      "topic": "emergency",
+      "text": "У пациента внезапно одышка. Что вы скажете?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Спокойно, я сейчас вызову скорую помощь."
+        },
+        {
+          "key": "b",
+          "text": "Подождите до завтра."
+        },
+        {
+          "key": "c",
+          "text": "Выпейте воды и идите."
+        },
+        {
+          "key": "d",
+          "text": "Это неважно."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "ru7",
+      "topic": "payment",
+      "text": "Как подтвердить оплату и согласие?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Лечение стоит 30 евро. Вы согласны?"
+        },
+        {
+          "key": "b",
+          "text": "Я заберу ваши деньги."
+        },
+        {
+          "key": "c",
+          "text": "Подпишите здесь, не читая."
+        },
+        {
+          "key": "d",
+          "text": "Заплатите потом, может быть."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "ru8",
+      "topic": "symptoms",
+      "text": "Пациент говорит: «У меня кружится голова». Что это значит?",
+      "options": [
+        {
+          "key": "a",
+          "text": "У него кружится голова."
+        },
+        {
+          "key": "b",
+          "text": "Он хочет есть."
+        },
+        {
+          "key": "c",
+          "text": "Он очень устал."
+        },
+        {
+          "key": "d",
+          "text": "Он радуется."
+        }
+      ],
+      "correct": "a"
+    }
+  ],
+  "pl": [
+    {
+      "id": "pl1",
+      "topic": "greeting",
+      "text": "Jak przywitasz pacjenta?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Dzień dobry, jestem twoją pielęgniarką / twoim pielęgniarzem."
+        },
+        {
+          "key": "b",
+          "text": "Idź sobie."
+        },
+        {
+          "key": "c",
+          "text": "Bądź cicho."
+        },
+        {
+          "key": "d",
+          "text": "Zapłać teraz."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "pl2",
+      "topic": "symptoms",
+      "text": "Pacjent mówi: „Bardzo boli mnie noga”. Co to znaczy?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Bardzo boli go noga."
+        },
+        {
+          "key": "b",
+          "text": "Jest bardzo szczęśliwy."
+        },
+        {
+          "key": "c",
+          "text": "Jest głodny."
+        },
+        {
+          "key": "d",
+          "text": "Chce spać."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "pl3",
+      "topic": "procedure",
+      "text": "Jak wyjaśnisz zmianę opatrunku?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Teraz zmienię opatrunek. To może chwilę boleć."
+        },
+        {
+          "key": "b",
+          "text": "Teraz idę do domu."
+        },
+        {
+          "key": "c",
+          "text": "Musisz zapłacić natychmiast."
+        },
+        {
+          "key": "d",
+          "text": "Nie wiem."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "pl4",
+      "topic": "allergies",
+      "text": "Jak zapytasz o alergie?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Czy ma Pan/Pani alergię na leki?"
+        },
+        {
+          "key": "b",
+          "text": "Czy lubisz czekoladę?"
+        },
+        {
+          "key": "c",
+          "text": "Gdzie mieszkasz?"
+        },
+        {
+          "key": "d",
+          "text": "Ile masz lat?"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "pl5",
+      "topic": "aftercare",
+      "text": "Co powiesz po zmianie opatrunku?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Trzymaj opatrunek suchy i zadzwoń do nas, jeśli masz gorączkę."
+        },
+        {
+          "key": "b",
+          "text": "Idź popływać."
+        },
+        {
+          "key": "c",
+          "text": "Nic więcej nie jedz."
+        },
+        {
+          "key": "d",
+          "text": "Nigdy więcej nie śpij."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "pl6",
+      "topic": "emergency",
+      "text": "Pacjent nagle ma duszności. Co powiesz?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Proszę się uspokoić, wzywam natychmiast pogotowie."
+        },
+        {
+          "key": "b",
+          "text": "Poczekaj do jutra."
+        },
+        {
+          "key": "c",
+          "text": "Napij się wody i idź."
+        },
+        {
+          "key": "d",
+          "text": "To nieważne."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "pl7",
+      "topic": "payment",
+      "text": "Jak potwierdzisz płatność i zgodę?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Leczenie kosztuje 30 euro. Czy się zgadzasz?"
+        },
+        {
+          "key": "b",
+          "text": "Wezmę twoje pieniądze."
+        },
+        {
+          "key": "c",
+          "text": "Podpisz tutaj bez czytania."
+        },
+        {
+          "key": "d",
+          "text": "Zapłać później, może."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "pl8",
+      "topic": "symptoms",
+      "text": "Pacjent mówi: „Kręci mi się w głowie”. Co to znaczy?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Kręci mu się w głowie."
+        },
+        {
+          "key": "b",
+          "text": "Jest głodny."
+        },
+        {
+          "key": "c",
+          "text": "Jest bardzo zmęczony."
+        },
+        {
+          "key": "d",
+          "text": "Cieszy się."
+        }
+      ],
+      "correct": "a"
+    }
+  ],
+  "nl": [
+    {
+      "id": "nl1",
+      "topic": "greeting",
+      "text": "Hoe begroet u een patiënt?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Goedendag, ik ben uw verpleegkundige."
+        },
+        {
+          "key": "b",
+          "text": "Ga weg."
+        },
+        {
+          "key": "c",
+          "text": "Wees stil."
+        },
+        {
+          "key": "d",
+          "text": "Betaal nu."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "nl2",
+      "topic": "symptoms",
+      "text": "De patiënt zegt: „Ik heb veel pijn in mijn been.” Wat betekent dat?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Hij heeft veel pijn in zijn been."
+        },
+        {
+          "key": "b",
+          "text": "Hij is erg gelukkig."
+        },
+        {
+          "key": "c",
+          "text": "Hij heeft honger."
+        },
+        {
+          "key": "d",
+          "text": "Hij wil slapen."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "nl3",
+      "topic": "procedure",
+      "text": "Hoe legt u een verbandwissel uit?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Ik ga nu uw verband verwisselen. Dat kan even pijn doen."
+        },
+        {
+          "key": "b",
+          "text": "Ik ga nu naar huis."
+        },
+        {
+          "key": "c",
+          "text": "U moet nu meteen betalen."
+        },
+        {
+          "key": "d",
+          "text": "Ik weet het niet."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "nl4",
+      "topic": "allergies",
+      "text": "Hoe vraagt u naar allergieën?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Heeft u allergieën voor medicijnen?"
+        },
+        {
+          "key": "b",
+          "text": "Houdt u van chocolade?"
+        },
+        {
+          "key": "c",
+          "text": "Waar woont u?"
+        },
+        {
+          "key": "d",
+          "text": "Hoe oud bent u?"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "nl5",
+      "topic": "aftercare",
+      "text": "Wat zegt u na de verbandwissel?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Houd het verband droog en bel ons bij koorts."
+        },
+        {
+          "key": "b",
+          "text": "Ga zwemmen."
+        },
+        {
+          "key": "c",
+          "text": "Eet niets meer."
+        },
+        {
+          "key": "d",
+          "text": "Slaap nooit meer."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "nl6",
+      "topic": "emergency",
+      "text": "De patiënt krijgt plotseling ademnood. Wat zegt u?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Blijf rustig, ik bel meteen een ambulance."
+        },
+        {
+          "key": "b",
+          "text": "Wacht tot morgen."
+        },
+        {
+          "key": "c",
+          "text": "Drink water en ga."
+        },
+        {
+          "key": "d",
+          "text": "Dat is niet belangrijk."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "nl7",
+      "topic": "payment",
+      "text": "Hoe bevestigt u betaling en toestemming?",
+      "options": [
+        {
+          "key": "a",
+          "text": "De behandeling kost 30 euro. Gaat u akkoord?"
+        },
+        {
+          "key": "b",
+          "text": "Ik neem uw geld."
+        },
+        {
+          "key": "c",
+          "text": "Teken hier zonder te lezen."
+        },
+        {
+          "key": "d",
+          "text": "Betaal later, misschien."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "nl8",
+      "topic": "symptoms",
+      "text": "De patiënt zegt: „Ik ben duizelig.” Wat betekent dat?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Hij is duizelig."
+        },
+        {
+          "key": "b",
+          "text": "Hij heeft honger."
+        },
+        {
+          "key": "c",
+          "text": "Hij is erg moe."
+        },
+        {
+          "key": "d",
+          "text": "Hij is blij."
+        }
+      ],
+      "correct": "a"
+    }
+  ],
+  "zh": [
+    {
+      "id": "zh1",
+      "topic": "greeting",
+      "text": "你怎么向病人问好？",
+      "options": [
+        {
+          "key": "a",
+          "text": "您好，我是您的护士。"
+        },
+        {
+          "key": "b",
+          "text": "走开。"
+        },
+        {
+          "key": "c",
+          "text": "安静。"
+        },
+        {
+          "key": "d",
+          "text": "马上付钱。"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "zh2",
+      "topic": "symptoms",
+      "text": "病人说：“我的腿很疼。”这是什么意思？",
+      "options": [
+        {
+          "key": "a",
+          "text": "他的腿很疼。"
+        },
+        {
+          "key": "b",
+          "text": "他很开心。"
+        },
+        {
+          "key": "c",
+          "text": "他饿了。"
+        },
+        {
+          "key": "d",
+          "text": "他想睡觉。"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "zh3",
+      "topic": "procedure",
+      "text": "你怎么解释换药？",
+      "options": [
+        {
+          "key": "a",
+          "text": "现在我要给您换药，可能会有点疼。"
+        },
+        {
+          "key": "b",
+          "text": "我现在回家。"
+        },
+        {
+          "key": "c",
+          "text": "你必须马上付钱。"
+        },
+        {
+          "key": "d",
+          "text": "我不知道。"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "zh4",
+      "topic": "allergies",
+      "text": "你怎么问过敏史？",
+      "options": [
+        {
+          "key": "a",
+          "text": "您对药物过敏吗？"
+        },
+        {
+          "key": "b",
+          "text": "你喜欢巧克力吗？"
+        },
+        {
+          "key": "c",
+          "text": "你住在哪里？"
+        },
+        {
+          "key": "d",
+          "text": "你多大了？"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "zh5",
+      "topic": "aftercare",
+      "text": "换药后你说什么？",
+      "options": [
+        {
+          "key": "a",
+          "text": "请保持敷料干燥，如果发烧请打电话给我们。"
+        },
+        {
+          "key": "b",
+          "text": "去游泳吧。"
+        },
+        {
+          "key": "c",
+          "text": "不要再吃东西。"
+        },
+        {
+          "key": "d",
+          "text": "再也不要睡觉。"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "zh6",
+      "topic": "emergency",
+      "text": "病人突然呼吸困难。你说什么？",
+      "options": [
+        {
+          "key": "a",
+          "text": "请冷静，我马上叫救护车。"
+        },
+        {
+          "key": "b",
+          "text": "等到明天吧。"
+        },
+        {
+          "key": "c",
+          "text": "喝点水然后走吧。"
+        },
+        {
+          "key": "d",
+          "text": "这不重要。"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "zh7",
+      "topic": "payment",
+      "text": "你怎么确认付款和同意？",
+      "options": [
+        {
+          "key": "a",
+          "text": "治疗费用是30欧元，您同意吗？"
+        },
+        {
+          "key": "b",
+          "text": "我拿走你的钱。"
+        },
+        {
+          "key": "c",
+          "text": "在这里签字，不要读。"
+        },
+        {
+          "key": "d",
+          "text": "以后再付，也许。"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "zh8",
+      "topic": "symptoms",
+      "text": "病人说：“我头晕。”这是什么意思？",
+      "options": [
+        {
+          "key": "a",
+          "text": "他头晕。"
+        },
+        {
+          "key": "b",
+          "text": "他饿了。"
+        },
+        {
+          "key": "c",
+          "text": "他很累。"
+        },
+        {
+          "key": "d",
+          "text": "他很高兴。"
+        }
+      ],
+      "correct": "a"
+    }
+  ],
+  "cs": [
+    {
+      "id": "cs1",
+      "topic": "greeting",
+      "text": "Jak pozdravíte pacienta?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Dobrý den, jsem vaše zdravotní sestra / váš zdravotník."
+        },
+        {
+          "key": "b",
+          "text": "Jděte pryč."
+        },
+        {
+          "key": "c",
+          "text": "Buďte zticha."
+        },
+        {
+          "key": "d",
+          "text": "Zaplaťte hned."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "cs2",
+      "topic": "symptoms",
+      "text": "Pacient říká: „Moc mě bolí noha.” Co to znamená?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Moc ho bolí noha."
+        },
+        {
+          "key": "b",
+          "text": "Je velmi šťastný."
+        },
+        {
+          "key": "c",
+          "text": "Má hlad."
+        },
+        {
+          "key": "d",
+          "text": "Chce spát."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "cs3",
+      "topic": "procedure",
+      "text": "Jak vysvětlíte převaz?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Teď vám vyměním obvaz. Může to chvíli bolet."
+        },
+        {
+          "key": "b",
+          "text": "Teď jdu domů."
+        },
+        {
+          "key": "c",
+          "text": "Musíte zaplatit okamžitě."
+        },
+        {
+          "key": "d",
+          "text": "Nevím."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "cs4",
+      "topic": "allergies",
+      "text": "Jak se zeptáte na alergie?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Máte alergii na nějaké léky?"
+        },
+        {
+          "key": "b",
+          "text": "Máte rád čokoládu?"
+        },
+        {
+          "key": "c",
+          "text": "Kde bydlíte?"
+        },
+        {
+          "key": "d",
+          "text": "Kolik je vám let?"
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "cs5",
+      "topic": "aftercare",
+      "text": "Co řeknete po převazu?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Udržujte obvaz v suchu a při horečce nám zavolejte."
+        },
+        {
+          "key": "b",
+          "text": "Jděte plavat."
+        },
+        {
+          "key": "c",
+          "text": "Nic víc nejezte."
+        },
+        {
+          "key": "d",
+          "text": "Už nikdy nespěte."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "cs6",
+      "topic": "emergency",
+      "text": "Pacient najednou nemůže dýchat. Co řeknete?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Zůstaňte v klidu, hned volám sanitku."
+        },
+        {
+          "key": "b",
+          "text": "Počkejte do zítřka."
+        },
+        {
+          "key": "c",
+          "text": "Napijte se vody a jděte."
+        },
+        {
+          "key": "d",
+          "text": "To není důležité."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "cs7",
+      "topic": "payment",
+      "text": "Jak potvrdíte platbu a souhlas?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Ošetření stojí 30 eur. Souhlasíte?"
+        },
+        {
+          "key": "b",
+          "text": "Vezmu si vaše peníze."
+        },
+        {
+          "key": "c",
+          "text": "Podepište zde, aniž byste četl."
+        },
+        {
+          "key": "d",
+          "text": "Zaplaťte později, možná."
+        }
+      ],
+      "correct": "a"
+    },
+    {
+      "id": "cs8",
+      "topic": "symptoms",
+      "text": "Pacient říká: „Točí se mi hlava.” Co to znamená?",
+      "options": [
+        {
+          "key": "a",
+          "text": "Točí se mu hlava."
+        },
+        {
+          "key": "b",
+          "text": "Má hlad."
+        },
+        {
+          "key": "c",
+          "text": "Je velmi unavený."
+        },
+        {
+          "key": "d",
+          "text": "Těší se."
+        }
+      ],
+      "correct": "a"
+    }
+  ]
+};
 
 // Emergency triage danger signs — ANY one rejects a home-visit booking.
 const DANGER_SIGNS = [
@@ -391,5 +1782,7 @@ module.exports = {
   INTERVIEW_DIMENSIONS, INTERVIEW_COMMON, INTERVIEW_ROLE_QUESTIONS,
   HOTELS, MCQ, ENGLISH_CHECK, DANGER_SIGNS,
   TERMS_VERSION, TERMS_UPDATED_AT, TERMS_AR, TERMS_EN,
+  DEFAULT_LANGUAGES, LANGUAGE_TESTS, LANGUAGE_TEST_QUESTIONS, LANGUAGE_TEST_PASS_MIN,
+  LANGUAGE_TEST_MINUTES, LANGUAGE_TEST_RETAKE_DAYS, LANGUAGE_TEST_TOPICS,
   distanceFee, servicePriceEgp,
 };

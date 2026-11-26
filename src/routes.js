@@ -8,8 +8,9 @@ const crypto = require('crypto');
 const { store, sha256, saltedSha256, newId, nowIso, isNight } = require('./store');
 const { makeCode, hashOtpCode, verifyOtpCode, getMockCode, pickProvider, normalizePhone } = require('./otp');
 const { issueTokens, verifyRefreshToken, detectRefreshReuse, revokeRefreshToken, requireAuth, requireRole, requireAdmin, issueAdminToken } = require('./auth');
-const { computePoints, isoWeekKey, currentWeekKey, touristCompatible, englishBlocked } = require('./points');
+const { computePoints, isoWeekKey, currentWeekKey, touristCompatible, touristCompatibleFor, hasLanguageBadge, englishBlocked } = require('./points');
 const cat = require('./catalog');
+const { evaluateProviderDocuments } = require('./evaluate');
 const notify = require('./notify');
 
 const router = express.Router();
@@ -120,6 +121,61 @@ function requireHighRiskConsent(req, res, serviceCode) {
   if (req.body?.consentGiven === true) return false;
   res.status(400).json({ error: 'explicit_consent_required', message: 'هذه الخدمة عالية الخطورة وتتطلب موافقة كتابية صريحة من المريض قبل الحجز.' });
   return true;
+}
+// ---------------------------------------------------------------- v2.1.2 — languages, documents, receipts
+// Language list (data-driven: admin can add languages; a language is
+// testable only when a question bank exists for it in catalog.js).
+function languageList() {
+  return (store.data.languages || cat.DEFAULT_LANGUAGES).map((l) => ({
+    ...l, testAvailable: !!cat.LANGUAGE_TESTS[l.code],
+  }));
+}
+function findLanguage(code) {
+  const c = String(code || '').toLowerCase();
+  return (store.data.languages || []).find((l) => l.code === c) || null;
+}
+// Parse a base64 data URL (data:<mime>;base64,<payload>). Returns
+// {mime, size, data} or {error}. Size is the DECODED byte count.
+function parseDataUrl(raw, { allowedMimes, maxBytes, label }) {
+  if (typeof raw !== 'string') return { error: `${label} must be a base64 data URL.` };
+  const m = raw.match(/^data:([a-zA-Z0-9/+.-]+);base64,([A-Za-z0-9+/=]+)$/);
+  if (!m) return { error: `${label} must be a base64 data URL (data:<type>;base64,...).` };
+  const mime = m[1].toLowerCase();
+  if (!allowedMimes.includes(mime)) return { error: `${label} must be one of: ${allowedMimes.join(', ')}.` };
+  let buf;
+  try { buf = Buffer.from(m[2], 'base64'); } catch { return { error: `${label} is not valid base64.` }; }
+  if (!buf.length || buf.length > maxBytes) return { error: `${label} is too large (max ${Math.round(maxBytes / 1024 / 1024)} MB).` };
+  return { mime, size: buf.length, data: raw };
+}
+// Receipt upload at booking creation (v2.1.2): online payment only
+// (InstaPay / card). Cash bookings use a receipt at the visit, so a
+// receipt image with cash is rejected, not silently ignored.
+const RECEIPT_MAX_BYTES = 3 * 1024 * 1024; // 3 MB, JPEG/PNG only
+const RECEIPT_MIMES = ['image/jpeg', 'image/png'];
+function receiptFromBody(body, paymentMethod) {
+  const raw = body?.receiptImage || body?.receipt;
+  if (!raw) return { receipt: null, image: null };
+  if (paymentMethod === 'cash_receipt') {
+    return { error: 'Cash payments use a receipt at the visit — no receipt photo is needed at booking.' };
+  }
+  const parsed = parseDataUrl(raw, { allowedMimes: RECEIPT_MIMES, maxBytes: RECEIPT_MAX_BYTES, label: 'Receipt photo' });
+  if (parsed.error) return { error: parsed.error };
+  return {
+    receipt: { uploadedAt: nowIso(), status: 'pending', reviewedAt: null, note: null },
+    image: { mime: parsed.mime, size: parsed.size, data: parsed.data, uploadedAt: nowIso() },
+  };
+}
+function attachReceipt(booking, parsed) {
+  booking.receipt = parsed && parsed.receipt ? parsed.receipt : null;
+  if (parsed && parsed.image) store.data.receiptImages[booking.id] = parsed.image;
+}
+function receiptPending(b) { return !!(b.receipt && b.receipt.status === 'pending'); }
+// Re-run the CV/certificate evaluation after anything that changes the
+// inputs (document upload, admin credential verify).
+function refreshCvEvaluation(p) {
+  if (!p) return null;
+  p.cvEvaluation = evaluateProviderDocuments(p);
+  return p.cvEvaluation;
 }
 // Length caps (M11): name <=120, notes <=1000, address <=300,
 // complaint <=1000, safety text <=1000.
@@ -639,6 +695,10 @@ router.get('/bootstrap', (req, res) => {
     // v2.1.0 — high-risk tier (owner refinement 26 Nov 2026).
     highRiskServices: cat.HIGH_RISK_SERVICES,
     highRiskChecklist: cat.HIGH_RISK_CHECKLIST,
+    // v2.1.2 — languages + in-app language tests (owner decision 26 Nov
+    // 2026): 7 seeded languages, testable only with a question bank.
+    languages: languageList(),
+    languageTest: { questionsPerTest: cat.LANGUAGE_TEST_QUESTIONS, passMin: cat.LANGUAGE_TEST_PASS_MIN, minutes: cat.LANGUAGE_TEST_MINUTES, retakeDays: cat.LANGUAGE_TEST_RETAKE_DAYS },
     // v2.0.9 — active promo-month override (commission %, no secrets).
     promo: (() => { const pr = activePromo(); return pr ? { active: true, commissionPct: pr.commissionPct, until: pr.until || null } : { active: false, commissionPct: null, until: null }; })(),
     note: 'Prices are fixed and announced in advance. No bargaining inside the app.',
@@ -790,6 +850,328 @@ router.post('/medical-file-interest', (req, res) => {
   res.json({ ok: true, recorded });
 });
 
+// ---------------------------------------------------------------- v2.1.2 — languages + in-app language tests
+// One separate MCQ test per language a provider claims. The general
+// tourist badge needs interview passed + English test passed; a
+// tourist booking in language X needs X's test passed. A certificate
+// NEVER exempts anyone from a test (it still counts toward points and
+// the $15/€15 bonus still needs a verified certificate — unchanged).
+// Server-side question bank only (catalog.js LANGUAGE_TESTS); options
+// are shuffled at start, like the interview bank. Pass >= 6/8, 15
+// minutes, retake after 7 days.
+router.get('/languages', (req, res) => {
+  res.json({
+    languages: languageList(),
+    test: { questionsPerTest: cat.LANGUAGE_TEST_QUESTIONS, passMin: cat.LANGUAGE_TEST_PASS_MIN, minutes: cat.LANGUAGE_TEST_MINUTES, retakeDays: cat.LANGUAGE_TEST_RETAKE_DAYS },
+  });
+});
+
+router.post('/admin/languages', requireAdmin, (req, res) => {
+  const code = String(req.body?.code || '').trim().toLowerCase();
+  if (!/^[a-z]{2,5}$/.test(code)) return bad(res, 400, 'code must be a 2–5 letter language code (e.g. de, ru).');
+  if (findLanguage(code)) return res.status(409).json({ error: 'conflict', message: 'Language already exists.' });
+  const nameAr = String(req.body?.nameAr || '').trim().slice(0, 60);
+  const nameEn = String(req.body?.nameEn || '').trim().slice(0, 60);
+  const nativeName = String(req.body?.nativeName || nameEn).trim().slice(0, 60);
+  if (!nameAr || !nameEn) return bad(res, 400, 'nameAr and nameEn are required.');
+  const lang = { code, nameAr, nameEn, nativeName };
+  store.data.languages.push(lang);
+  store.audit('admin.language_added', 'admin', { code, nameEn, testAvailable: !!cat.LANGUAGE_TESTS[code] });
+  store.save();
+  res.status(201).json({ ...lang, testAvailable: !!cat.LANGUAGE_TESTS[code], note: cat.LANGUAGE_TESTS[code] ? undefined : 'No question bank for this language yet — tests stay unavailable until a bank is added.' });
+});
+
+function languageTestState(p, lang) {
+  const rec = (p.languageTests && p.languageTests[lang]) || { attempts: [] };
+  const last = rec.attempts[rec.attempts.length - 1] || null;
+  const badge = (p.languageBadges && p.languageBadges[lang]) || null;
+  return { badge: badge || null, attempts: rec.attempts.length, lastAttemptAt: last ? last.submittedAt : null, lastScore: last ? last.score : null, canRetakeAt: rec.canRetakeAt || null };
+}
+
+router.get('/me/language-badges', requireAuth, requireRole('provider'), (req, res) => {
+  const p = store.data.providers[req.user.providerId];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
+  const langs = languageList();
+  const tests = {};
+  for (const l of langs) tests[l.code] = languageTestState(p, l.code);
+  res.json({
+    providerId: p.id,
+    interviewStatus: p.interviewStatus,
+    claimedLanguages: p.claimedLanguages || [],
+    touristCompatible: touristCompatible(p),
+    englishBlocked: englishBlocked(p),
+    badges: p.languageBadges || {},
+    tests,
+    languages: langs,
+    passMin: cat.LANGUAGE_TEST_PASS_MIN, questionsPerTest: cat.LANGUAGE_TEST_QUESTIONS,
+  });
+});
+
+router.post('/me/language-tests/:lang/start', requireAuth, requireRole('provider'), (req, res) => {
+  const lang = String(req.params.lang || '').toLowerCase();
+  const p = store.data.providers[req.user.providerId];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
+  if (!findLanguage(lang)) return res.status(404).json({ error: 'not_found', message: 'Unknown language code.' });
+  const bank = cat.LANGUAGE_TESTS[lang];
+  if (!bank) return res.status(409).json({ error: 'test_unavailable', message: 'No question bank for this language yet — the test cannot be taken.' });
+  if (hasLanguageBadge(p, lang)) {
+    return res.status(409).json({ error: 'already_passed', message: 'You already passed this language test — the badge is on your profile.' });
+  }
+  const rec = (p.languageTests && p.languageTests[lang]) || { attempts: [] };
+  if (rec.canRetakeAt && new Date(rec.canRetakeAt).getTime() > Date.now()) {
+    return res.status(409).json({ error: 'retake_blocked', message: 'Retake cooldown is still active.', canRetakeAt: rec.canRetakeAt });
+  }
+  const sessions = store.data.languageTestSessions || (store.data.languageTestSessions = {});
+  const key = `${p.id}:${lang}`;
+  const existing = sessions[key];
+  if (existing && new Date(existing.deadlineAt).getTime() > Date.now()) {
+    return res.status(409).json({ error: 'conflict', message: 'A language test attempt is already in progress.', deadlineAt: existing.deadlineAt });
+  }
+  const questions = shuffle([...bank]);
+  const answerKey = {};
+  const pub = questions.map((q) => {
+    const opts = shuffle(q.options);
+    answerKey[q.id] = q.correct;
+    return { id: q.id, topic: q.topic, text: q.text, options: opts };
+  });
+  const attemptId = newId('lt');
+  const deadlineAt = new Date(Date.now() + cat.LANGUAGE_TEST_MINUTES * 60 * 1000).toISOString();
+  sessions[key] = { attemptId, providerId: p.id, lang, startedAt: nowIso(), deadlineAt, answerKey, pub };
+  store.audit('provider.language_test_started', req.user.phone, { providerId: p.id, lang, attemptId });
+  store.save();
+  res.json({ attemptId, lang, deadlineAt, minutes: cat.LANGUAGE_TEST_MINUTES, totalQuestions: cat.LANGUAGE_TEST_QUESTIONS, passMin: cat.LANGUAGE_TEST_PASS_MIN, questions: pub });
+});
+
+router.post('/me/language-tests/:lang/submit', requireAuth, requireRole('provider'), (req, res) => {
+  const lang = String(req.params.lang || '').toLowerCase();
+  const p = store.data.providers[req.user.providerId];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
+  const sessions = store.data.languageTestSessions || {};
+  const key = `${p.id}:${lang}`;
+  const active = sessions[key];
+  if (!active || (req.body?.attemptId && req.body.attemptId !== active.attemptId)) {
+    return bad(res, 409, 'No active language test attempt. Start one first.');
+  }
+  if (new Date(active.deadlineAt).getTime() < Date.now()) {
+    delete sessions[key];
+    store.save();
+    return res.status(410).json({ error: 'expired', message: 'The language test deadline passed (server time). Start a new attempt.' });
+  }
+  const mapAnswers = (raw, pub) => {
+    const out = {};
+    for (const [qid, v] of Object.entries(raw || {})) {
+      const q = (pub || []).find((x) => x.id === qid);
+      if (!q) { out[qid] = v; continue; }
+      const idx = Number(v);
+      out[qid] = Number.isInteger(idx) && q.options[idx] ? q.options[idx].key : v;
+    }
+    return out;
+  };
+  const answers = mapAnswers(req.body?.answers, active.pub);
+  let score = 0;
+  for (const q of cat.LANGUAGE_TESTS[lang] || []) {
+    if (answers[q.id] === active.answerKey[q.id]) score += 1;
+  }
+  const total = cat.LANGUAGE_TEST_QUESTIONS;
+  const passed = score >= cat.LANGUAGE_TEST_PASS_MIN;
+  p.languageTests = p.languageTests || {};
+  const rec = p.languageTests[lang] || (p.languageTests[lang] = { attempts: [] });
+  const attempt = { attemptId: active.attemptId, startedAt: active.startedAt, submittedAt: nowIso(), score, total, passed, passMin: cat.LANGUAGE_TEST_PASS_MIN };
+  rec.attempts.push(attempt);
+  rec.canRetakeAt = passed ? null : new Date(Date.now() + cat.LANGUAGE_TEST_RETAKE_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  if (passed) {
+    p.languageBadges = p.languageBadges || {};
+    p.languageBadges[lang] = { passed: true, score, total, passedAt: nowIso() };
+  }
+  delete sessions[key];
+  store.audit('provider.language_test_submitted', req.user.phone, { providerId: p.id, lang, score, total, passed });
+  store.save();
+  res.json({
+    ...attempt, lang, canRetakeAt: rec.canRetakeAt,
+    touristCompatible: touristCompatible(p),
+    badge: (p.languageBadges && p.languageBadges[lang]) || null,
+    message: passed
+      ? `Passed the ${lang.toUpperCase()} test (${score}/${total}) — the badge is on your profile.`
+      : `Did not pass (${score}/${total}, need ${cat.LANGUAGE_TEST_PASS_MIN}/${total}). You may retake after 7 days.`,
+  });
+});
+
+// ---------------------------------------------------------------- v2.1.2 — CV / certificate uploads + algorithmic evaluation
+// Real file contents reach the server now (v2.1.1 was metadata-only):
+// max 5 MB per file, max 10 files per provider, JPEG/PNG/PDF only,
+// base64 data URLs in JSON (fits the existing file-store architecture).
+// Files live in the same file store, so they reset on redeploy like all
+// data — documented in BUILD-STATUS.md. Never collect card data here.
+const DOC_MAX_BYTES = 5 * 1024 * 1024; // 5 MB per file
+const DOC_MAX_FILES = 10;
+const DOC_MIMES = ['image/jpeg', 'image/png', 'application/pdf'];
+const DOC_KINDS = ['certificate', 'course', 'cv', 'licence', 'id', 'other'];
+
+router.post('/me/documents', requireAuth, requireRole('provider'), (req, res) => {
+  const p = store.data.providers[req.user.providerId];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
+  const kind = String(req.body?.kind || '').toLowerCase();
+  if (!DOC_KINDS.includes(kind)) return bad(res, 400, `kind must be one of: ${DOC_KINDS.join(', ')}.`);
+  const name = String(req.body?.name || '').trim().slice(0, 200);
+  if (!name) return bad(res, 400, 'name required (file name).');
+  if ((p.documents || []).length >= DOC_MAX_FILES) return res.status(409).json({ error: 'too_many_documents', message: `Maximum ${DOC_MAX_FILES} documents per provider.` });
+  const parsed = parseDataUrl(req.body?.data, { allowedMimes: DOC_MIMES, maxBytes: DOC_MAX_BYTES, label: 'Document' });
+  if (parsed.error) return bad(res, 400, parsed.error);
+  const doc = { id: newId('doc'), kind, name, size: parsed.size, mime: parsed.mime, data: parsed.data, uploadedAt: nowIso() };
+  p.documents = p.documents || [];
+  p.documents.push(doc);
+  // Also mirror certificate/course uploads into the metadata lists the
+  // admin verifies (no double-count: points only count VERIFIED entries).
+  if (kind === 'certificate' && !(p.certificates || []).some((c) => c.name === name)) {
+    p.certificates = p.certificates || [];
+    p.certificates.push({ name, verified: false });
+  }
+  if (kind === 'course' && !(p.courses || []).some((c) => c.name === name)) {
+    p.courses = p.courses || [];
+    p.courses.push({ name, verified: false });
+  }
+  refreshCvEvaluation(p);
+  store.audit('provider.document_uploaded', req.user.phone, { providerId: p.id, docId: doc.id, kind, name, size: doc.size, cvScore: p.cvEvaluation ? p.cvEvaluation.total : null });
+  store.save();
+  res.status(201).json({
+    document: { id: doc.id, kind: doc.kind, name: doc.name, size: doc.size, mime: doc.mime, uploadedAt: doc.uploadedAt },
+    evaluation: p.cvEvaluation,
+    note: 'The file is stored with your application for admin review. Points only change when the admin verifies a certificate or course.',
+  });
+});
+
+router.get('/me/documents', requireAuth, requireRole('provider'), (req, res) => {
+  const p = store.data.providers[req.user.providerId];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
+  res.json({
+    documents: (p.documents || []).map((d) => ({ id: d.id, kind: d.kind, name: d.name, size: d.size, mime: d.mime, uploadedAt: d.uploadedAt })),
+    evaluation: p.cvEvaluation || null,
+    limits: { maxBytesPerFile: DOC_MAX_BYTES, maxFiles: DOC_MAX_FILES, allowedMimes: DOC_MIMES },
+  });
+});
+
+// Admin reads one uploaded document WITH content (admin only).
+router.get('/admin/providers/:id/documents/:docId', requireAdmin, (req, res) => {
+  const p = store.data.providers[req.params.id];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
+  const doc = (p.documents || []).find((d) => d.id === req.params.docId);
+  if (!doc) return res.status(404).json({ error: 'not_found', message: 'Document not found.' });
+  store.audit('admin.document_read', 'admin', { providerId: p.id, docId: doc.id, kind: doc.kind });
+  res.json({ id: doc.id, providerId: p.id, kind: doc.kind, name: doc.name, size: doc.size, mime: doc.mime, uploadedAt: doc.uploadedAt, data: doc.data });
+});
+
+// ---------------------------------------------------------------- v2.1.2 — admin review queue (applications)
+// Each application shows the algorithmic score breakdown, interview
+// score, points, and uploaded documents. The ADMIN (Mohamed) approves
+// or rejects — the final decision is his; the recommendation is advisory.
+function applicationView(p) {
+  const pts = p.points || computePoints(p, Object.values(store.data.bookings));
+  return {
+    providerId: p.id, name: p.name, phone: p.phone, role: p.role, providerType: p.providerType || p.role,
+    tier: p.tier, status: p.status, submittedAt: p.createdAt,
+    rejectionReason: p.rejectionReason || null, rejectedAt: p.rejectedAt || null,
+    interviewStatus: p.interviewStatus, interviewScore: p.interviewScore,
+    points: pts,
+    cvEvaluation: p.cvEvaluation || evaluateProviderDocuments(p),
+    documents: (p.documents || []).map((d) => ({ id: d.id, kind: d.kind, name: d.name, size: d.size, mime: d.mime, uploadedAt: d.uploadedAt })),
+    certificates: p.certificates || [], courses: p.courses || [],
+    languageBadges: p.languageBadges || {}, claimedLanguages: p.claimedLanguages || [],
+  };
+}
+
+router.get('/admin/applications', requireAdmin, (req, res) => {
+  const status = String(req.query.status || 'pending');
+  let list = Object.values(store.data.providers);
+  if (status !== 'all') list = list.filter((p) => p.status === status);
+  list.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  res.json({ applications: list.map(applicationView), count: list.length, status });
+});
+
+router.post('/admin/applications/:id/approve', requireAdmin, (req, res) => {
+  const p = store.data.providers[req.params.id];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
+  if (p.status === 'verified') return bad(res, 409, 'This application is already approved (provider verified).');
+  p.status = 'verified';
+  p.roleVerified = true;
+  recomputeProviderPoints(p);
+  refreshCvEvaluation(p);
+  store.audit('admin.application_approved', 'admin', { providerId: p.id, cvScore: p.cvEvaluation ? p.cvEvaluation.total : null, recommendation: p.cvEvaluation ? p.cvEvaluation.recommendation : null });
+  store.save();
+  res.json(applicationView(p));
+});
+
+router.post('/admin/applications/:id/reject', requireAdmin, (req, res) => {
+  const p = store.data.providers[req.params.id];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
+  if (p.status === 'verified') return bad(res, 409, 'A verified provider cannot be rejected here — use suspend instead.');
+  const reason = String(req.body?.reason || '').slice(0, 500) || null;
+  p.status = 'rejected';
+  p.rejectionReason = reason;
+  p.rejectedAt = nowIso();
+  store.audit('admin.application_rejected', 'admin', { providerId: p.id, reason, cvScore: p.cvEvaluation ? p.cvEvaluation.total : null });
+  store.save();
+  res.json(applicationView(p));
+});
+
+// ---------------------------------------------------------------- v2.1.2 — receipt-photo payment confirmation
+// For online payment (InstaPay / card) the patient uploads a receipt
+// photo at booking (or right after, while the booking is still held).
+// The booking stays pending until an admin reviews the receipt:
+// acceptance is blocked while receipt.status is 'pending' (see the
+// accept gate) and the radar hides it. Cash is unchanged (receipt at
+// the visit). Never collect card data — receipt image only.
+router.post('/bookings/:id/receipt', requireAuth, requireRole('patient'), (req, res) => {
+  const b = loadBooking(req, res);
+  if (!b) return;
+  if (b.patientPhone !== req.user.phone) return res.status(403).json({ error: 'forbidden', message: 'Not your booking.' });
+  if (b.paymentMethod === 'cash_receipt') return bad(res, 400, 'Cash payments use a receipt at the visit — no receipt photo is needed for this booking.');
+  if (b.status !== 'held') return bad(res, 409, `Receipt photos can only be uploaded while the booking is held (status is ${b.status}).`);
+  if (b.receipt && b.receipt.status === 'pending') return res.status(409).json({ error: 'receipt_pending_review', message: 'A receipt photo is already under admin review for this booking.' });
+  if (b.receipt && b.receipt.status === 'approved') return res.status(409).json({ error: 'receipt_already_approved', message: 'The receipt for this booking is already approved.' });
+  const parsed = receiptFromBody({ receiptImage: req.body?.receiptImage || req.body?.data }, b.paymentMethod);
+  if (parsed.error) return bad(res, 400, parsed.error);
+  if (!parsed.receipt) return bad(res, 400, 'receiptImage (base64 data URL, JPEG/PNG, max 3 MB) is required.');
+  attachReceipt(b, parsed);
+  store.audit('booking.receipt_uploaded', req.user.phone, { bookingId: b.id });
+  store.save();
+  res.status(201).json({ ok: true, bookingId: b.id, receipt: b.receipt, note: 'Receipt uploaded — the booking stays pending until the admin reviews it.' });
+});
+
+router.get('/admin/bookings/:id/receipt', requireAdmin, (req, res) => {
+  const b = store.data.bookings[req.params.id];
+  if (!b) return res.status(404).json({ error: 'not_found', message: 'Booking not found.' });
+  const img = store.data.receiptImages[b.id] || null;
+  res.json({ bookingId: b.id, receipt: b.receipt || null, image: img ? img.data : null, mime: img ? img.mime : null, size: img ? img.size : null });
+});
+
+router.post('/admin/bookings/:id/receipt/approve', requireAdmin, (req, res) => {
+  const b = store.data.bookings[req.params.id];
+  if (!b) return res.status(404).json({ error: 'not_found', message: 'Booking not found.' });
+  if (!b.receipt) return bad(res, 409, 'This booking has no receipt photo.');
+  if (b.receipt.status === 'approved') return bad(res, 409, 'Receipt already approved.');
+  b.receipt.status = 'approved';
+  b.receipt.reviewedAt = nowIso();
+  b.receipt.note = String(req.body?.note || '').slice(0, 500) || null;
+  store.audit('admin.receipt_approved', 'admin', { bookingId: b.id });
+  store.save();
+  res.json({ ok: true, bookingId: b.id, receipt: b.receipt });
+});
+
+router.post('/admin/bookings/:id/receipt/reject', requireAdmin, (req, res) => {
+  const b = store.data.bookings[req.params.id];
+  if (!b) return res.status(404).json({ error: 'not_found', message: 'Booking not found.' });
+  if (!b.receipt) return bad(res, 409, 'This booking has no receipt photo.');
+  if (b.receipt.status === 'approved') return bad(res, 409, 'An approved receipt cannot be rejected — resolve it with the patient instead.');
+  const note = String(req.body?.note || '').slice(0, 500);
+  if (!note) return bad(res, 400, 'A rejection needs a short note for the patient (what is wrong with the receipt).');
+  b.receipt.status = 'rejected';
+  b.receipt.reviewedAt = nowIso();
+  b.receipt.note = note;
+  store.audit('admin.receipt_rejected', 'admin', { bookingId: b.id, note });
+  store.save();
+  res.json({ ok: true, bookingId: b.id, receipt: b.receipt, note: 'The patient can upload a new receipt photo while the booking is still held.' });
+});
+
 // ---------------------------------------------------------------- monitor (v2.1.1)
 // READ-ONLY oversight summary for Muse (owner-approved 26 Nov 2026).
 // Auth ONLY by header X-Monitor-Token exact match (timingSafeEqual when
@@ -850,6 +1232,23 @@ router.get('/monitor/summary', (req, res) => {
     return t && new Date(t).getTime() >= thirtyDaysAgo;
   });
   const repeatBookingRate = { overall: repeatRate(bookings), last30Days: repeatRate(recentCompleted) };
+  // v2.1.2 — pending applications (no PII: provider id + scores only,
+  // so the admin partner can read them and send Mohamed a
+  // recommendation in chat) + receipts awaiting review.
+  const pendingApplications = Object.values(store.data.providers)
+    .filter((p) => p.status === 'pending')
+    .map((p) => ({
+      providerId: p.id, status: p.status,
+      interviewStatus: p.interviewStatus,
+      interviewScore: p.interviewScore ? p.interviewScore.total : null,
+      pointsTotal: (p.points && p.points.total) || 0, tier: p.tier || 'Starter',
+      cvScore: (p.cvEvaluation || evaluateProviderDocuments(p)).total,
+      cvRecommendation: (p.cvEvaluation || evaluateProviderDocuments(p)).recommendation,
+      documentsCount: (p.documents || []).length,
+    }));
+  const pendingReceipts = bookings
+    .filter((b) => b.receipt && b.receipt.status === 'pending')
+    .map((b) => ({ id: b.id }));
   store.audit('monitor.access', 'monitor', { ip: req.ip });
   store.save();
   res.json({
@@ -861,6 +1260,8 @@ router.get('/monitor/summary', (req, res) => {
     circumventionReports: { count: circumventionReports.length, items: circumventionReports.map((r) => ({ id: r.id, bookingId: r.bookingId })) },
     settlement: { appOwesProviderEgp: appOwes, providerOwesAppEgp: provOwes, pendingEgp: pending, complaintHoldEgp: hold },
     repeatBookingRate,
+    pendingApplications: { count: pendingApplications.length, items: pendingApplications },
+    pendingReceipts: { count: pendingReceipts.length, items: pendingReceipts },
     medicalFileInterestCount: (store.data.medicalFileInterest || {}).count || 0,
   });
 });
@@ -1144,6 +1545,12 @@ router.post('/bookings', requireAuth, requireRole('patient'), (req, res) => {
   if (priced.contract_required) {
     return res.status(422).json({ error: 'contract_required', ...priced });
   }
+  // v2.1.2 — receipt photo for online payment (InstaPay): parsed and
+  // validated here; cash bookings reject a receipt image (receipt at
+  // the visit instead). The booking stays pending until the admin
+  // reviews the receipt (see the accept gate).
+  const receiptParsed = receiptFromBody(req.body, b.paymentMethod);
+  if (receiptParsed.error) return bad(res, 400, receiptParsed.error);
   const id = newId('bk');
   // v2.0.9 — auto-apply one loyalty voucher when the booking is >= 300 EGP.
   // The provider's share is computed on the FULL price at release; the
@@ -1179,6 +1586,7 @@ router.post('/bookings', requireAuth, requireRole('patient'), (req, res) => {
     address: b.address ? capStr(b.address, 300) : null, scheduledAt: b.scheduledAt || null, notes: b.notes ? capStr(b.notes, 1000) : null,
     alternateContact: b.alternateContact || null, // admin-only if needed
     providerId: null, commissionPct: null, providerShareEgp: null, appShareEgp: null, estimatedProviderShareEgp: null, languageBonusEgp: 0,
+    receipt: null,
     vitals: null, review: null, providerReview: null, complaint: false,
     circumventionHold: false, circumventionReportId: null,
     complaintStatus: null, complaintDeadline: null, complaintAt: null, complaintResolvedAt: null,
@@ -1187,9 +1595,10 @@ router.post('/bookings', requireAuth, requireRole('patient'), (req, res) => {
     createdAt: nowIso(), acceptedAt: null, providerConfirmedAt: null,
     patientConfirmedAt: null, reviewedAt: null, releasedAt: null, releaseMode: null,
   };
+  attachReceipt(booking, receiptParsed);
   store.data.bookings[id] = booking;
   if (vou) { vou.status = 'used'; vou.usedAt = nowIso(); vou.usedBookingId = id; }
-  store.audit('booking.created', req.user.phone, { bookingId: id, serviceCode: b.serviceCode, totalEgp: booking.amountEgp, voucherId: booking.voucherId, voucherDiscountEgp: booking.voucherDiscountEgp });
+  store.audit('booking.created', req.user.phone, { bookingId: id, serviceCode: b.serviceCode, totalEgp: booking.amountEgp, voucherId: booking.voucherId, voucherDiscountEgp: booking.voucherDiscountEgp, receipt: booking.receipt ? booking.receipt.status : null });
   if (cat.isHighRiskService(b.serviceCode)) store.audit('booking.high_risk_consent', req.user.phone, { bookingId: id, serviceCode: b.serviceCode });
   recordTermsAcceptance(req.user.phone);
   store.save();
@@ -1465,9 +1874,11 @@ router.post('/providers/register', requireAuth, (req, res) => {
   const licenseNo = String(b.licenseNo || '');
   if (!/^\d{14}$/.test(nationalId)) return bad(res, 400, 'nationalId must be 14 digits.');
   if (!licenseNo || licenseNo.length < 4) return bad(res, 400, 'licenseNo required.');
-  // Certificates / courses are METADATA only in Phase 1 (no real file
-  // upload yet — M29 partial): {name, verified:false} until admin
-  // verifies them. A physio registration REQUIRES >=1 certificate entry.
+  // Certificates / courses are metadata at registration ({name,
+  // verified:false} until admin verifies them). The REAL files are
+  // uploaded after registration via POST /api/me/documents (v2.1.2)
+  // and feed the algorithmic CV evaluation. A physio registration
+  // REQUIRES >=1 certificate entry.
   const certificates = Array.isArray(b.certificates)
     ? b.certificates.map((c) => (typeof c === 'string' ? { name: String(c).slice(0, 200), verified: false } : { name: String(c.name || '').slice(0, 200), verified: false })).filter((c) => c.name).slice(0, 20)
     : [];
@@ -1480,6 +1891,11 @@ router.post('/providers/register', requireAuth, (req, res) => {
   const extraLanguages = Array.isArray(b.extraLanguages)
     ? b.extraLanguages.filter((l) => l && l.language).map((l) => ({ language: String(l.language).toLowerCase().slice(0, 5), certified: l.certified === true })).slice(0, 5)
     : [];
+  const claimedLanguages = [...new Set([
+    ...(Array.isArray(b.claimedLanguages) ? b.claimedLanguages : []),
+    ...(Array.isArray(b.extraLanguages) ? b.extraLanguages : []),
+    ...(Array.isArray(b.languageCertificates) ? b.languageCertificates : []),
+  ].map((l) => (typeof l === 'string' ? l : (l && l.language) || '')).filter(Boolean).map((l) => String(l).toLowerCase().slice(0, 10)))].slice(0, 7);
   const languageCertificates = Array.isArray(b.languageCertificates)
     ? b.languageCertificates.filter((l) => l && l.language).map((l) => ({ language: String(l.language).toLowerCase().slice(0, 10), certificateName: String(l.certificateName || l.name || '').slice(0, 200), verified: false })).slice(0, 5)
     : extraLanguages.filter((l) => l.certified).map((l) => ({ language: l.language, certificateName: '', verified: false }));
@@ -1492,7 +1908,8 @@ router.post('/providers/register', requireAuth, (req, res) => {
     // v2.1.1 (M18): salted sha256; only last4 ever leaves the server.
     nationalIdHash: saltedSha256(nationalId), nationalIdLast4: nationalId.slice(-4),
     licenseHash: saltedSha256(licenseNo), licenseLast4: licenseNo.slice(-4),
-    certificates, courses, languageCertificates, extraLanguages,
+    certificates, courses, languageCertificates, extraLanguages, claimedLanguages,
+    languageBadges: {}, languageTests: {}, documents: [], cvEvaluation: null,
     verifiedCertificates: 0, // +5 points each (max 20) — set by admin certificate review
     interviewStatus: 'not_started', interviewScore: null, interviewPoints: 0,
     interviewEnglishCorrect: null, interviewEnglishTotal: null,
@@ -1505,6 +1922,7 @@ router.post('/providers/register', requireAuth, (req, res) => {
   store.data.providersByPhone[req.user.phone] = id;
   recordTermsAcceptance(req.user.phone);
   recomputeProviderPoints(p);
+  refreshCvEvaluation(p);
   store.audit('provider.registered', req.user.phone, { providerId: id, role: providerType, providerType });
   store.save();
   res.status(201).json({ ...store.publicProvider(p, { self: true, points: p.points }), next: 'Take the 36-question interview: POST /api/providers/interview/start' });
@@ -1543,9 +1961,14 @@ router.get('/providers/radar', requireAuth, requireRole('provider'), (req, res) 
       && !(p.providerType === 'assistant' && cat.isHighRiskService(b.serviceCode))
       // v2.1.1 — physio-category services ONLY to providerType 'physio'.
       && !(b.category === 'physio' && p.providerType !== 'physio')
-      // v2.1.1 — tourist bookings ONLY to tourist-compatible providers
-      // who are not English-blocked.
-      && !(b.kind === 'tourist' && (!touristCompatible(p) || englishBlocked(p)))
+      // v2.1.2 — tourist bookings ONLY to providers who passed the
+      // in-app test for THAT booking's language (interview passed +
+      // test passed) and are not English-blocked. A certificate alone
+      // no longer grants the badge (supersedes v2.1.1).
+      && !(b.kind === 'tourist' && (!touristCompatibleFor(p, b.language) || englishBlocked(p)))
+      // v2.1.2 — a booking whose receipt photo is still under admin
+      // review cannot be accepted yet, so it stays off the radar too.
+      && !receiptPending(b)
       // v2.1.1 — Elite early access: bookings created <30 min ago are
       // visible ONLY to Elite providers; everyone else sees them after
       // 30 minutes.
@@ -1576,11 +1999,16 @@ router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, 
   if (p.status !== 'verified') {
     return res.status(403).json({ error: 'forbidden', message: 'Admin document verification is required before accepting work (status=verified).' });
   }
-  // v2.1.1 — defense in depth: tourist bookings need a verified language
-  // certificate and a non-blocked English check; physio services need a
-  // physio provider.
-  if (b.kind === 'tourist' && (!touristCompatible(p) || englishBlocked(p))) {
-    return res.status(403).json({ error: 'forbidden', message: 'Tourist bookings require a verified language certificate and a passing English check.' });
+  // v2.1.2 — defense in depth: tourist bookings need the in-app test
+  // for this booking's language (interview passed + test passed) and a
+  // non-blocked English check; physio services need a physio provider.
+  if (b.kind === 'tourist' && (!touristCompatibleFor(p, b.language) || englishBlocked(p))) {
+    return res.status(403).json({ error: 'forbidden', message: `Tourist bookings in ${b.language || 'en'} require the in-app ${(b.language || 'en').toUpperCase()} language test (interview passed + test passed).` });
+  }
+  // v2.1.2 — a receipt photo under admin review blocks acceptance
+  // until the admin confirms or rejects it.
+  if (receiptPending(b)) {
+    return res.status(403).json({ error: 'receipt_pending_review', message: 'This booking has a receipt photo under admin review — it cannot be accepted until the admin confirms or rejects the receipt.' });
   }
   if (b.category === 'physio' && p.providerType !== 'physio') {
     return res.status(403).json({ error: 'forbidden', message: 'Physiotherapy services can only be accepted by a physiotherapy specialist.' });
@@ -2242,6 +2670,10 @@ router.post('/tourist-bookings', requireAuth, requireRole('patient'), (req, res)
   const amountForeign = Math.round((base + urgent + distanceForeign) * 100) / 100;
   const amountEgp = Math.round(amountForeign * fx);
   const language = b.language ? String(b.language).toLowerCase() : 'en';
+  // v2.1.2 — receipt photo for online payment (InstaPay / card); cash
+  // bookings reject a receipt image (receipt at the visit instead).
+  const receiptParsedTourist = receiptFromBody(req.body, b.paymentMethod);
+  if (receiptParsedTourist.error) return bad(res, 400, receiptParsedTourist.error);
   const id = newId('bk');
   // v2.0.9 — loyalty voucher (50 EGP, converted at this booking's fx rate).
   // Provider share is computed on the FULL pre-discount price at release.
@@ -2273,6 +2705,7 @@ router.post('/tourist-bookings', requireAuth, requireRole('patient'), (req, res)
     nationality: b.nationality || null, diagnosis: b.diagnosis || null,
     address: b.address || null, scheduledAt: b.scheduledAt || null, notes: b.notes || null,
     providerId: null, commissionPct: null, providerShareEgp: null, appShareEgp: null, estimatedProviderShareEgp: null, languageBonusEgp: 0,
+    receipt: null,
     vitals: null, review: null, providerReview: null, complaint: false,
     circumventionHold: false, circumventionReportId: null,
     complaintStatus: null, complaintDeadline: null, complaintAt: null, complaintResolvedAt: null,
@@ -2281,6 +2714,7 @@ router.post('/tourist-bookings', requireAuth, requireRole('patient'), (req, res)
     createdAt: nowIso(), acceptedAt: null, providerConfirmedAt: null,
     patientConfirmedAt: null, reviewedAt: null, releasedAt: null, releaseMode: null,
   };
+  attachReceipt(booking, receiptParsedTourist);
   store.data.bookings[id] = booking;
   if (vou) { vou.status = 'used'; vou.usedAt = nowIso(); vou.usedBookingId = id; }
   store.audit('tourist_booking.created', req.user.phone, { bookingId: id, serviceCode: b.serviceCode, amountForeign: booking.amountForeign, currency, voucherId: booking.voucherId, voucherDiscountEgp: booking.voucherDiscountEgp });
@@ -2453,6 +2887,9 @@ router.post('/npwt/bookings', requireAuth, (req, res) => {
   // base is discarded): NPWT total + distance fee.
   const distanceFeeEgp = priced.distanceFeeEgp;
   const totalEgp = calc.totalEgp + distanceFeeEgp;
+  // v2.1.2 — receipt photo for online payment (InstaPay); cash rejects it.
+  const receiptParsedNpwt = receiptFromBody(req.body, b.paymentMethod);
+  if (receiptParsedNpwt.error) return bad(res, 400, receiptParsedNpwt.error);
   const id = newId('bk');
   const vou = findVoucher(req.user.phone, totalEgp);
   const booking = {
@@ -2491,6 +2928,7 @@ router.post('/npwt/bookings', requireAuth, (req, res) => {
     createdAt: nowIso(), acceptedAt: null, providerConfirmedAt: null,
     patientConfirmedAt: null, reviewedAt: null, releasedAt: null, releaseMode: null,
   };
+  attachReceipt(booking, receiptParsedNpwt);
   store.data.bookings[id] = booking;
   if (vou) { vou.status = 'used'; vou.usedAt = nowIso(); vou.usedBookingId = id; }
   store.audit('npwt_booking.created', req.user.phone, { bookingId: id, days: calc.days, dressings: calc.dressings, totalEgp, voucherId: booking.voucherId, voucherDiscountEgp: booking.voucherDiscountEgp });
@@ -2515,6 +2953,9 @@ router.post('/postop', requireAuth, requireRole('patient'), (req, res) => {
   if (priced.error === 'distance_required') return res.status(400).json({ error: 'distance_required', message: 'distanceKm or hotelId is required — the distance cannot be assumed to be 0.' });
   if (priced.error) return bad(res, 400, priced.error);
   if (priced.contract_required) return res.status(422).json({ error: 'contract_required', ...priced });
+  // v2.1.2 — receipt photo for online payment (InstaPay); cash rejects it.
+  const receiptParsedPostop = receiptFromBody(req.body, b.paymentMethod);
+  if (receiptParsedPostop.error) return bad(res, 400, receiptParsedPostop.error);
   const id = newId('bk');
   // v2.0.9 — loyalty voucher (same rule as standard bookings).
   const vou = findVoucher(req.user.phone, priced.totalEgp);
@@ -2545,6 +2986,7 @@ router.post('/postop', requireAuth, requireRole('patient'), (req, res) => {
     createdAt: nowIso(), acceptedAt: null, providerConfirmedAt: null,
     patientConfirmedAt: null, reviewedAt: null, releasedAt: null, releaseMode: null,
   };
+  attachReceipt(booking, receiptParsedPostop);
   store.data.bookings[id] = booking;
   if (vou) { vou.status = 'used'; vou.usedAt = nowIso(); vou.usedBookingId = id; }
   store.audit('postop.created', req.user.phone, { bookingId: id, surgeryType: b.surgeryType, totalEgp: booking.amountEgp, voucherId: booking.voucherId, voucherDiscountEgp: booking.voucherDiscountEgp });
@@ -2615,6 +3057,9 @@ router.get('/admin/dashboard', requireAdmin, (req, res) => {
     doctors, doctorsCount: doctors.length,
     medicalFileInterestCount: (store.data.medicalFileInterest || {}).count || 0,
     settlementsCount: (store.data.settlements || []).length,
+    // v2.1.2 — review queue + receipts awaiting review.
+    pendingApplicationsCount: Object.values(store.data.providers).filter((p) => p.status === 'pending').length,
+    pendingReceipts: Object.values(store.data.bookings).filter((b) => b.receipt && b.receipt.status === 'pending').map((b) => ({ id: b.id, status: b.status, serviceName: b.serviceName, amountEgp: b.amountEgp, createdAt: b.createdAt })),
   });
 });
 
@@ -2686,6 +3131,7 @@ router.post('/admin/providers/:id/verify', requireAdmin, (req, res) => {
   p.status = 'verified';
   p.roleVerified = true;
   recomputeProviderPoints(p);
+  refreshCvEvaluation(p);
   store.audit('admin.provider_verified', 'admin', { providerId: p.id, verifiedCertificates: p.verifiedCertificates, role: p.role });
   store.save();
   res.json(store.publicProvider(p, { admin: true, points: p.points }));
@@ -2744,6 +3190,7 @@ router.post('/admin/providers/:id/credentials', requireAdmin, (req, res) => {
     p.languageCertificates.push({ language, certificateName: name, verified });
   }
   recomputeProviderPoints(p);
+  refreshCvEvaluation(p);
   store.audit('admin.credential_added', 'admin', { providerId: p.id, kind, name, verified });
   store.save();
   res.status(201).json(store.publicProvider(p, { admin: true, points: p.points }));
@@ -2767,6 +3214,7 @@ router.post('/admin/providers/:id/credentials/:index/verify', requireAdmin, (req
   if (!entry) return res.status(404).json({ error: 'not_found', message: 'Credential not found at that index.' });
   entry.verified = req.body?.verified !== false;
   recomputeProviderPoints(p);
+  refreshCvEvaluation(p);
   store.audit('admin.credential_verified', 'admin', { providerId: p.id, kind: kind || 'any', index: idx, verified: entry.verified });
   store.save();
   res.json(store.publicProvider(p, { admin: true, points: p.points }));

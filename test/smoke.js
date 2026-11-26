@@ -9,7 +9,8 @@ const { spawn } = require('child_process');
 
 // v2.1.1: correct answers come from the server catalog (the test knows
 // the bank, not the API — the API never leaks 'correct' or red flags).
-const { MCQ, ENGLISH_CHECK } = require('../src/catalog');
+const { MCQ, ENGLISH_CHECK, LANGUAGE_TESTS } = require('../src/catalog');
+const LANG_CORRECT = {}; for (const [lang, qs] of Object.entries(LANGUAGE_TESTS)) for (const q of qs) LANG_CORRECT[`${lang}:${q.id}`] = q.correct;
 const CORRECT = Object.fromEntries(MCQ.map((q) => [q.id, q.correct]));
 const RED_FLAG = Object.fromEntries(MCQ.filter((q) => q.redFlagOption).map((q) => [q.id, q.redFlagOption]));
 const EN_CORRECT = Object.fromEntries(ENGLISH_CHECK.map((q) => [q.id, q.correct]));
@@ -95,7 +96,11 @@ async function main() {
         certificates: extra.certificates || [],
       } });
       const login = await req('POST', '/api/auth/login-phone', { body: { phone, role: 'provider' } });
-      return { token: login.json?.accessToken, providerId: login.json?.providerId, reg, regStatus: reg.status };
+      // v2.1.2: the run makes ~23 login-phone calls against the 20/15min
+      // IP limiter, so a late registration's re-login can 429 — fall
+      // back to the registration response for the id (the OTP token
+      // still works for the admin-side checks that only need the id).
+      return { token: login.json?.accessToken || tok, providerId: login.json?.providerId || reg.json?.id, reg, regStatus: reg.status };
     }
     // Answer an interview attempt in a given mode.
     async function answerInterview(token, mode) {
@@ -114,6 +119,22 @@ async function main() {
       const sub = await req('POST', '/api/providers/interview/submit', { token, body: { attemptId: st.json.attemptId, answers, englishAnswers: enAnswers } });
       return { start: st, submit: sub };
     }
+    // v2.1.2 — answer a language test in a given mode (keys come from
+    // the server catalog in the TEST ONLY — the API never leaks them).
+    async function answerLanguageTest(token, lang, mode) {
+      const st = await req('POST', `/api/me/language-tests/${lang}/start`, { token });
+      if (st.status !== 200) return { start: st, submit: null };
+      const answers = {};
+      for (const q of st.json.questions) {
+        answers[q.id] = mode === 'all-correct' ? LANG_CORRECT[`${lang}:${q.id}`] : 'zzz';
+      }
+      const sub = await req('POST', `/api/me/language-tests/${lang}/submit`, { token, body: { attemptId: st.json.attemptId, answers } });
+      return { start: st, submit: sub };
+    }
+    // v2.1.2 fixtures: tiny valid receipt / document data URLs.
+    const RECEIPT_JPEG = 'data:image/jpeg;base64,' + Buffer.from('fake-receipt-jpeg-bytes').toString('base64');
+    const DOC_PDF = 'data:application/pdf;base64,' + Buffer.from('%PDF-fake').toString('base64');
+    const DOC_TEXT = 'data:text/plain;base64,' + Buffer.from('not-allowed').toString('base64');
 
     // --- 1. bootstrap is public, minimal -------------------------------
     console.log('\n[bootstrap]');
@@ -1028,7 +1049,8 @@ async function main() {
     check('physio patient confirm -> 200', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
     r = await req('POST', `/api/bookings/${bkPhysio}/review`, { token: patientToken2, body: { rating: 5, comment: 'Good.' } });
     check('physio review releases visit', r.status === 200 && r.json?.status === 'released', JSON.stringify(r.json)?.slice(0, 200));
-    // 21d. tourist badge gating + language bonus on release.
+    // 21d. v2.1.2 tourist badge gating (TEST-based, supersedes the
+    // v2.1.1 certificate rule) + language bonus on release.
     r = await req('POST', '/api/tourist-bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Tourist Test', serviceCode: 'tourist_iv', language: 'de', currency: 'eur',
       paymentMethod: 'cash_receipt', distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
@@ -1043,16 +1065,28 @@ async function main() {
     r = await req('POST', '/api/admin/providers/prov_demo_pro/credentials', { token: adminToken, body: { kind: 'language', name: 'Goethe B2', language: 'de', verified: true } });
     check('admin adds verified German certificate -> 201', r.status === 201, JSON.stringify(r.json)?.slice(0, 200));
     r = await req('GET', '/api/providers/me', { token: provToken });
-    check('provider is touristCompatible after verified language cert', r.status === 200 && r.json?.touristCompatible === true, JSON.stringify({ touristCompatible: r.json?.touristCompatible }));
+    check('v2.1.2: verified certificate ALONE does not grant the tourist badge', r.status === 200 && r.json?.touristCompatible === false, JSON.stringify({ touristCompatible: r.json?.touristCompatible }));
+    // English test (all correct, 8/8) -> general badge.
+    const enTest = await answerLanguageTest(provToken, 'en', 'all-correct');
+    check('English test all-correct -> 200, passed 8/8', enTest.submit?.status === 200 && enTest.submit?.json?.passed === true && enTest.submit?.json?.score === 8, JSON.stringify(enTest.submit?.json));
+    r = await req('GET', '/api/providers/me', { token: provToken });
+    check('provider is touristCompatible after passing English test', r.status === 200 && r.json?.touristCompatible === true && (r.json?.languageBadges?.en?.passed === true), JSON.stringify({ touristCompatible: r.json?.touristCompatible, badges: r.json?.languageBadges }));
+    // German booking still needs the GERMAN test, not just English.
+    r = await req('GET', '/api/providers/radar', { token: provToken });
+    check('German tourist booking still hidden without German badge', r.status === 200 && !(r.json?.pending || []).some((b) => b.id === bkTourist), JSON.stringify((r.json?.pending || []).map((b) => b.id)));
+    r = await req('POST', `/api/bookings/${bkTourist}/accept`, { token: provToken });
+    check('German tourist booking cannot be accepted without German badge -> 403', r.status === 403, JSON.stringify(r.json)?.slice(0, 200));
+    const deTest = await answerLanguageTest(provToken, 'de', 'all-correct');
+    check('German test all-correct -> 200, passed 8/8', deTest.submit?.status === 200 && deTest.submit?.json?.passed === true && deTest.submit?.json?.score === 8, JSON.stringify(deTest.submit?.json));
     // The credential add recomputed points and demoted the manual Elite
     // tier back to Pro — re-apply Elite so the radar check below tests
     // the tourist gate only, not the Elite early-access gate.
     r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Elite' } });
     check('main provider Elite again for tourist radar check', r.status === 200 && r.json?.tier === 'Elite', JSON.stringify(r.json));
     r = await req('GET', '/api/providers/radar', { token: provToken });
-    check('tourist booking visible to compatible provider radar', r.status === 200 && (r.json?.pending || []).some((b) => b.id === bkTourist), JSON.stringify((r.json?.pending || []).map((b) => b.id)));
+    check('tourist booking visible to German-badge provider radar', r.status === 200 && (r.json?.pending || []).some((b) => b.id === bkTourist), JSON.stringify((r.json?.pending || []).map((b) => b.id)));
     r = await req('POST', `/api/bookings/${bkTourist}/accept`, { token: provToken });
-    check('compatible provider accepts tourist booking -> 200', r.status === 200 && r.json?.status === 'accepted', JSON.stringify(r.json)?.slice(0, 200));
+    check('German-badge provider accepts tourist booking -> 200', r.status === 200 && r.json?.status === 'accepted', JSON.stringify(r.json)?.slice(0, 200));
     r = await req('POST', `/api/bookings/${bkTourist}/vitals`, { token: provToken, body: vitalsBody });
     check('tourist vitals recorded', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
     r = await req('POST', `/api/bookings/${bkTourist}/complete-provider`, { token: provToken });
@@ -1063,7 +1097,7 @@ async function main() {
     check('tourist review releases visit', r.status === 200 && r.json?.status === 'released', JSON.stringify(r.json)?.slice(0, 200));
     r = await req('GET', '/api/providers/wallet', { token: provToken });
     const tourLine = (r.json?.ledger || []).find((l) => l.bookingId === bkTourist);
-    check('language bonus 15 EUR at booking FX in wallet ledger', !!tourLine && tourLine.languageBonusEgp === Math.round(15 * fxEur), JSON.stringify(tourLine));
+    check('language bonus 15 EUR at booking FX in wallet ledger (cert rule UNCHANGED)', !!tourLine && tourLine.languageBonusEgp === Math.round(15 * fxEur), JSON.stringify(tourLine));
     // 21e. favorites (patient role; provider must exist + verified).
     r = await req('POST', '/api/me/favorites', { token: patientToken2, body: { providerId: 'prov_demo_starter' } });
     check('favorite unverified provider -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
@@ -1181,6 +1215,131 @@ async function main() {
     check('5 SOS alerts accepted in one day', sosOk === 5, `got ${sosOk}`);
     r = await req('POST', `/api/bookings/${bkSos}/sos`, { token: provToken });
     check('6th SOS same day -> 429', r.status === 429, JSON.stringify(r.json)?.slice(0, 200));
+
+    // --- 22. v2.1.2 coverage: language tests, documents + evaluation, ---
+    //     applications queue, receipt-photo confirmation, terms clause --
+    console.log('\n[v2.1.2 coverage]');
+    // 22a. languages list (public) + bootstrap.
+    r = await req('GET', '/api/languages');
+    check('GET /api/languages public -> 7 seeded languages, all testable', r.status === 200 && Array.isArray(r.json?.languages) && r.json.languages.length === 7 && r.json.languages.every((l) => l.testAvailable === true) && r.json?.test?.passMin === 6 && r.json?.test?.questionsPerTest === 8, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('GET', '/api/bootstrap');
+    check('bootstrap carries languages (7) + languageTest passMin 6', r.status === 200 && Array.isArray(r.json?.languages) && r.json.languages.length === 7 && r.json?.languageTest?.passMin === 6, JSON.stringify({ languages: (r.json?.languages || []).length, languageTest: r.json?.languageTest }));
+    // 22b. language-test rules (physio provider: interview passed, no badges yet).
+    r = await req('POST', '/api/me/language-tests/xx/start', { token: phys.token });
+    check('language test unknown code -> 404', r.status === 404, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/me/language-tests/ru/submit', { token: phys.token, body: { answers: {} } });
+    check('language test submit without start -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/me/language-tests/en/start', { token: phys.token });
+    check('language test start -> 200, 8 questions, 15 min, no answers leaked', r.status === 200 && Array.isArray(r.json?.questions) && r.json.questions.length === 8 && r.json?.minutes === 15 && !JSON.stringify(r.json).includes('"correct"'), JSON.stringify(r.json)?.slice(0, 300));
+    const ltAttempt = r.json?.attemptId;
+    const ltWrong = {};
+    for (const q of r.json?.questions || []) ltWrong[q.id] = 'zzz';
+    r = await req('POST', '/api/me/language-tests/en/submit', { token: phys.token, body: { attemptId: ltAttempt, answers: ltWrong } });
+    check('language test all-wrong -> 200, failed 0/8, retake in 7 days', r.status === 200 && r.json?.passed === false && r.json?.score === 0 && !!r.json?.canRetakeAt, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', '/api/me/language-tests/en/start', { token: phys.token });
+    check('language test immediate retake -> 409 retake_blocked', r.status === 409 && r.json?.error === 'retake_blocked' && !!r.json?.canRetakeAt, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', '/api/me/language-badges', { token: phys.token });
+    check('language badges show failed attempt (1 attempt, lastScore 0, no badge)', r.status === 200 && r.json?.tests?.en?.attempts === 1 && r.json?.tests?.en?.lastScore === 0 && !r.json?.badges?.en, JSON.stringify(r.json?.tests?.en));
+    r = await req('POST', '/api/me/language-tests/en/start', { token: provToken });
+    check('already-passed English test cannot be retaken -> 409 already_passed', r.status === 409 && r.json?.error === 'already_passed', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/admin/languages', { token: adminToken, body: { code: 'sw', nameAr: 'السواحيلية', nameEn: 'Swahili', nativeName: 'Kiswahili' } });
+    check('admin adds a language -> 201, testAvailable false (no bank yet)', r.status === 201 && r.json?.code === 'sw' && r.json?.testAvailable === false, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/admin/languages', { token: adminToken, body: { code: 'sw', nameAr: 'x', nameEn: 'y' } });
+    check('duplicate language -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', '/api/languages');
+    check('languages list now 8 (sw added, untestable)', r.status === 200 && r.json?.languages?.length === 8 && r.json.languages.find((l) => l.code === 'sw')?.testAvailable === false, JSON.stringify((r.json?.languages || []).map((l) => l.code)));
+    r = await req('POST', '/api/me/language-tests/sw/start', { token: phys.token });
+    check('language without a bank -> 409 test_unavailable', r.status === 409 && r.json?.error === 'test_unavailable', JSON.stringify(r.json)?.slice(0, 200));
+    // 22c. documents + algorithmic evaluation (physio provider).
+    r = await req('POST', '/api/me/documents', { token: phys.token, body: { kind: 'cv', name: 'my-cv.pdf', data: DOC_PDF } });
+    check('upload CV pdf -> 201 with evaluation breakdown + recommendation', r.status === 201 && !!r.json?.evaluation && typeof r.json.evaluation.total === 'number' && !!r.json.evaluation.breakdown?.licence && !!r.json.evaluation.recommendation, JSON.stringify(r.json?.evaluation)?.slice(0, 300));
+    const cvDocId = r.json?.document?.id;
+    r = await req('GET', '/api/me/documents', { token: phys.token });
+    check('my documents list -> 1 doc, metadata only (no file content)', r.status === 200 && (r.json?.documents || []).length === 1 && !JSON.stringify(r.json?.documents).includes('data:application'), JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', '/api/me/documents', { token: phys.token, body: { kind: 'certificate', name: 'note.txt', data: DOC_TEXT } });
+    check('document wrong mime (text/plain) -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    const bigDoc = 'data:application/pdf;base64,' + Buffer.alloc(5 * 1024 * 1024 + 1).toString('base64');
+    r = await req('POST', '/api/me/documents', { token: phys.token, body: { kind: 'certificate', name: 'big.pdf', data: bigDoc } });
+    check('document over 5 MB -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    for (let i = 0; i < 9; i++) {
+      await req('POST', '/api/me/documents', { token: phys.token, body: { kind: 'other', name: `filler-${i}.pdf`, data: DOC_PDF } });
+    }
+    r = await req('POST', '/api/me/documents', { token: phys.token, body: { kind: 'other', name: 'eleventh.pdf', data: DOC_PDF } });
+    check('11th document -> 409 too_many_documents', r.status === 409 && r.json?.error === 'too_many_documents', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', `/api/admin/providers/${phys.providerId}/documents/${cvDocId}`, { token: adminToken });
+    check('admin reads document WITH content -> 200, data URL present', r.status === 200 && typeof r.json?.data === 'string' && r.json.data.startsWith('data:application/pdf'), JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', `/api/admin/providers/${phys.providerId}/documents/doc_nope`, { token: adminToken });
+    check('admin reads unknown document -> 404', r.status === 404, JSON.stringify(r.json)?.slice(0, 200));
+    // 22d. admin review queue: approve + reject, monitor sees no PII.
+    const appA = await registerProvider('01018181818', 'nurse', { certificates: [{ name: 'BLS' }] });
+    check('application provider A registers -> 201 pending', appA.regStatus === 201, JSON.stringify(appA.reg)?.slice(0, 200));
+    r = await req('GET', '/api/admin/applications', { token: adminToken });
+    check('applications queue lists A with evaluation + interview + points', r.status === 200 && (r.json?.applications || []).some((a) => a.providerId === appA.providerId && !!a.cvEvaluation && typeof a.cvEvaluation.total === 'number' && !!a.cvEvaluation.recommendation && a.points), JSON.stringify((r.json?.applications || []).map((a) => a.providerId)));
+    r = await req('GET', '/api/monitor/summary', { monitorToken: 'monitor-test-token' });
+    const pendApp = (r.json?.pendingApplications?.items || []).find((a) => a.providerId === appA.providerId);
+    check('monitor pendingApplications has A with scores, no PII', r.status === 200 && !!pendApp && typeof pendApp.cvScore === 'number' && !('phone' in pendApp) && !('name' in pendApp) && !JSON.stringify(pendApp).includes('01018181818'), JSON.stringify(pendApp));
+    r = await req('POST', `/api/admin/applications/${appA.providerId}/approve`, { token: adminToken });
+    check('admin approves application A -> 200 verified', r.status === 200 && r.json?.status === 'verified', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/applications/${appA.providerId}/approve`, { token: adminToken });
+    check('approving an already-verified application -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    const appB = await registerProvider('01019191919', 'nurse', { certificates: [{ name: 'BLS' }] });
+    check('application provider B registers -> 201 pending', appB.regStatus === 201, JSON.stringify(appB.reg)?.slice(0, 200));
+    r = await req('POST', `/api/admin/applications/${appB.providerId}/reject`, { token: adminToken, body: { reason: 'Documents unclear.' } });
+    check('admin rejects application B -> 200 rejected with reason', r.status === 200 && r.json?.status === 'rejected' && r.json?.rejectionReason === 'Documents unclear.', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', '/api/admin/applications?status=rejected', { token: adminToken });
+    check('rejected applications list contains B', r.status === 200 && (r.json?.applications || []).some((a) => a.providerId === appB.providerId), JSON.stringify((r.json?.applications || []).map((a) => a.providerId)));
+    // 22e. receipt-photo payment confirmation.
+    const bookReceipt = async (paymentMethod, extra = {}) => req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Receipt Patient', serviceCode: 'standard', paymentMethod,
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] }, ...extra,
+    } });
+    r = await bookReceipt('cash_receipt', { receiptImage: RECEIPT_JPEG });
+    check('cash booking with receipt photo -> 400 (receipt at the visit)', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await bookReceipt('instapay', { receiptImage: DOC_TEXT });
+    check('instapay booking with non-image receipt -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    const bigReceipt = 'data:image/jpeg;base64,' + Buffer.alloc(3 * 1024 * 1024 + 1).toString('base64');
+    r = await bookReceipt('instapay', { receiptImage: bigReceipt });
+    check('instapay booking with receipt over 3 MB -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await bookReceipt('instapay', { receiptImage: RECEIPT_JPEG });
+    check('instapay booking with receipt -> 201, receipt pending', r.status === 201 && r.json?.receipt?.status === 'pending', JSON.stringify(r.json?.receipt));
+    const bkReceipt = r.json?.id;
+    r = await req('GET', '/api/providers/radar', { token: provToken });
+    check('receipt-pending booking hidden from radar', r.status === 200 && !(r.json?.pending || []).some((b) => b.id === bkReceipt), JSON.stringify((r.json?.pending || []).map((b) => b.id)));
+    r = await req('POST', `/api/bookings/${bkReceipt}/accept`, { token: provToken });
+    check('receipt-pending booking cannot be accepted -> 403 receipt_pending_review', r.status === 403 && r.json?.error === 'receipt_pending_review', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', `/api/bookings/${bkReceipt}`, { token: patientToken2 });
+    check('patient sees receipt status pending in booking details', r.status === 200 && r.json?.receipt?.status === 'pending', JSON.stringify(r.json?.receipt));
+    r = await req('GET', `/api/admin/bookings/${bkReceipt}/receipt`, { token: adminToken });
+    check('admin reads receipt image -> 200, data URL present', r.status === 200 && typeof r.json?.image === 'string' && r.json.image.startsWith('data:image/jpeg'), JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/bookings/${bkReceipt}/receipt/approve`, { token: adminToken, body: {} });
+    check('admin approves receipt -> 200 approved', r.status === 200 && r.json?.receipt?.status === 'approved' && !!r.json?.receipt?.reviewedAt, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkReceipt}/accept`, { token: provToken });
+    check('receipt-approved booking accepts -> 200', r.status === 200 && r.json?.status === 'accepted', JSON.stringify(r.json)?.slice(0, 200));
+    // Second receipt booking: reject (note required), re-upload, approve.
+    r = await bookReceipt('instapay', { receiptImage: RECEIPT_JPEG });
+    check('second instapay booking with receipt -> 201 pending', r.status === 201 && r.json?.receipt?.status === 'pending', JSON.stringify(r.json?.receipt));
+    const bkReceipt2 = r.json?.id;
+    r = await req('GET', '/api/monitor/summary', { monitorToken: 'monitor-test-token' });
+    check('monitor pendingReceipts counts the open receipt', r.status === 200 && (r.json?.pendingReceipts?.count || 0) >= 1 && (r.json?.pendingReceipts?.items || []).some((x) => x.id === bkReceipt2), JSON.stringify(r.json?.pendingReceipts));
+    r = await req('POST', `/api/admin/bookings/${bkReceipt2}/receipt/reject`, { token: adminToken, body: {} });
+    check('receipt reject without a note -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/bookings/${bkReceipt2}/receipt/reject`, { token: adminToken, body: { note: 'Blurry photo — please re-upload.' } });
+    check('receipt reject with note -> 200 rejected', r.status === 200 && r.json?.receipt?.status === 'rejected' && r.json?.receipt?.note === 'Blurry photo — please re-upload.', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkReceipt2}/receipt`, { token: patientToken2, body: { receiptImage: RECEIPT_JPEG } });
+    check('patient re-uploads receipt after rejection -> 201 pending again', r.status === 201 && r.json?.receipt?.status === 'pending', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkReceipt2}/receipt`, { token: patientToken2, body: { receiptImage: RECEIPT_JPEG } });
+    check('receipt re-upload while one is pending -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/bookings/${bkReceipt2}/receipt/approve`, { token: adminToken, body: {} });
+    check('admin approves re-uploaded receipt -> 200', r.status === 200 && r.json?.receipt?.status === 'approved', JSON.stringify(r.json)?.slice(0, 200));
+    // Receipt upload endpoint on a cash booking -> 400.
+    r = await bookReceipt('cash_receipt');
+    check('cash booking (no receipt) -> 201, receipt null', r.status === 201 && r.json?.receipt === null, JSON.stringify(r.json?.receipt));
+    const bkCash = r.json?.id;
+    r = await req('POST', `/api/bookings/${bkCash}/receipt`, { token: patientToken2, body: { receiptImage: RECEIPT_JPEG } });
+    check('receipt upload on a cash booking -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    // 22f. terms: intermediary clause in both languages, version stays 1.0.
+    r = await req('GET', '/api/terms');
+    check('terms v1.0 carries the intermediary clause (AR + EN)', r.status === 200 && r.json?.version === '1.0' && String(r.json?.textAr || '').includes('وسيط تقني يربط بينهما') && String(r.json?.textEn || '').includes('technical intermediary'), JSON.stringify({ version: r.json?.version }));
 
     // --- 14. logout / refresh revocation ---------------------------------
     console.log('\n[logout]');

@@ -5,7 +5,8 @@ const path = require('path');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const config = require('./config');
-const { HOTELS } = require('./catalog');
+const { HOTELS, DEFAULT_LANGUAGES } = require('./catalog');
+const { touristCompatible } = require('./points');
 
 function sha256(v) {
   return crypto.createHash('sha256').update(String(v)).digest('hex');
@@ -126,6 +127,14 @@ function seed() {
       failures: 0,
       lockedUntil: null,
     },
+    // v2.1.2 — language list (data-driven; admin can add more),
+    // receipt images (bookingId -> {mime, size, data}), and active
+    // language-test sessions (providerId:lang -> session). Receipt and
+    // document files live in this same file store, so they reset on
+    // redeploy like all data — documented in BUILD-STATUS.md.
+    languages: DEFAULT_LANGUAGES.map((l) => ({ ...l })),
+    receiptImages: {},
+    languageTestSessions: {},
     hotels: HOTELS,
   };
 }
@@ -195,6 +204,12 @@ class Store {
     if (!this.data.favorites) this.data.favorites = {};
     if (!this.data.sosDaily) this.data.sosDaily = {};
     if (!this.data.safetyDaily) this.data.safetyDaily = {};
+    // v2.1.2 — languages, receipt images, language-test sessions.
+    if (!Array.isArray(this.data.languages) || !this.data.languages.length) {
+      this.data.languages = DEFAULT_LANGUAGES.map((l) => ({ ...l }));
+    }
+    if (!this.data.receiptImages) this.data.receiptImages = {};
+    if (!this.data.languageTestSessions) this.data.languageTestSessions = {};
     // v2.1.1 provider backfill: providerType = role, joinedAt = createdAt,
     // languageCertificates from legacy extraLanguages, empty courses.
     for (const p of Object.values(this.data.providers || {})) {
@@ -208,6 +223,19 @@ class Store {
       }
       if (!p.casesByWeek) p.casesByWeek = {};
       if (p.interviewPoints == null) p.interviewPoints = 0;
+      // v2.1.2 — language badges + tests, uploaded documents, CV
+      // evaluation, claimed languages. Backfilled from the legacy
+      // extraLanguages / languageCertificates lists.
+      if (!p.languageBadges || typeof p.languageBadges !== 'object') p.languageBadges = {};
+      if (!p.languageTests || typeof p.languageTests !== 'object') p.languageTests = {};
+      if (!Array.isArray(p.documents)) p.documents = [];
+      if (!('cvEvaluation' in p)) p.cvEvaluation = null;
+      if (!Array.isArray(p.claimedLanguages)) {
+        const langs = new Set();
+        for (const l of p.extraLanguages || []) if (l && l.language) langs.add(String(l.language).toLowerCase());
+        for (const l of p.languageCertificates || []) if (l && l.language) langs.add(String(l.language).toLowerCase());
+        p.claimedLanguages = [...langs];
+      }
     }
   }
   load() {
@@ -222,6 +250,7 @@ class Store {
       console.warn('[store] could not read data file, reseeding:', e.message);
     }
     this.data = seed();
+    this.applyDefaults();
     this.save();
   }
   // ADMIN_PIN env var is the source of truth: re-hash it on every boot when
@@ -292,12 +321,19 @@ class Store {
       warningCount: (p.warnings || []).length,
       createdAt: p.createdAt, joinedAt: p.joinedAt || p.createdAt,
       buddyId: p.buddyId || null,
-      // v2.1.1 — tourist badge (verified language certificate) + English
-      // block (interview English 0/3). Computed here from the record;
-      // points are attached by the caller when available (opts.points).
-      touristCompatible: Array.isArray(p.languageCertificates) && p.languageCertificates.some((l) => l && l.verified === true),
+      // v2.1.2 — tourist badge (in-app English test + interview passed)
+      // and per-language badges. Computed here from the record; points
+      // are attached by the caller when available (opts.points).
+      touristCompatible: touristCompatible(p),
       englishBlocked: p.interviewEnglishCorrect === 0 && p.interviewEnglishTotal === 3,
+      languageBadges: p.languageBadges || {},
+      claimedLanguages: p.claimedLanguages || [],
+      // Uploaded documents: metadata only in the public view (name /
+      // kind / size — never the file content; the admin reads content
+      // via GET /api/admin/providers/:id/documents/:docId).
+      documents: (p.documents || []).map((d) => ({ id: d.id, kind: d.kind, name: d.name, size: d.size, mime: d.mime, uploadedAt: d.uploadedAt })),
     };
+    if (opts.admin || opts.self) out.cvEvaluation = p.cvEvaluation || null;
     if (opts.points) out.points = opts.points;
     else if (p.points) out.points = p.points;
     if (opts.admin || opts.self) out.phone = p.phone;

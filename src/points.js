@@ -92,12 +92,28 @@ function computePoints(provider, bookings) {
   };
 }
 
-// Is the provider tourist-compatible? >=1 VERIFIED entry in
-// p.languageCertificates (non-English languages need a certificate;
-// English itself needs none — it is measured in the interview).
+// v2.1.2 — tourist badge by IN-APP TEST (owner decision 26 Nov 2026,
+// supersedes the v2.1.1 certificate rule): the general «متوافق مع
+// السياح» badge needs the expanded interview PASSED *and* the in-app
+// English test PASSED. A certificate NEVER grants the badge and never
+// exempts anyone from a test — certificates still count toward points
+// (+5 each, max 20) and the $15/€15 extra-language bonus still
+// requires a VERIFIED certificate for that non-English language
+// (unchanged rule, see releaseBooking in routes.js).
+function hasLanguageBadge(provider, lang) {
+  const b = provider.languageBadges && provider.languageBadges[String(lang || 'en').toLowerCase()];
+  return !!(b && b.passed === true);
+}
+// General tourist badge: interview passed + English test passed.
 function touristCompatible(provider) {
-  return Array.isArray(provider.languageCertificates)
-    && provider.languageCertificates.some((l) => l && l.verified === true);
+  return provider.interviewStatus === 'passed' && hasLanguageBadge(provider, 'en');
+}
+// Per-language tourist eligibility: interview passed + that
+// language's test passed. A tourist booking in language X may only be
+// shown to / accepted by a provider who passed X's test (English
+// bookings need the English badge).
+function touristCompatibleFor(provider, lang) {
+  return provider.interviewStatus === 'passed' && hasLanguageBadge(provider, lang || 'en');
 }
 // English 0/3 in the interview blocks tourist radar (owner decision).
 function englishBlocked(provider) {
@@ -105,4 +121,4 @@ function englishBlocked(provider) {
     && provider.interviewEnglishTotal === 3;
 }
 
-module.exports = { computePoints, isoWeekKey, currentWeekKey, countVerified, touristCompatible, englishBlocked };
+module.exports = { computePoints, isoWeekKey, currentWeekKey, countVerified, touristCompatible, touristCompatibleFor, hasLanguageBadge, englishBlocked };

@@ -47,6 +47,12 @@ const server = app.listen(PORT, async () => {
     check('bootstrap services have id+price', r.status === 200 && Array.isArray(r.body.services) && r.body.services[0].id === 'standard' && r.body.services[0].price === 250, JSON.stringify(r.body).slice(0, 200));
     check('bootstrap tourist ids doctor/iv/dressing/nurse', Array.isArray(r.body.tourist) && r.body.tourist.some((t) => t.id === 'doctor' && t.usd === 55));
     check('bootstrap distanceTiers + mockMode', Array.isArray(r.body.distanceTiers) && r.body.mockMode === true);
+    // v2.1.2 — languages + language-test info in bootstrap, /api/languages.
+    check('bootstrap carries languages (7) + languageTest passMin 6', Array.isArray(r.body.languages) && r.body.languages.length === 7 && r.body.languageTest && r.body.languageTest.passMin === 6, JSON.stringify({ languages: (r.body.languages || []).length, languageTest: r.body.languageTest }));
+    r = await call('GET', '/api/languages');
+    check('GET /api/languages public -> 7 testable languages', r.status === 200 && Array.isArray(r.body.languages) && r.body.languages.length === 7 && r.body.languages.every((l) => l.testAvailable === true), JSON.stringify(r.body).slice(0, 200));
+    r = await call('GET', '/api/terms');
+    check('terms v1.0 carries the intermediary clause (AR + EN)', r.status === 200 && r.body.version === '1.0' && String(r.body.textAr || '').includes('وسيط تقني يربط بينهما') && String(r.body.textEn || '').includes('technical intermediary'), JSON.stringify({ version: r.body.version }));
 
     // 2. legacy OTP paths (frontend: /api/auth/otp/*), token alias
     r = await call('POST', '/api/auth/otp/request', { phone: '01012345678', channel: 'whatsapp' });
