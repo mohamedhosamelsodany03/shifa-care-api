@@ -1231,6 +1231,10 @@ router.get('/bootstrap', (req, res) => {
     // single shifts at 500/850, provider paid on the 700/1,200
     // reference. Default OFF until the admin enables it at launch.
     launchOffer: (() => { const lo = activeLaunchOffer(); return lo ? { active: true, until: lo.until || null } : { active: false, until: null }; })(),
+    // v2.1.7 — latest published APK for the in-app update checker.
+    // Empty (code 0, no URL) until a release is published — the app
+    // treats that as "no update available".
+    latestApp: { ...config.latestApp },
     note: 'Prices are fixed and announced in advance. No bargaining inside the app.',
   });
 });
@@ -1721,6 +1725,59 @@ router.post('/admin/bookings/:id/receipt/reject', requireAdmin, (req, res) => {
   store.audit('admin.receipt_rejected', 'admin', { bookingId: b.id, note });
   store.save();
   res.json({ ok: true, bookingId: b.id, receipt: b.receipt, note: 'The patient can upload a new receipt photo while the booking is still held.' });
+});
+
+// ---------------------------------------------------------------- client reports (v2.1.7)
+// Crash / unclean-exit / JS-error reports sent by the app itself (see
+// web/app.js initSessionTracking). PUBLIC — the app may be logged out
+// when it dies — and rate-limited to 10/hour per IP. Only allowlisted
+// fields are stored, capped at 200 entries; tokens, PINs and passwords
+// are never accepted or stored. Admin reads them via
+// GET /api/admin/client-reports.
+const CLIENT_REPORT_MAX = 200;
+const CLIENT_REPORT_PER_HOUR = 10;
+router.post('/client-report', (req, res) => {
+  const ip = req.ip || 'unknown';
+  const now = Date.now();
+  const hourAgo = now - 60 * 60 * 1000;
+  const limits = store.data.clientReportLimits || (store.data.clientReportLimits = {});
+  const rec = limits[ip] || { requests: [] };
+  rec.requests = (rec.requests || []).filter((t) => t > hourAgo);
+  if (rec.requests.length >= CLIENT_REPORT_PER_HOUR) {
+    return res.status(429).json({ error: 'rate_limited', message: 'Too many client reports from this IP.' });
+  }
+  rec.requests.push(now);
+  limits[ip] = rec;
+  const b = req.body || {};
+  const kind = b.kind;
+  if (kind !== 'unclean_exit' && kind !== 'js_error') return bad(res, 400, 'kind must be unclean_exit or js_error.');
+  if (kind === 'js_error' && (typeof b.message !== 'string' || !b.message.trim())) return bad(res, 400, 'message is required for js_error reports.');
+  const str = (v, max) => (typeof v === 'string' ? v.slice(0, max) : null);
+  const entry = {
+    id: newId('crep'), kind,
+    lastScreen: str(b.lastScreen, 200),
+    lastHeartbeat: typeof b.lastHeartbeat === 'number' ? b.lastHeartbeat : null,
+    message: str(b.message, 2000),
+    stack: str(b.stack, 2000),
+    screen: str(b.screen, 200),
+    userAgent: str(b.userAgent, 300),
+    appVersion: str(b.appVersion, 40),
+    // A phone is attached ONLY when the app is logged in; it is a
+    // diagnostic hint only, never trusted for identity (the endpoint is
+    // public). Any other field in the body (token, pin, password, ...)
+    // is dropped, never stored.
+    phone: (typeof b.phone === 'string' && /^01[0-9]{9}$/.test(b.phone)) ? b.phone : null,
+    createdAt: nowIso(),
+  };
+  const list = store.data.clientReports || (store.data.clientReports = []);
+  list.push(entry);
+  while (list.length > CLIENT_REPORT_MAX) list.shift();
+  store.save();
+  res.json({ ok: true, id: entry.id });
+});
+router.get('/admin/client-reports', requireAdmin, (req, res) => {
+  const limit = Math.min(200, Number(req.query.limit) || 100);
+  res.json((store.data.clientReports || []).slice(-limit).reverse());
 });
 
 // ---------------------------------------------------------------- monitor (v2.1.1)

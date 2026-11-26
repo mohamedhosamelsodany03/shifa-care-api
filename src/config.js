@@ -168,6 +168,16 @@ const config = {
   // creation require acceptedTerms=true AND termsVersion to match this
   // value; bumping it forces every user to re-accept (see /api/me/terms).
   termsVersion: '1.0',
+  // v2.1.7 — in-app update checker: the latest published APK. Read from
+  // env at boot; all empty/zero until a release is published (v2.1.8's
+  // release step sets LATEST_APP_* + hosts the APK). force=false by
+  // default — only critical updates force the install.
+  latestApp: {
+    code: envInt('LATEST_APP_CODE', 0),
+    version: process.env.LATEST_APP_VERSION || '',
+    apkUrl: process.env.LATEST_APP_APK_URL || '',
+    force: process.env.LATEST_APP_FORCE === 'true',
+  },
 };
 
 // --- derived availability flags (env-only, no secrets) -----------------

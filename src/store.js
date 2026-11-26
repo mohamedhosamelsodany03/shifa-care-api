@@ -108,6 +108,10 @@ function seed() {
     // admin adds real doctors with their consent; no fake doctors).
     devices: {}, // phone -> [{token, tokenHash, platform, updatedAt}] — FCM tokens; NEVER returned by any API
     notifications: {}, // phone -> [{id, type, titleAr/titleEn, bodyAr/bodyEn, data, createdAt, validUntil, readAt, pushStatus, smsStatus, critical}]
+    // v2.1.7 — client crash / unclean-exit / JS-error reports (see
+    // POST /api/client-report) + their per-IP rate-limit buckets.
+    clientReports: [], // capped at 200, newest last; tokens/PINs never stored
+    clientReportLimits: {}, // ip -> {requests: [ts...]} (10/hour)
     doctors: [], // {id, name, specialty, phone, clinic, address, workingHours, notes, active, createdAt}
     settlementNotifiedOn: null, // 'YYYY-MM-DD' (Africa/Cairo) of the last Thursday-settlement notification pass
     // v2.1.1 — weekly settlement records (audit #5): one per provider per
@@ -203,6 +207,9 @@ class Store {
     if (!('launchOffer' in this.data)) this.data.launchOffer = null;
     if (!this.data.devices) this.data.devices = {};
     if (!this.data.notifications) this.data.notifications = {};
+    // v2.1.7 — client reports + rate-limit buckets.
+    if (!Array.isArray(this.data.clientReports)) this.data.clientReports = [];
+    if (!this.data.clientReportLimits) this.data.clientReportLimits = {};
     if (!this.data.doctors) this.data.doctors = [];
     if (!('settlementNotifiedOn' in this.data)) this.data.settlementNotifiedOn = null;
     if (!Array.isArray(this.data.settlements)) this.data.settlements = [];

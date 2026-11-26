@@ -57,6 +57,13 @@ async function main() {
     CANCEL_WINDOW_MS: '5000', // shorten the 15-min cancel window for the test only
     MIN_VISIT_MS: '0', // v2.1.6 (C8): disable the 10-min accept->complete floor — the test completes visits in seconds; the floor is tested in §27 with a dedicated flow
     SWEEP_INTERVAL_MS: '3600000', // v2.1.6: the interval sweep never fires during tests — all sweeps are explicit via /api/jobs/sweep
+    // v2.1.7 (§28): the spawned server announces an update, so the
+    // bootstrap latestApp shape is exercised (defaults are checked
+    // in-process with a fresh config require instead).
+    LATEST_APP_CODE: '22',
+    LATEST_APP_VERSION: '2.1.8',
+    LATEST_APP_APK_URL: 'https://example.com/shifa-care-v2.1.8.apk',
+    LATEST_APP_FORCE: 'true',
   };
   const child = spawn('node', [path.join(__dirname, '..', 'server.js')], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '';
@@ -2039,6 +2046,281 @@ async function main() {
     // by this point and any further login-phone call would 429).
     r = await req('GET', '/api/admin/dashboard', { token: adminToken });
     check('C1 dashboard exposes newDeviceLogins (new-device logins are audited)', r.status === 200 && Array.isArray(r.json?.newDeviceLogins) && (r.json?.newDeviceLogins || []).some((x) => x.phone === '01077777777'), JSON.stringify(r.json?.newDeviceLogins?.slice(0, 2)));
+  }
+
+  // --- §28. v2.1.7: crash/session/registration fixes + in-app dialogs + update checker ---
+  // (owner QA 26 Nov 2026: the app was being killed from any screen, every
+  // kill logged the user out, provider registration bounced, no visible
+  // patient login, no bell before login, and prompt() was the kill cause.)
+  console.log('\n[§28 v2.1.7]');
+  // 28a. Client-report endpoint: validation, sanitisation, rate limit, admin list.
+  {
+    // Invalid kind -> 400.
+    r = await req('POST', '/api/client-report', { body: { kind: 'bogus' } });
+    check('§28 client-report rejects an unknown kind -> 400', r.status === 400, JSON.stringify(r.json));
+    // js_error without a message -> 400.
+    r = await req('POST', '/api/client-report', { body: { kind: 'js_error' } });
+    check('§28 client-report js_error without message -> 400', r.status === 400, JSON.stringify(r.json));
+    // Valid unclean_exit -> 200 with an id.
+    r = await req('POST', '/api/client-report', { body: { kind: 'unclean_exit', lastScreen: '#/patient', lastHeartbeat: Date.now() - 5000, userAgent: 'smoke-test', appVersion: '2.1.7 (21)' } });
+    check('§28 client-report unclean_exit accepted -> 200 + id', r.status === 200 && typeof r.json?.id === 'string', JSON.stringify(r.json));
+    // Valid js_error -> 200.
+    r = await req('POST', '/api/client-report', { body: { kind: 'js_error', message: 'TypeError: x is null', stack: 'at foo (app.js:1)', screen: '#/provider', appVersion: '2.1.7 (21)' } });
+    check('§28 client-report js_error accepted -> 200 + id', r.status === 200 && typeof r.json?.id === 'string', JSON.stringify(r.json));
+    // Oversized message is truncated to 2000 chars, not rejected.
+    const big = 'x'.repeat(5000);
+    r = await req('POST', '/api/client-report', { body: { kind: 'js_error', message: big, screen: '#/' } });
+    check('§28 client-report oversized message truncated, still 200', r.status === 200, JSON.stringify(r.json)?.slice(0, 100));
+    // Secret-looking extra fields are dropped, never stored.
+    r = await req('POST', '/api/client-report', { body: { kind: 'js_error', message: 'boom', token: 'SECRET-TOKEN', pin: '123456', password: 'hunter2', shifa_token: 'SECRET' } });
+    check('§28 client-report with token/pin fields still 200', r.status === 200, JSON.stringify(r.json)?.slice(0, 100));
+    // Admin list is admin-only and shows the stored reports, newest first.
+    r = await req('GET', '/api/admin/client-reports');
+    check('§28 admin client-reports without auth -> 401', r.status === 401, JSON.stringify(r.json)?.slice(0, 100));
+    r = await req('GET', '/api/admin/client-reports', { token: adminToken });
+    const reports = Array.isArray(r.json) ? r.json : [];
+    check('§28 admin client-reports lists 4 stored reports, newest first', r.status === 200 && reports.length === 4 && reports[0]?.kind === 'js_error', JSON.stringify(reports.map((x) => x.kind)));
+    const withSecrets = reports.find((x) => x.message === 'boom');
+    check('§28 stored report has no token/pin/password fields', !!withSecrets && !('token' in withSecrets) && !('pin' in withSecrets) && !('password' in withSecrets) && !('shifa_token' in withSecrets), JSON.stringify(withSecrets));
+    const bigStored = reports.find((x) => (x.message || '').length === 2000);
+    check('§28 stored oversized message is exactly 2000 chars', !!bigStored, JSON.stringify({ storedLens: reports.map((x) => (x.message || '').length) }));
+    // Rate limit: 10/hour per IP. 6 requests above (2 invalid + 4 valid)
+    // + 4 more valid = 10 -> all 200; the 11th -> 429.
+    let okCount = 0;
+    for (let i = 0; i < 4; i++) {
+      const rr = await req('POST', '/api/client-report', { body: { kind: 'unclean_exit', lastScreen: '#/' } });
+      if (rr.status === 200) okCount++;
+    }
+    check('§28 rate limit: 4 more reports fill the 10/hour bucket (all 200)', okCount === 4, String(okCount));
+    r = await req('POST', '/api/client-report', { body: { kind: 'unclean_exit', lastScreen: '#/' } });
+    check('§28 rate limit: 11th report in the hour -> 429', r.status === 429, JSON.stringify(r.json)?.slice(0, 100));
+  }
+  // 28b. Update checker — server side.
+  {
+    r = await req('GET', '/api/bootstrap');
+    check('§28 bootstrap latestApp reflects the release env (code 22 / 2.1.8 / forced)', r.status === 200 && r.json?.latestApp?.code === 22 && r.json?.latestApp?.version === '2.1.8' && r.json?.latestApp?.apkUrl === 'https://example.com/shifa-care-v2.1.8.apk' && r.json?.latestApp?.force === true, JSON.stringify(r.json?.latestApp));
+    // Config defaults (fresh require, env unset): no update available.
+    const cfgPath = require.resolve('../src/config');
+    delete require.cache[cfgPath];
+    delete process.env.LATEST_APP_CODE; delete process.env.LATEST_APP_VERSION; delete process.env.LATEST_APP_APK_URL; delete process.env.LATEST_APP_FORCE;
+    const freshCfg = require('../src/config');
+    check('§28 latestApp defaults to no update (code 0, empty URL, force false)', freshCfg.latestApp.code === 0 && freshCfg.latestApp.version === '' && freshCfg.latestApp.apkUrl === '' && freshCfg.latestApp.force === false, JSON.stringify(freshCfg.latestApp));
+  }
+  // 28c. Client logic (web/app.js) — the helpers block is extracted
+  // verbatim from the shipped file and driven with a minimal DOM/storage
+  // shim, so the REAL code is tested, not a copy.
+  {
+    const vm = require('vm');
+    const appJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
+    const BEGIN = '/* v2.1.7 — testable helpers (BEGIN';
+    const END = '/* v2.1.7 — testable helpers (END) */';
+    const bi = appJs.indexOf(BEGIN);
+    const ei = appJs.indexOf(END, bi);
+    check('§28 v2.1.7 helpers block is extractable from web/app.js', bi !== -1 && ei !== -1 && ei > bi, `${bi}/${ei}`);
+    if (bi !== -1 && ei !== -1) {
+      const code = appJs.slice(bi, ei);
+      // Minimal DOM + storage shim — just enough for the helpers.
+      const makeStore = () => {
+        const m = new Map();
+        return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k), _map: m };
+      };
+      const localStore = makeStore();
+      const sessionStore = makeStore();
+      const fetchCalls = [];
+      const openedUrls = [];
+      const listeners = {};
+      function makeEl(tag) {
+        const el = {
+          tagName: (tag || 'div').toUpperCase(), children: [], _id: '', className: '',
+          _html: '', value: '', onclick: null, _listeners: {}, _byId: {},
+          set id(v) { this._id = v; },
+          get id() { return this._id; },
+          set innerHTML(h) {
+            this._html = h; this._byId = {}; this.children = [];
+            const re = /<(\w+)[^>]*\sid="([^"]+)"/g;
+            let m;
+            while ((m = re.exec(h))) {
+              const child = makeEl(m[1]);
+              child.id = m[2];
+              if (m[1] === 'textarea') child.value = (h.match(new RegExp('id="' + m[2] + '"[^>]*>([^<]*)')) || [])[1] || '';
+              this._byId[m[2]] = child;
+              this.children.push(child);
+            }
+          },
+          get innerHTML() { return this._html; },
+          appendChild(c) { c._parent = this; this.children.push(c); return c; },
+          remove() { this._removed = true; if (this._parent) { const i = this._parent.children.indexOf(this); if (i !== -1) this._parent.children.splice(i, 1); } },
+          querySelector(sel) { if (typeof sel === 'string' && sel[0] === '#') return this._byId[sel.slice(1)] || null; return null; },
+          addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); },
+          focus() {},
+        };
+        return el;
+      }
+      const bodyEl = makeEl('body');
+      const fakeDocument = {
+        body: bodyEl,
+        visibilityState: 'visible',
+        createElement: (tag) => makeEl(tag),
+        getElementById: (id) => {
+          const walk = (el) => {
+            if (el.id === id && !el._removed) return el;
+            for (const c of el.children) { const r = walk(c); if (r) return r; }
+            return null;
+          };
+          return walk(bodyEl);
+        },
+        addEventListener: (type, fn) => { (listeners['document:' + type] = listeners['document:' + type] || []).push(fn); },
+      };
+      const fakeWindow = {
+        addEventListener: (type, fn) => { (listeners['window:' + type] = listeners['window:' + type] || []).push(fn); },
+        open: (url) => { openedUrls.push(url); },
+        ShifaUpdater: null,
+      };
+      const ctx = vm.createContext({
+        console,
+        localStorage: localStore,
+        sessionStorage: sessionStore,
+        document: fakeDocument,
+        window: fakeWindow,
+        navigator: { userAgent: 'smoke-test-agent' },
+        location: { hash: '#/patient' },
+        fetch: (url, opts) => { fetchCalls.push({ url, body: opts && opts.body ? JSON.parse(opts.body) : null }); return Promise.resolve({ ok: true }); },
+        setInterval: (fn) => { (ctx.__intervals = ctx.__intervals || []).push(fn); return 1; },
+        setTimeout: (fn) => 1,
+        Date,
+        JSON,
+        Promise,
+        store: { phone: '01012345678', bootstrap: null },
+        LANG: 'ar',
+        API_BASE: 'http://127.0.0.1:3456',
+        t: (k) => k,
+        esc: (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
+        $: () => null,
+        toast: () => {},
+      });
+      vm.runInContext(code, ctx);
+      const run = (snippet) => { ctx.__out = undefined; vm.runInContext(snippet, ctx); return ctx.__out; };
+      // Token migration: sessionStorage -> localStorage, never overwrites.
+      vm.runInContext('sessionStorage.setItem("shifa_token", "tok-1"); sessionStorage.setItem("shifa_refresh", "ref-1"); sessionStorage.setItem("shifa_role", "patient"); sessionStorage.setItem("shifa_phone", "01012345678"); localStorage.setItem("shifa_role", "provider");', ctx);
+      vm.runInContext('migrateSessionTokens();', ctx);
+      check('§28 migrateSessionTokens copies session tokens to localStorage', localStore.getItem('shifa_token') === 'tok-1' && localStore.getItem('shifa_refresh') === 'ref-1' && localStore.getItem('shifa_phone') === '01012345678', JSON.stringify([...localStore._map.entries()]));
+      check('§28 migrateSessionTokens never overwrites a localStorage value', localStore.getItem('shifa_role') === 'provider', localStore.getItem('shifa_role'));
+      // Last-screen restore: safe routes restore, login/PIN/terms go home.
+      const rs = (hash, admin) => run(`__out = resolveRestoreScreen(${JSON.stringify(hash)}, ${admin});`);
+      check('§28 restore: patient screen restores', rs('#/patient', false) === '#/patient', String(rs('#/patient', false)));
+      check('§28 restore: login screen goes home', rs('#/login?role=patient', false) === '#/', String(rs('#/login?role=patient', false)));
+      check('§28 restore: admin without token goes home', rs('#/admin', false) === '#/', String(rs('#/admin', false)));
+      check('§28 restore: admin with token restores', rs('#/admin', true) === '#/admin', String(rs('#/admin', true)));
+      check('§28 restore: terms goes home', rs('#/terms', false) === '#/', String(rs('#/terms', false)));
+      check('§28 restore: empty goes home', rs(null, false) === '#/', String(rs(null, false)));
+      // Update decision: only a newer code WITH a URL is an update.
+      const ua = (obj) => run(`__out = updateAvailable(${JSON.stringify(obj)});`);
+      check('§28 update: no latestApp -> no update', ua(null) === false);
+      check('§28 update: code 0 / empty URL -> no update', ua({ code: 0, apkUrl: '' }) === false);
+      check('§28 update: same code -> no update', ua({ code: 21, apkUrl: 'https://x/app.apk' }) === false);
+      check('§28 update: newer code + URL -> update', ua({ code: 22, apkUrl: 'https://x/app.apk' }) === true);
+      check('§28 update: newer code but no URL -> no update', ua({ code: 22, apkUrl: '' }) === false);
+      const dc = (obj) => run(`__out = updateDialogConfig(${JSON.stringify(obj)});`);
+      check('§28 update dialog: optional update can be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: false }).hideCancel === false);
+      check('§28 update dialog: forced update cannot be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: true }).hideCancel === true);
+      // In-app dialogs: open / submit / cancel (the native prompt()/confirm()
+      // these replace were killing the app process on the test phones).
+      vm.runInContext('__p = showInputDialog({title: "Why?"}); __p.then((v) => { __resolved = v; });', ctx);
+      check('§28 input dialog opens an overlay', !!fakeDocument.getElementById('appDialogOverlay'), 'overlay missing');
+      {
+        const overlay = fakeDocument.getElementById('appDialogOverlay');
+        const input = overlay.querySelector('#appDialogInput');
+        input.value = 'my complaint text';
+        overlay.querySelector('#appDialogOk').onclick();
+      }
+      await sleep(10);
+      check('§28 input dialog submit resolves with the typed value', ctx.__resolved === 'my complaint text', String(ctx.__resolved));
+      check('§28 input dialog is removed after submit', !fakeDocument.getElementById('appDialogOverlay'), 'overlay still there');
+      vm.runInContext('__resolved = undefined; __p = showInputDialog({title: "Why?"}); __p.then((v) => { __resolved = v; });', ctx);
+      fakeDocument.getElementById('appDialogOverlay').querySelector('#appDialogCancel').onclick();
+      await sleep(10);
+      check('§28 input dialog cancel resolves null', ctx.__resolved === null, String(ctx.__resolved));
+      vm.runInContext('__resolved = undefined; __p = showInputDialog({title: "Why?"}); __p.then((v) => { __resolved = v; });', ctx);
+      {
+        const overlay = fakeDocument.getElementById('appDialogOverlay');
+        (overlay._listeners.click || []).forEach((fn) => fn({ target: overlay }));
+      }
+      await sleep(10);
+      check('§28 input dialog background tap resolves null', ctx.__resolved === null, String(ctx.__resolved));
+      vm.runInContext('__resolved = undefined; __p = showConfirmDialog({title: "Sure?"}); __p.then((v) => { __resolved = v; });', ctx);
+      fakeDocument.getElementById('appDialogOverlay').querySelector('#appDialogOk').onclick();
+      await sleep(10);
+      check('§28 confirm dialog confirm resolves true', ctx.__resolved === true, String(ctx.__resolved));
+      vm.runInContext('__resolved = undefined; __p = showConfirmDialog({title: "Sure?"}); __p.then((v) => { __resolved = v; });', ctx);
+      fakeDocument.getElementById('appDialogOverlay').querySelector('#appDialogCancel').onclick();
+      await sleep(10);
+      check('§28 confirm dialog cancel resolves false', ctx.__resolved === false, String(ctx.__resolved));
+      vm.runInContext('__resolved = undefined; __p = showConfirmDialog({title: "Must", hideCancel: true}); __p.then((v) => { __resolved = v; });', ctx);
+      {
+        const overlay = fakeDocument.getElementById('appDialogOverlay');
+        check('§28 forced confirm dialog has no cancel button', overlay.querySelector('#appDialogCancel') === null, 'cancel present');
+        (overlay._listeners.click || []).forEach((fn) => fn({ target: overlay }));
+      }
+      await sleep(10);
+      check('§28 forced confirm dialog background tap does not resolve', ctx.__resolved === undefined, String(ctx.__resolved));
+      vm.runInContext('__p = showInputDialog({title: "Why?"}); __p.then((v) => { __resolved = v; }); __resolved = undefined;', ctx);
+      vm.runInContext('closeAppDialog();', ctx);
+      await sleep(10);
+      check('§28 closeAppDialog resolves a pending dialog as cancelled', ctx.__resolved === null, String(ctx.__resolved));
+      // Death detector: heartbeat without a clean flag reports on boot;
+      // a clean exit stays silent; JS errors are reported as js_error.
+      vm.runInContext('localStorage.setItem("shifa_heartbeat", JSON.stringify({ts: 1234567890, screen: "#/patient"}));', ctx);
+      fetchCalls.length = 0;
+      vm.runInContext('initSessionTracking();', ctx);
+      await sleep(10);
+      check('§28 death detector reports an unclean exit on boot', fetchCalls.length === 1 && fetchCalls[0].body && fetchCalls[0].body.kind === 'unclean_exit' && fetchCalls[0].body.lastScreen === '#/patient' && fetchCalls[0].body.lastHeartbeat === 1234567890 && fetchCalls[0].body.phone === '01012345678', JSON.stringify(fetchCalls));
+      check('§28 error listener is registered', (listeners['window:error'] || []).length === 1, String((listeners['window:error'] || []).length));
+      (listeners['window:error'] || [])[0]({ message: 'boom', error: { stack: 'at x' } });
+      await sleep(10);
+      check('§28 JS error is reported as js_error', fetchCalls.length === 2 && fetchCalls[1].body.kind === 'js_error' && fetchCalls[1].body.message === 'boom', JSON.stringify(fetchCalls));
+      vm.runInContext('__intervals[0]();', ctx);
+      check('§28 heartbeat writes the current screen to localStorage', (() => { try { const h = JSON.parse(localStore.getItem('shifa_heartbeat') || 'null'); return h && typeof h.ts === 'number' && h.screen === '#/patient'; } catch { return false; } })(), localStore.getItem('shifa_heartbeat'));
+      vm.runInContext('localStorage.setItem("shifa_heartbeat", JSON.stringify({ts: 1234567890, screen: "#/patient"})); localStorage.setItem("shifa_clean_exit", "1"); initSessionTracking();', ctx);
+      await sleep(10);
+      check('§28 death detector stays silent after a clean exit', fetchCalls.length === 2, JSON.stringify(fetchCalls));
+      // Update install: native bridge when present, browser fallback when not.
+      const bridgeCalls = [];
+      fakeWindow.ShifaUpdater = {
+        canRequestInstalls: () => true,
+        downloadAndInstall: (u) => { bridgeCalls.push(u); },
+        openUnknownSourcesSettings: () => { bridgeCalls.push('settings'); },
+      };
+      vm.runInContext('startAppUpdate({code: 22, version: "2.1.8", apkUrl: "https://example.com/app.apk", force: false});', ctx);
+      check('§28 startAppUpdate uses the native bridge when present', bridgeCalls.length === 1 && bridgeCalls[0] === 'https://example.com/app.apk', JSON.stringify(bridgeCalls));
+      fakeWindow.ShifaUpdater.canRequestInstalls = () => false;
+      bridgeCalls.length = 0;
+      openedUrls.length = 0;
+      vm.runInContext('startAppUpdate({code: 22, version: "2.1.8", apkUrl: "https://example.com/app.apk", force: false});', ctx);
+      await sleep(10);
+      check('§28 startAppUpdate without install permission shows the settings dialog, no download', bridgeCalls.length === 0 && !!fakeDocument.getElementById('appDialogOverlay'), JSON.stringify(bridgeCalls));
+      vm.runInContext('closeAppDialog();', ctx);
+      fakeWindow.ShifaUpdater = null;
+      vm.runInContext('startAppUpdate({code: 22, version: "2.1.8", apkUrl: "https://example.com/app.apk", force: false});', ctx);
+      check('§28 startAppUpdate without a bridge opens the APK URL in the browser', openedUrls.length === 1 && openedUrls[0] === 'https://example.com/app.apk', JSON.stringify(openedUrls));
+    }
+  }
+  // 28d. Static contract checks on the shipped web app.
+  {
+    const webJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
+    const noComments = webJs.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+    check('§28 no native prompt() calls remain in web/app.js', !/\bprompt\s*\(/.test(noComments), 'prompt( found');
+    check('§28 no native confirm() calls remain in web/app.js', !/\bconfirm\s*\(/.test(noComments), 'confirm( found');
+    check('§28 tokens are stored in localStorage, never written to sessionStorage', webJs.includes('localStorage.setItem("shifa_token"') && !webJs.includes('sessionStorage.setItem("shifa_token"'), 'token storage');
+    check('§28 no sessionStorage token reads except the one-time migration fallback', (webJs.match(/sessionStorage\.getItem\("shifa_(token|refresh|role|phone|admin_token)"\)/g) || []).length === 5, 'unexpected sessionStorage token reads');
+    check('§28 provider registration never sends users to provider login', !webJs.includes("navigate('#/login?role=provider')"), 'role=provider nav found');
+    check('§28 login entries go to patient login', webJs.includes("navigate('#/login?role=patient')"), 'no patient login entry');
+    check('§28 registration failures show the server message verbatim', webJs.includes('err.serverMessage || apiErrorMessage(err)'), 'serverMessage not shown');
+    check('§28 home screen has a visible patient login button', webJs.includes('btn-primary btn-block" onclick="navigate(\'#/login?role=patient\')" style="margin-top:10px">🔐'), 'no home login button');
+    check('§28 notification bell is always visible (not only after login)', webJs.includes('class="bell-btn"') && !webJs.includes('store.token ? `<button class="bell-btn"'), 'bell still gated on token');
+    check('§28 terms page shows a prominent scroll-to-accept hint', webJs.includes('termsScrollMust') && webJs.includes('termsScrollHintBox'), 'no prominent terms hint');
+    check('§28 last-screen restore is wired (save on navigate, restore at boot)', webJs.includes('saveLastScreen(hash)') && webJs.includes('restoreLastScreen'), 'last-screen restore not wired');
+    check('§28 update checker runs after bootstrap on launch', webJs.includes('await loadBootstrap(); checkForAppUpdate();'), 'update check not wired');
+    check('§28 version header is v2.1.7 code 21', webJs.includes('v2.1.7, code 21'), 'header not bumped');
   }
 
   // --- 14. logout / refresh revocation ---------------------------------
