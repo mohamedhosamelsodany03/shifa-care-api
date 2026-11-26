@@ -31,7 +31,7 @@ const SPECIALIZATION_KEYWORDS = [
   { area: 'wound', label: 'Wound care / dressings', serviceCodes: ['dressing', 'package7'], re: /wound|dress|غيار|جرح/i },
   { area: 'npwt', label: 'NPWT / vacuum dressing', serviceCodes: ['npwt'], re: /npwt|vacuum|فاكيوم|negative pressure/i },
   { area: 'catheter', label: 'Catheter care', serviceCodes: ['catheter_insert', 'catheter_remove', 'catheter_flush'], re: /catheter|قسطرة/i },
-  { area: 'physio', label: 'Physiotherapy', serviceCodes: ['physio_general', 'physio_stroke'], re: /physio|physiotherapy|علاج طبيعي/i },
+  { area: 'physio', label: 'Physiotherapy', serviceCodes: ['physio_session'], re: /physio|physiotherapy|علاج طبيعي/i },
   { area: 'emergency', label: 'Emergency / triage', serviceCodes: ['standard', 'vip'], re: /emergency|triage|طوارئ|فرز|BLS|ACLS|ATLS/i },
   { area: 'iv', label: 'IV therapy / infusions', serviceCodes: ['cannula_iv', 'iv_infusion'], re: /\biv\b|infusion|كانيولا|محاليل|وريد/i },
   { area: 'elderly', label: 'Elderly care', serviceCodes: ['elderly_shift_mobile', 'elderly_shift_bedridden'], re: /elderly|geriatr|مسنين|كبار السن/i },

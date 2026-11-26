@@ -841,7 +841,7 @@ async function main() {
     console.log('\n[v2.1.0 notifications + high-risk + doctors + npwt booking]');
     // --- 18a. bootstrap flags + new services ---------------------------
     r = await req('GET', '/api/bootstrap');
-    check('bootstrap has 41 priced services (27 v2.1.0 + 14 v2.1.1)', r.json?.services?.length === 41, `got ${r.json?.services?.length}`);
+    check('bootstrap has 34 priced services (41 − 7: the 8 physio services unified into one 450 EGP session, v2.1.11)', r.json?.services?.length === 34, `got ${r.json?.services?.length}`);
     const svc = (code) => r.json.services.find((s) => s.code === code);
     check('catheter_insert 400 high-risk', svc('catheter_insert')?.price_egp === 400 && svc('catheter_insert')?.riskLevel === 'high', JSON.stringify(svc('catheter_insert')));
     check('catheter_remove 300 high-risk', svc('catheter_remove')?.price_egp === 300 && svc('catheter_remove')?.riskLevel === 'high');
@@ -1068,8 +1068,8 @@ async function main() {
     // gate only (not the Elite early-access gate).
     r = await req('POST', '/api/admin/providers/prov_demo_pro/tier', { token: adminToken, body: { tier: 'Elite' } });
     check('main provider Elite for radar-gate checks', r.status === 200 && r.json?.tier === 'Elite', JSON.stringify(r.json));
-    r = await bookStd('physio_general');
-    check('physio_general booking -> 201, 350 EGP, category physio', r.status === 201 && r.json?.amountEgp === 350 && r.json?.category === 'physio', JSON.stringify(r.json)?.slice(0, 200));
+    r = await bookStd('physio_session');
+    check('physio_session booking -> 201, 450 EGP, category physio', r.status === 201 && r.json?.amountEgp === 450 && r.json?.category === 'physio', JSON.stringify(r.json)?.slice(0, 200));
     const bkPhysio = r.json?.id;
     r = await req('GET', '/api/providers/radar', { token: provToken });
     check('nurse radar hides physio-category booking', r.status === 200 && !(r.json?.pending || []).some((b) => b.id === bkPhysio), JSON.stringify((r.json?.pending || []).map((b) => b.serviceCode)));
@@ -2221,9 +2221,9 @@ async function main() {
       const ua = (obj) => run(`__out = updateAvailable(${JSON.stringify(obj)});`);
       check('§28 update: no latestApp -> no update', ua(null) === false);
       check('§28 update: code 0 / empty URL -> no update', ua({ code: 0, apkUrl: '' }) === false);
-      check('§28 update: same code -> no update', ua({ code: 24, apkUrl: 'https://x/app.apk' }) === false);
-      check('§28 update: newer code + URL -> update', ua({ code: 25, apkUrl: 'https://x/app.apk' }) === true);
-      check('§28 update: newer code but no URL -> no update', ua({ code: 25, apkUrl: '' }) === false);
+      check('§28 update: same code -> no update', ua({ code: 25, apkUrl: 'https://x/app.apk' }) === false);
+      check('§28 update: newer code + URL -> update', ua({ code: 26, apkUrl: 'https://x/app.apk' }) === true);
+      check('§28 update: newer code but no URL -> no update', ua({ code: 26, apkUrl: '' }) === false);
       const dc = (obj) => run(`__out = updateDialogConfig(${JSON.stringify(obj)});`);
       check('§28 update dialog: optional update can be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: false }).hideCancel === false);
       check('§28 update dialog: forced update cannot be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: true }).hideCancel === true);
@@ -2324,7 +2324,7 @@ async function main() {
     check('§28 terms page shows a prominent scroll-to-accept hint', webJs.includes('termsScrollMust') && webJs.includes('termsScrollHintBox'), 'no prominent terms hint');
     check('§28 last-screen restore is wired (save on navigate, restore at boot)', webJs.includes('saveLastScreen(hash)') && webJs.includes('restoreLastScreen'), 'last-screen restore not wired');
     check('§28 update checker runs after bootstrap on launch', webJs.includes('await loadBootstrap(); checkForAppUpdate();'), 'update check not wired');
-    check('§28 version header is v2.1.10 code 24', webJs.includes('v2.1.10, code 24'), 'header not bumped');
+    check('§28 version header is v2.1.11 code 25', webJs.includes('v2.1.11, code 25'), 'header not bumped');
   }
 
   // --- §29. v2.1.8: password-gated login + push de-automation + responsive layout ---
@@ -2489,8 +2489,8 @@ async function main() {
   // 29f. Version header + responsive layout (360–430px audit).
   {
     const webJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
-    check('§29 version header is v2.1.10 code 24', webJs.includes('v2.1.10, code 24'), 'header not bumped');
-    check('§29 APP_VERSION_CODE is 24 / NAME is 2.1.10', webJs.includes('const APP_VERSION_CODE = 24;') && webJs.includes('const APP_VERSION_NAME = "2.1.10";'), 'version constants not bumped');
+    check('§29 version header is v2.1.11 code 25', webJs.includes('v2.1.11, code 25'), 'header not bumped');
+    check('§29 APP_VERSION_CODE is 25 / NAME is 2.1.11', webJs.includes('const APP_VERSION_CODE = 25;') && webJs.includes('const APP_VERSION_NAME = "2.1.11";'), 'version constants not bumped');
     check('§29 footer shows the installed version in-app', webJs.includes('v${APP_VERSION_NAME} (${APP_VERSION_CODE})'), 'footer has no version');
     const css = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'style.css'), 'utf8');
     check('§29 CSS: no horizontal page scroll (overflow-x clip safety net)', css.includes('overflow-x: clip'), 'no overflow-x guard');
@@ -2583,7 +2583,7 @@ async function main() {
     check('§30 CSS: option-sheet field + list styles exist', css.includes('.app-select') && css.includes('.opt-item') && css.includes('.opt-search'), 'sheet styles missing');
     check('§30 CSS: large complaint rows exist', css.includes('.opt-list.opt-large .opt-item'), 'large-row styles missing');
     // 30e. Version header.
-    check('§30 version header is v2.1.10 code 24', webJs.includes('v2.1.10, code 24') && webJs.includes('const APP_VERSION_CODE = 24;') && webJs.includes('const APP_VERSION_NAME = "2.1.10";'), 'header not bumped');
+    check('§30 version header is v2.1.11 code 25', webJs.includes('v2.1.11, code 25') && webJs.includes('const APP_VERSION_CODE = 25;') && webJs.includes('const APP_VERSION_NAME = "2.1.11";'), 'header not bumped');
     // 30g. The v2.1.9 interview SyntaxError (found by the zero-defect
     // tap-through): three radios embedded JSON.stringify (double
     // quotes) inside a DOUBLE-quoted inline handler — the attribute
@@ -2652,7 +2652,7 @@ async function main() {
     check('§31 broadcast tab shows accounts/devices/audience', webJs.includes('broadcastAccounts') && webJs.includes('broadcastAudience') && webJs.includes('d.broadcastAccounts'), 'broadcast tab labels missing');
     check('§31 broadcast i18n exists in both languages', webJs.includes('broadcastAccounts: "حسابات مسجلة"') && webJs.includes('broadcastAccounts: "Registered accounts"') && webJs.includes('broadcastAudience: "جمهور البث"') && webJs.includes('broadcastAudience: "Broadcast audience"'), 'broadcast i18n missing');
     // 31d. Version bump.
-    check('§31 app.js header + APP_VERSION_NAME are 2.1.10 / code 24', webJs.includes('v2.1.10, code 24') && webJs.includes('const APP_VERSION_NAME = "2.1.10"'), 'version not bumped');
+    check('§31 app.js header + APP_VERSION_NAME are 2.1.11 / code 25', webJs.includes('v2.1.11, code 25') && webJs.includes('const APP_VERSION_NAME = "2.1.11"'), 'version not bumped');
     // 31e. Dashboard counts: the true audience equals the dry-run users
     // count, and it always includes the registered accounts (the v2.1.9
     // 0/0 bug: broadcastUsers counted only phones with an FCM device, so
@@ -2754,6 +2754,45 @@ async function main() {
     check('§32 register gives password sessions 30 days', routesSrc.includes("refreshTtlDays: 30, authMethod: 'password'"), 'register TTL wrong');
     check('§32 authMethodForPhone gives password sessions 30 days', routesSrc.includes("if (latest.authMethod === 'password') return { refreshTtlDays: 30, authMethod: 'password' };"), 'authMethodForPhone TTL wrong');
     check('§32 rotation keeps 30 days for password families', routesSrc.includes("rec.authMethod === 'password' ? { refreshTtlDays: 30, authMethod: rec.authMethod }"), 'rotation TTL wrong');
+  }
+
+  // --- §33. v2.1.11: ONE physiotherapy session (owner decision 27 Nov
+  // 2026) — all physio sessions are a single service «جلسة علاج طبيعي»,
+  // flat 450 EGP, with an includes note under the name. The 8 separate
+  // physio_* services (350/400 EGP) are gone; old codes are invalid.
+  console.log('\n[§33 v2.1.11]');
+  {
+    // 33a. Bootstrap: exactly one physio service, 450 EGP, includes note.
+    r = await req('GET', '/api/bootstrap');
+    const physioSvcs = (r.json?.services || []).filter((s) => s.category === 'physio');
+    check('§33 bootstrap has exactly ONE physio service', physioSvcs.length === 1, `got ${physioSvcs.length}: ${JSON.stringify(physioSvcs.map((s) => s.code))}`);
+    const ps = physioSvcs[0] || {};
+    check('§33 physio_session is 450 EGP, standard risk, Arabic name', ps.code === 'physio_session' && ps.price_egp === 450 && ps.price === 450 && ps.riskLevel === 'standard' && ps.name_ar === 'جلسة علاج طبيعي', JSON.stringify(ps));
+    check('§33 includes_ar names all 8 areas', typeof ps.includes_ar === 'string' && ps.includes_ar.includes('تأهيل حركي عام') && ps.includes_ar.includes('تأهيل ما بعد الجلطة') && ps.includes_ar.includes('تمارين ما بعد الكسور والعمليات') && ps.includes_ar.includes('علاج طبيعي للصدر') && ps.includes_ar.includes('تمارين توازن ومشي') && ps.includes_ar.includes('تدليك علاجي') && ps.includes_ar.includes('تمارين شد وإطالة') && ps.includes_ar.includes('تأهيل كبار السن'), String(ps.includes_ar)?.slice(0, 200));
+    check('§33 includes_en present (post-stroke, therapeutic massage)', typeof ps.includes_en === 'string' && ps.includes_en.includes('post-stroke') && ps.includes_en.includes('therapeutic massage') && ps.includes_en.includes('elderly rehabilitation'), String(ps.includes_en)?.slice(0, 200));
+    // 33b. Old physio codes are no longer valid serviceCodes.
+    for (const old of ['physio_general', 'physio_stroke', 'physio_postfracture', 'physio_chest', 'physio_balance', 'physio_massage', 'physio_stretching', 'physio_elderly']) {
+      r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS, patientName: 'Coverage Patient', serviceCode: old, paymentMethod: 'cash_receipt', distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] } } });
+      check(`§33 old code ${old} booking -> 400 (invalid serviceCode)`, r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    }
+    // 33c. Static: the shipped web app carries the single session and
+    // renders its includes note under the name everywhere it is listed.
+    const webJs33 = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
+    const noComments33 = webJs33.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+    const oldCodes = ['physio_general', 'physio_stroke', 'physio_postfracture', 'physio_chest', 'physio_balance', 'physio_massage', 'physio_stretching', 'physio_elderly'];
+    check('§33 no old physio_* codes remain in web/app.js', !oldCodes.some((c) => noComments33.includes(c)), oldCodes.filter((c) => noComments33.includes(c)).join(', '));
+    check('§33 FALLBACK has physio_session at 450 with includes fields', webJs33.includes('id: "physio_session"') && webJs33.includes('price: 450, category: "physio"') && webJs33.includes('includes_ar: "تشمل الجلسة:'), 'FALLBACK physio entry wrong');
+    check('§33 i18n has svc_physio_session in both languages', webJs33.includes('svc_physio_session: "جلسة علاج طبيعي"') && webJs33.includes('svc_physio_session: "Physiotherapy session"'), 'name key missing');
+    check('§33 serviceIncludes helper reads bootstrap/FALLBACK fields', webJs33.includes('function serviceIncludes(id)') && webJs33.includes('s.includes_ar') && webJs33.includes('s.includes_en'), 'helper missing');
+    check('§33 service cards render the includes note under the name', webJs33.includes('${serviceIncludes(s.id) ? `<div class="note">${esc(serviceIncludes(s.id))}</div>` : ""}'), 'card note missing');
+    check('§33 booking form shows the note under the service picker', webJs33.includes('id="bkServiceIncludes"') && webJs33.includes('updateServiceIncludesNote()'), 'booking note missing');
+    check('§33 radar rows render the includes note', webJs33.includes('${serviceIncludes(b.serviceCode || b.service || "") ? `<div class="note">${esc(serviceIncludes(b.serviceCode || b.service || ""))}</div>` : ""}'), 'radar note missing');
+    // 33d. Static: the catalog + evaluation map the physio area to the
+    // single session, and no old code survives server-side either.
+    const catSrc33 = fs.readFileSync(path.join(__dirname, '..', 'src', 'catalog.js'), 'utf8');
+    const evalSrc33 = fs.readFileSync(path.join(__dirname, '..', 'src', 'evaluate.js'), 'utf8');
+    check('§33 catalog has physio_session at 450, no old codes', catSrc33.includes("physio_session: { code: 'physio_session'") && catSrc33.includes('price_egp: 450') && !oldCodes.some((c) => catSrc33.replace(/\/\/.*$/gm, '').includes(c)), 'catalog wrong');
+    check('§33 evaluate.js physio area maps to physio_session', evalSrc33.includes("serviceCodes: ['physio_session']"), 'evaluate mapping wrong');
   }
 
   // --- 14. logout / refresh revocation ---------------------------------

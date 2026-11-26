@@ -1162,6 +1162,10 @@ router.get('/bootstrap', (req, res) => {
       category: s.category || 'nursing',
       requiresDoctorOrder: s.requiresDoctorOrder === true,
       experience_bands: s.experience_bands || undefined,
+      // v2.1.11 — physio_session carries its includes note (both
+      // languages); the web app renders it under the service name.
+      includes_ar: s.includes_ar || undefined,
+      includes_en: s.includes_en || undefined,
     }));
   const touristMap = { tourist_doctor: 'doctor', tourist_iv: 'iv', tourist_dressing: 'dressing', tourist_nurse: 'nurse' };
   const tourist = Object.values(cat.TOURIST_SERVICES).map((s) => ({

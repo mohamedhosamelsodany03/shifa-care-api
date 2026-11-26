@@ -84,19 +84,19 @@ const SERVICES = {
   condom_catheter: { code: 'condom_catheter', category: 'nursing', name_en: 'Condom (external) catheter', name_ar: 'قسطرة خارجية (كوندوم)', price_egp: 300, riskLevel: 'standard' },
   culture_sample: { code: 'culture_sample', category: 'nursing', name_en: 'Culture sample', name_ar: 'عينة مزرعة', price_egp: 400, riskLevel: 'standard' },
   urine_catheter_sample: { code: 'urine_catheter_sample', category: 'nursing', name_en: 'Urine sample from catheter', name_ar: 'عينة بول من قسطرة', price_egp: 350, riskLevel: 'standard' },
-  // --- v2.1.1 — physiotherapy services (owner-approved 26 Nov 2026) -----
-  // Minimum 350 EGP for any physiotherapy-specialist service. Physio
-  // services are visible ONLY to providerType 'physio' on the radar.
-  physio_general: { code: 'physio_general', category: 'physio', name_en: 'General mobility rehabilitation', name_ar: 'تأهيل حركي عام', price_egp: 350, riskLevel: 'standard' },
-  physio_stroke: { code: 'physio_stroke', category: 'physio', name_en: 'Post-stroke rehabilitation', name_ar: 'تأهيل ما بعد الجلطة', price_egp: 400, riskLevel: 'standard' },
-  physio_postfracture: { code: 'physio_postfracture', category: 'physio', name_en: 'Post-fracture / post-surgery exercises', name_ar: 'تمارين ما بعد الكسور / العمليات', price_egp: 350, riskLevel: 'standard' },
-  physio_chest: { code: 'physio_chest', category: 'physio', name_en: 'Chest physiotherapy', name_ar: 'علاج طبيعي للصدر', price_egp: 350, riskLevel: 'standard' },
-  physio_balance: { code: 'physio_balance', category: 'physio', name_en: 'Balance & walking exercises', name_ar: 'تمارين توازن ومشي', price_egp: 350, riskLevel: 'standard' },
-  physio_massage: { code: 'physio_massage', category: 'physio', name_en: 'Therapeutic massage', name_ar: 'تدليك علاجي', price_egp: 350, riskLevel: 'standard' },
-  physio_stretching: { code: 'physio_stretching', category: 'physio', name_en: 'Stretching exercises', name_ar: 'تمارين شد وإطالة', price_egp: 350, riskLevel: 'standard' },
-  physio_elderly: { code: 'physio_elderly', category: 'physio', name_en: 'Elderly rehabilitation', name_ar: 'تأهيل كبار السن', price_egp: 350, riskLevel: 'standard' },
-  // NOTE (superseded v2.1.1): physiotherapy services were proposed 26 Nov
-  // 2026 and APPROVED the same day — they are live above (physio_*).
+  // --- v2.1.11 — ONE physiotherapy session (owner decision 27 Nov 2026) --
+  // All physio sessions are now a single service only: «جلسة علاج طبيعي»,
+  // flat 450 EGP — not less. The 8 separate services (350/400 EGP) are
+  // gone; the session covers all of them — the includes note below the
+  // name says what it covers, per the specialist's assessment of the
+  // patient's condition. Visible ONLY to providerType 'physio' on the radar.
+  physio_session: { code: 'physio_session', category: 'physio', name_en: 'Physiotherapy session', name_ar: 'جلسة علاج طبيعي', price_egp: 450, riskLevel: 'standard',
+    includes_ar: 'تشمل الجلسة: تأهيل حركي عام، تأهيل ما بعد الجلطة، تمارين ما بعد الكسور والعمليات، علاج طبيعي للصدر، تمارين توازن ومشي، تدليك علاجي، تمارين شد وإطالة، تأهيل كبار السن — حسب حالة المريض وتقييم الأخصائي.',
+    includes_en: 'Includes: general mobility rehabilitation, post-stroke rehabilitation, post-fracture/post-surgery exercises, chest physiotherapy, balance & walking exercises, therapeutic massage, stretching exercises, elderly rehabilitation — as needed for the patient’s condition, per the specialist’s assessment.' },
+  // NOTE (superseded v2.1.11): the 8 separate physio services (physio_*,
+  // 350/400 EGP, v2.1.1) were unified into the single physio_session
+  // above by owner decision 27 Nov 2026 — old codes are no longer valid
+  // serviceCodes (booking with one returns 400).
 };
 
 // v2.1.4 — LAUNCH-MONTH SHIFT OFFER (owner-approved 26 Nov 2026,
