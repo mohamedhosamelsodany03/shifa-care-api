@@ -290,6 +290,14 @@ class Store {
         p.claimedLanguages = [...langs];
       }
     }
+    // v2.1.13 (B1): heal cash bookings created before the flag was set
+    // at creation — cash-ness derives from the payment method.
+    for (const b of Object.values(this.data.bookings || {})) {
+      if (b.paymentMethod === 'cash_receipt' && b.cashCollectedByProvider !== true) b.cashCollectedByProvider = true;
+    }
+    // v2.1.13 (M32): first-sight timestamp for the env-promo cap
+    // (null until an env promo is first seen while configured).
+    if (!('envPromoStartedAt' in this.data)) this.data.envPromoStartedAt = null;
   }
   load() {
     try {
@@ -454,6 +462,14 @@ class Store {
       delete out.insurer;
       delete out.policyNo;
     }
+    // v2.1.13 (H18): the assigned provider loses the patient phone +
+    // address once the booking leaves active status (the visit is over;
+    // any later contact goes through the admin).
+    if (viewer && viewer.role === 'provider' && b.patientPhone !== viewer.phone
+      && !['accepted', 'provider_confirmed'].includes(b.status)) {
+      delete out.patientPhone;
+      delete out.address;
+    }
     // v2.1.0 — doctor referrals: the doctor's phone is visible to the
     // ASSIGNED provider and admin only — never to the patient
     // (anti-leakage: patients never see doctors' numbers, same rule as
@@ -470,8 +486,12 @@ class Store {
     out.cancelDeadline = b.createdAt
       ? new Date(new Date(b.createdAt).getTime() + config.cancelWindowMs).toISOString()
       : null;
-    out.canCancel = ['held', 'accepted'].includes(b.status)
-      && !!out.cancelDeadline && now < new Date(out.cancelDeadline).getTime();
+    // v2.1.13 (B4): a PENDING booking (held, not yet accepted) can be
+    // cancelled by the patient at any time — the 15-minute window only
+    // binds an ACCEPTED booking (a provider is already committed).
+    out.canCancel = b.status === 'held'
+      ? true
+      : (b.status === 'accepted' && !!out.cancelDeadline && now < new Date(out.cancelDeadline).getTime());
     // v2.1.3 — packages do NOT use the 15-minute window (terms §12):
     // cancel any time before the package completes; the deadline shown is
     // the start date (full refund before it, remaining-days refund after).

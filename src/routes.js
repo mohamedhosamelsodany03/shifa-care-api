@@ -5,7 +5,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const config = require('./config');
 const crypto = require('crypto');
-const { store, sha256, saltedSha256, newId, nowIso, isNight } = require('./store');
+const { store, sha256, saltedSha256, matchesSaltedHash, newId, nowIso, isNight } = require('./store');
 const { makeCode, hashOtpCode, verifyOtpCode, getMockCode, pickProvider, normalizePhone } = require('./otp');
 const { issueTokens, verifyRefreshToken, detectRefreshReuse, revokeRefreshToken, requireAuth, requireRole, requireAdmin, issueAdminToken } = require('./auth');
 const { computePoints, isoWeekKey, currentWeekKey, touristCompatible, touristCompatibleFor, hasLanguageBadge, englishBlocked } = require('./points');
@@ -92,11 +92,40 @@ function recordTermsAcceptance(phone) {
 }
 // A suspended (or permanently banned) provider cannot take new work:
 // radar, accept, vitals, completion and cash collection are all blocked.
+// v2.1.13 (M23): a TEMPORARY suspension expires on its own — when
+// suspendedUntil has passed, the suspension is cleared (with an audit
+// entry) the first time it is checked. A permanent ban
+// (suspendedUntil === null) never expires.
+function refreshSuspension(p) {
+  if (!p || !p.suspended || !p.suspendedUntil) return false;
+  if (Date.now() > new Date(p.suspendedUntil).getTime()) {
+    p.suspended = false;
+    p.suspendedUntil = null;
+    p.suspendedReason = null;
+    store.audit('admin.suspension_expired', p.id, { providerId: p.id });
+    store.save();
+    return true;
+  }
+  return false;
+}
 function providerBlocked(p) {
   if (!p) return null;
   if (p.permanentBan) return 'This provider account is permanently banned. Contact admin.';
+  refreshSuspension(p);
   if (p.suspended) return 'This provider account is suspended. Contact admin.';
   return null;
+}
+// v2.1.13 (B5/H8/H10): admin alerts — in-app + push to the admin phone.
+// Fire-and-forget: a failed notification never blocks the response.
+function notifyAdmin(payload) {
+  return notify.notifyUser(config.adminPhone, payload)
+    .catch((e) => console.error('[notify] admin alert:', e.message));
+}
+// v2.1.13 (B1): cash-ness derives from the PAYMENT METHOD, not from a
+// flag that can be forgotten — a cash-with-receipt booking is cash even
+// when an old record was created before the flag existed.
+function isCashBooking(b) {
+  return !!b && (b.cashCollectedByProvider === true || b.paymentMethod === 'cash_receipt');
 }
 // --- v2.1.1 helpers --------------------------------------------------
 // Reject prototype-pollution / reserved identifiers anywhere they are
@@ -183,10 +212,13 @@ function isOnlinePayment(b) {
 // review OR when an online payment has NO receipt at all (the old code
 // only blocked the "pending" case, so a booking created without a
 // receipt slipped through the radar/accept gates). Cash is never blocked.
+// v2.1.13 (B4): a REJECTED receipt blocks too — acceptance requires an
+// APPROVED receipt; a rejected one must never open the accept gate.
 function receiptBlocked(b) {
   if (!b) return false;
   if (receiptPending(b)) return true;
   if (isOnlinePayment(b) && !b.receipt) return true;
+  if (isOnlinePayment(b) && b.receipt && b.receipt.status === 'rejected') return true;
   return false;
 }
 // v2.1.6 (C6): receipt status flag, kept in sync with b.receipt so the
@@ -220,7 +252,10 @@ function capStr(v, max) { return v == null ? v : String(v).slice(0, max); }
 function validScheduledAt(v) {
   if (v == null || v === '') return true; // optional
   const d = new Date(v);
-  return Number.isFinite(d.getTime());
+  if (!Number.isFinite(d.getTime())) return false;
+  // v2.1.13 (M3): a scheduled time in the past is not a booking (5-min
+  // grace for clock skew / a patient booking "now").
+  return d.getTime() >= Date.now() - 5 * 60 * 1000;
 }
 // Recompute a provider's points + auto-promote (audit #17). Runs on
 // interview submit, admin credential verify and booking release.
@@ -237,6 +272,14 @@ function recomputeProviderPoints(p, { auditTier = true } = {}) {
   }
   return pts;
 }
+// v2.1.13 (L19): the stay bonus is ALLOCATED once a settlement record
+// carries it — whether or not that settlement was actually marked paid
+// yet. The allocation guard stops the next week's generation from
+// adding the same 250 EGP again; the paid flag itself is set ONLY by
+// POST /api/admin/settlements/:id/mark-paid.
+function stayBonusAllocated(p) {
+  return (store.data.settlements || []).some((s) => s.providerId === p.id && (s.totals?.stayBonusEgp || 0) > 0);
+}
 // Stay bonus (v2.1.1): 250 EGP, earned when 90 days since joining AND
 // >=10 completed cases. Paid once, via a settlement record.
 function stayBonusState(p) {
@@ -248,7 +291,7 @@ function stayBonusState(p) {
   const earned = days >= cat.STAY_BONUS_DAYS && cases >= cat.STAY_BONUS_MIN_CASES;
   return {
     eligibleAt: new Date(joined + cat.STAY_BONUS_DAYS * 24 * 60 * 60 * 1000).toISOString(),
-    amountEgp: cat.STAY_BONUS_EGP, earned, paid: !!p.stayBonusPaid, daysSinceJoin: days,
+    amountEgp: cat.STAY_BONUS_EGP, earned, paid: !!p.stayBonusPaid, allocated: stayBonusAllocated(p), daysSinceJoin: days,
   };
 }
 // v2.1.6 (C3): the volume bonus is paid ONCE per month — only the
@@ -256,11 +299,19 @@ function stayBonusState(p) {
 // amount is tracked on the provider record (volumeBonusPaid {month,
 // amountEgp}); older records are recovered by summing this month's
 // settlement records (self-heal for data written before v2.1.6).
+// v2.1.13 (L19/M29): the per-month ledger volumeBonusPaidByMonth
+// {[month]: amountEgp} is the source of truth — it is written ONLY by
+// mark-paid (M31). The settlement-sum fallback now counts a month's
+// bonus from BOTH its own totals and any carryover totals that settled
+// it, so a carried-over bonus is never paid twice.
 function volumeBonusPaidThisMonth(p, key) {
+  if (p.volumeBonusPaidByMonth && typeof p.volumeBonusPaidByMonth[key] === 'number') return p.volumeBonusPaidByMonth[key];
   if (p.volumeBonusPaid && p.volumeBonusPaid.month === key) return p.volumeBonusPaid.amountEgp || 0;
   let sum = 0;
   for (const s of (store.data.settlements || [])) {
-    if (s.providerId === p.id && (s.generatedAt || '').slice(0, 7) === key) sum += s.totals?.volumeBonusEgp || 0;
+    if (s.providerId !== p.id) continue;
+    if (s.totals?.volumeBonusMonth === key) sum += s.totals?.volumeBonusEgp || 0;
+    if (s.totals?.volumeBonusCarryoverMonth === key) sum += s.totals?.volumeBonusCarryoverEgp || 0;
   }
   return sum;
 }
@@ -284,20 +335,99 @@ function isSettleableBooking(b, nowMs) {
 // the refunded shares become a reversing adjustment deducted from the
 // provider's NEXT settlement record — money already "paid" on paper is
 // clawed back instead of vanishing.
-function createSettlementAdjustment(providerId, booking, reason) {
+// v2.1.13 (B2): the adjustment is now created on EVERY refund, settled
+// or not (pendingAdj applies at the next settlement), and its direction
+// depends on the money:
+//   - CASH: the app refunds the patient in full while the provider
+//     still holds the cash, so the provider OWES the app the FULL
+//     refund (refundEgp = provider share + app share). provOwes +=
+//     refundEgp at the next settlement (never a deduction).
+//   - NON-CASH, settled: the app refunds from escrow and claws back
+//     only the provider share already paid (appOwes -= providerShare).
+//   - NON-CASH, not settled: zero financial effect — the share was
+//     never paid, so there is nothing to claw back (the adjustment is
+//     still recorded, for the audit trail).
+// amounts: { providerShareEgp, appShareEgp, refundEgp,
+// settledProviderShareEgp } — for packages, settledProviderShareEgp is
+// the provider share inside ALREADY-SETTLED day-release entries only.
+function createSettlementAdjustment(providerId, booking, reason, amounts) {
   if (!providerId || !booking) return null;
-  const shares = booking.refundedShares || { providerShareEgp: booking.providerShareEgp || 0, appShareEgp: booking.appShareEgp || 0 };
+  const shares = amounts || booking.refundedShares || { providerShareEgp: booking.providerShareEgp || 0, appShareEgp: booking.appShareEgp || 0 };
+  const providerShareEgp = shares.providerShareEgp || 0;
+  const appShareEgp = shares.appShareEgp || 0;
+  // v2.1.13 (B2): the refund is what the patient ACTUALLY paid
+  // (booking.refundEgp = amountPayableEgp, after any voucher). The
+  // provider+app sum only equals that when no voucher applied — with a
+  // voucher the sum overstates the cash the provider holds by the
+  // voucher amount, so the provider would overpay on settlement.
+  const refundEgp = shares.refundEgp != null ? shares.refundEgp : (booking.refundEgp != null ? booking.refundEgp : providerShareEgp + appShareEgp);
+  const cash = isCashBooking(booking);
+  // For a package, "settled" means some provider share was actually
+  // settled — packages never set b.settledWeekKey, so the settled
+  // portion comes from the daily release entries only (v2.1.13 B2).
+  const settled = booking.kind === 'package'
+    ? (shares.settledProviderShareEgp || 0) > 0
+    : !!booking.settledWeekKey;
   const adj = {
     id: newId('adj'), providerId, bookingId: booking.id, reason,
-    providerShareEgp: shares.providerShareEgp || 0,
-    appShareEgp: shares.appShareEgp || 0,
-    cash: !!booking.cashCollectedByProvider,
+    providerShareEgp, appShareEgp, refundEgp,
+    settledProviderShareEgp: shares.settledProviderShareEgp != null ? shares.settledProviderShareEgp : (settled && !cash ? providerShareEgp : 0),
+    cash, settled,
     createdAt: nowIso(), appliedSettlementId: null,
   };
   store.data.settlementAdjustments = store.data.settlementAdjustments || [];
   store.data.settlementAdjustments.push(adj);
-  store.audit('settlement.adjustment_created', providerId, { adjustmentId: adj.id, bookingId: booking.id, reason, providerShareEgp: adj.providerShareEgp, appShareEgp: adj.appShareEgp, cash: adj.cash });
+  store.audit('settlement.adjustment_created', providerId, { adjustmentId: adj.id, bookingId: booking.id, reason, providerShareEgp: adj.providerShareEgp, appShareEgp: adj.appShareEgp, refundEgp: adj.refundEgp, cash: adj.cash, settled: adj.settled });
   return adj;
+}
+// v2.1.13 (M30): a loyalty voucher used on a booking that is later
+// cancelled or refunded goes back to the patient — restored to active
+// (unless it has already expired) so it can be used on the next booking.
+function restoreVoucher(b) {
+  if (!b || !b.voucherId) return null;
+  const v = (store.data.vouchers || []).find((x) => x.id === b.voucherId);
+  if (!v || v.status !== 'used') return null;
+  if (new Date(v.expiresAt).getTime() <= Date.now()) return null;
+  v.status = 'active';
+  v.usedAt = null;
+  v.usedBookingId = null;
+  store.audit('voucher.restored', b.patientPhone, { voucherId: v.id, bookingId: b.id });
+  return v;
+}
+// v2.1.13 (M33): the COMMISSION BASE of a booking — the service portion
+// only. The distance fee and NPWT equipment are PASS-THROUGH: the
+// provider keeps them in full, the app never commissions them. Old
+// bookings without the stored fields fall back to
+// amount − distance fee − NPWT equipment.
+function commissionBaseOf(b) {
+  if (typeof b.commissionBaseEgp === 'number') return b.commissionBaseEgp;
+  const equip = b.npwtEquipmentEgp || 0;
+  return Math.max(0, (b.amountEgp || 0) - (b.distanceFeeEgp || 0) - equip);
+}
+// v2.1.13 (M33/L17): provider/app shares for one booking at a given
+// commission %, computed from the commission base — the exact formula
+// releaseBooking uses, so the accept-time estimate matches the release.
+// Launch-offer branch: the provider is paid on the REFERENCE base
+// (700/1,200 + distance fee kept whole); the app share goes negative
+// by the top-up + any voucher (that negative share IS the launch cost).
+function sharesFor(b, pct) {
+  const total = b.amountEgp;
+  const feeEgp = b.distanceFeeEgp || 0;
+  const voucher = b.voucherDiscountEgp || 0;
+  const offerRef = b.launchOffer && b.launchOffer.referenceEgp != null ? b.launchOffer.referenceEgp : null;
+  if (offerRef != null) {
+    const refBase = offerRef - feeEgp;
+    const grossApp = Math.round(refBase * (pct / 100));
+    const providerShareEgp = offerRef - grossApp;
+    return { providerShareEgp, appShareEgp: total - providerShareEgp - voucher, grossAppShareEgp: grossApp, topupEgp: offerRef - total };
+  }
+  const base = commissionBaseOf(b);
+  const grossApp = Math.round(base * (pct / 100));
+  // The app funds any loyalty-voucher discount in full: the provider's
+  // share is computed on the FULL pre-discount price; the discount
+  // comes out of the app's share (floored at 0 — any shortfall is the
+  // app's cost of the voucher).
+  return { providerShareEgp: total - grossApp, appShareEgp: Math.max(0, grossApp - voucher), grossAppShareEgp: grossApp, topupEgp: 0 };
 }
 // v2.1.6 (C7): a package day is releasable when the patient confirmed
 // it, OR when vitals were recorded and 72h passed with no dispute
@@ -351,11 +481,14 @@ function generateSettlements() {
     // Package day releases: payable vs held, per release entry. A
     // weekly release is settleable at once (terms §12); a FINAL release
     // waits out the booking's 24h complaint window (rel.settleableAt).
+    // v2.1.13 (B2): a REFUNDED package settles nothing — its released
+    // days were already clawed back by a reversing adjustment.
     let packageDays = 0, packageProviderShare = 0, packageAppShare = 0, packageCashAppShare = 0;
     let packageHoldDays = 0, packageHoldEgp = 0;
     const payableRels = [];
     for (const b of Object.values(store.data.bookings)) {
       if (b.kind !== 'package') continue;
+      if (b.status === 'refunded') continue;
       for (const rel of (b.packageDayReleases || [])) {
         if (rel.providerId !== p.id || rel.settledWeekKey) continue;
         const relSettleable = (!rel.settleableAt || nowMs >= new Date(rel.settleableAt).getTime())
@@ -363,20 +496,35 @@ function generateSettlements() {
         if (relSettleable) payableRels.push({ booking: b, rel });
         else {
           packageHoldDays += rel.days;
-          packageHoldEgp += b.cashCollectedByProvider ? (rel.appShareEgp || 0) : (rel.providerShareEgp || 0);
+          packageHoldEgp += isCashBooking(b) ? (rel.appShareEgp || 0) : (rel.providerShareEgp || 0);
         }
       }
     }
     for (const { booking: b, rel } of payableRels) {
       packageDays += rel.days;
-      if (b.cashCollectedByProvider) packageCashAppShare += rel.appShareEgp || 0;
+      if (isCashBooking(b)) packageCashAppShare += rel.appShareEgp || 0;
       else { packageProviderShare += rel.providerShareEgp || 0; packageAppShare += rel.appShareEgp || 0; }
     }
     // Bonuses (C3: volume bonus pays only the monthly increase).
     const stay = stayBonusState(p);
-    const stayDue = stay.earned && !stay.paid ? cat.STAY_BONUS_EGP : 0;
+    const stayDue = stay.earned && !stay.paid && !stay.allocated ? cat.STAY_BONUS_EGP : 0;
     const vbDue = volumeBonusDue(p, key);
     const bonusDue = p.permanentBan ? 0 : vbDue.dueEgp;
+    // v2.1.13 (M29): month-boundary carryover — a bonus earned last
+    // month but never settled (the settlement was generated only this
+    // month) is settled now, most recent unpaid month first; the older
+    // month follows in the next settlement (the ledger then shows it
+    // paid, so it is never double-paid).
+    let carryoverDue = 0, carryoverMonth = null;
+    if (!p.permanentBan) {
+      for (let back = 1; back <= 2 && !carryoverMonth; back++) {
+        const d = new Date();
+        d.setMonth(d.getMonth() - back);
+        const mk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        const due = volumeBonusDue(p, mk);
+        if (due.dueEgp > 0) { carryoverDue = due.dueEgp; carryoverMonth = mk; }
+      }
+    }
     // Reversing adjustments (C4) for refunds of already-settled bookings.
     const pendingAdj = (store.data.settlementAdjustments || []).filter((a) => a.providerId === p.id && !a.appliedSettlementId);
     // Totals (C2): cash contributes ONLY the app share, as a debt the
@@ -384,62 +532,72 @@ function generateSettlements() {
     // by the app because the provider already holds the cash.
     let appOwes = 0, provOwes = 0;
     for (const b of payable) {
-      if (b.cashCollectedByProvider) provOwes += b.appShareEgp || 0;
-      else appOwes += b.providerShareEgp || 0;
+      if (isCashBooking(b)) {
+        const net = cashNetEgp(b);
+        if (net >= 0) provOwes += net; else appOwes += -net;
+      } else appOwes += b.providerShareEgp || 0;
     }
-    appOwes += packageProviderShare + bonusDue + stayDue;
+    appOwes += packageProviderShare + bonusDue + carryoverDue + stayDue;
     provOwes += packageCashAppShare;
     // Hold bucket (C4): amounts not yet settleable, shown separately
     // and never paid from this record.
     let holdEgp = packageHoldEgp;
     const holdBookingIds = [];
     for (const b of held) {
-      holdEgp += b.cashCollectedByProvider ? (b.appShareEgp || 0) : (b.providerShareEgp || 0);
+      holdEgp += isCashBooking(b) ? Math.abs(cashNetEgp(b)) : (b.providerShareEgp || 0);
       holdBookingIds.push(b.id);
     }
-    // Apply reversing adjustments: a refunded provider share reduces
-    // what the app owes; a refunded cash app-share reduces what the
-    // provider owes. An excess nets to the other side (a debt).
-    let adjProviderShare = 0, adjCashAppShare = 0;
+    // Apply reversing adjustments (v2.1.13 B2): a CASH refund ADDS the
+    // full refund to what the provider owes (the app refunds the
+    // patient while the provider still holds the cash); a NON-CASH
+    // refund of a SETTLED booking deducts the already-paid provider
+    // share from what the app owes; a non-cash refund of an UNSETTLED
+    // booking has no financial effect (nothing was paid). An excess
+    // nets to the other side (a debt).
+    let adjProviderShare = 0, adjCashRefund = 0;
     for (const a of pendingAdj) {
-      if (a.cash) adjCashAppShare += a.appShareEgp || 0;
-      else adjProviderShare += a.providerShareEgp || 0;
+      if (a.cash) adjCashRefund += a.refundEgp || 0;
+      else if (a.settled) adjProviderShare += a.settledProviderShareEgp ?? a.providerShareEgp ?? 0;
     }
     let appOwes2 = appOwes - adjProviderShare;
-    let provOwes2 = provOwes - adjCashAppShare;
+    let provOwes2 = provOwes + adjCashRefund;
     if (appOwes2 < 0) { provOwes2 += -appOwes2; appOwes2 = 0; }
     if (provOwes2 < 0) { appOwes2 += -provOwes2; provOwes2 = 0; }
-    const adjustmentsEgp = adjProviderShare + adjCashAppShare;
-    const hasActivity = payable.length || held.length || packageDays || packageHoldDays || stayDue || bonusDue > 0 || pendingAdj.length;
+    const adjustmentsEgp = adjProviderShare + adjCashRefund;
+    const hasActivity = payable.length || held.length || packageDays || packageHoldDays || stayDue || bonusDue > 0 || carryoverDue > 0 || pendingAdj.length;
     if (!hasActivity) continue;
     const exists = (store.data.settlements || []).some((x) => x.providerId === p.id && x.weekKey === weekKey);
     if (exists) continue;
     const totals = {
       appOwesProviderEgp: appOwes2, providerOwesAppEgp: provOwes2,
       volumeBonusEgp: bonusDue, volumeBonusMonth: key, volumeBonusPaidCumulative: (vbDue.paidEgp || 0) + bonusDue,
+      volumeBonusCarryoverEgp: carryoverDue, volumeBonusCarryoverMonth: carryoverMonth,
       stayBonusEgp: stayDue,
       releasedCases: payable.length,
       packageDays, packageProviderShareEgp: packageProviderShare, packageAppShareEgp: packageAppShare,
       packageCashAppShareEgp: packageCashAppShare,
-      cashAppShareEgp: payable.filter((b) => b.cashCollectedByProvider).reduce((s, b) => s + (b.appShareEgp || 0), 0),
+      cashAppShareEgp: payable.filter((b) => isCashBooking(b)).reduce((s, b) => s + (b.appShareEgp || 0), 0),
       complaintHoldEgp: holdEgp, complaintHoldBookingIds: holdBookingIds, packageHoldDays,
       adjustmentsEgp, adjustmentsApplied: pendingAdj.map((a) => a.id),
       payable: holdEgp === 0,
       settledBookingIds: payable.map((b) => b.id),
     };
-    const rec = { id: newId('stl'), providerId: p.id, weekKey, generatedAt: nowIso(), totals };
+    // v2.1.13 (M31): payment tracking — null until an admin marks the
+    // settlement paid (POST /api/admin/settlements/:id/mark-paid).
+    const rec = { id: newId('stl'), providerId: p.id, weekKey, generatedAt: nowIso(), totals, paidAt: null, paidBy: null, paidRef: null };
     store.data.settlements.push(rec);
     // Mark what this record settled so a later week never pays it again.
     for (const b of payable) { b.settledWeekKey = weekKey; b.settledAt = nowIso(); }
     for (const { rel } of payableRels) { rel.settledWeekKey = weekKey; rel.settledAt = nowIso(); }
     for (const a of pendingAdj) a.appliedSettlementId = rec.id;
-    if (bonusDue > 0) {
-      p.volumeBonusPaid = { month: key, amountEgp: (vbDue.paidEgp || 0) + bonusDue };
-      store.audit('bonus.paid', p.id, { settlementId: rec.id, month: key, amountEgp: bonusDue, cumulativeEgp: p.volumeBonusPaid.amountEgp });
+    // v2.1.13 (L19): bonuses are only ALLOCATED here — the paid flags
+    // (volumeBonusPaid / stayBonusPaid) are set ONLY when the settlement
+    // is actually marked paid (mark-paid), never at generation.
+    if (bonusDue > 0 || carryoverDue > 0) {
+      store.audit('bonus.allocated', p.id, { settlementId: rec.id, month: key, amountEgp: bonusDue, carryoverMonth, carryoverEgp: carryoverDue, cumulativeEgp: (vbDue.paidEgp || 0) + bonusDue });
     }
     if (stayDue > 0) {
-      p.stayBonusPaid = true;
-      store.audit('stay_bonus.paid', p.id, { settlementId: rec.id, amountEgp: stayDue });
+      store.audit('stay_bonus.allocated', p.id, { settlementId: rec.id, amountEgp: stayDue });
     }
     made.push(rec);
   }
@@ -448,9 +606,18 @@ function generateSettlements() {
 
 // Phone numbers are forbidden inside in-app messages: the masked channel
 // must never become a way to exchange personal numbers.
-const PHONE_IN_MESSAGE_RE = /(?:\+?20[\s-]?|0)?1[0-9][\s-]?[0-9]{4}[\s-]?[0-9]{4}|\b\d{10,}\b/;
+// v2.1.13 (M28): normalise BEFORE the phone filter — Arabic-Indic
+// digits (٠–٩) and Eastern Arabic-Indic digits (۰–۹) become ASCII,
+// then ALL non-digits are stripped, so "٠١٠٠٨٦٢٩٠٦٠", "0100 862 9060"
+// and "0100-862-9060" all test as the same digit string. An Egyptian
+// mobile (optionally country-prefixed) or any 10+ digit run is a phone.
+const ARABIC_DIGITS = { '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4', '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9', '۰': '0', '۱': '1', '۲': '2', '۳': '3', '۴': '4', '۵': '5', '۶': '6', '۷': '7', '۸': '8', '۹': '9' };
+function normalizeDigits(text) {
+  return String(text || '').replace(/[٠-٩۰-۹]/g, (d) => ARABIC_DIGITS[d]).replace(/\D/g, '');
+}
 function containsPhoneNumber(text) {
-  return PHONE_IN_MESSAGE_RE.test(String(text || ''));
+  const digits = normalizeDigits(text);
+  return /(?:20)?1[0-9]{9}/.test(digits) || /\d{10,}/.test(digits);
 }
 // In-app messaging is open from acceptance until 24h after completion
 // (patient confirmation / release). Before acceptance, or after the
@@ -590,7 +757,19 @@ function activePromo() {
     return null; // expired — the sweep clears it
   }
   if (config.promoCommissionPct != null) {
-    return { commissionPct: config.promoCommissionPct, until: null, source: 'env' };
+    // v2.1.13 (M32): an env promo has no end date of its own — it is
+    // capped in code at promoEnvMaxDays from FIRST SIGHT (stored in
+    // the data file so a restart does not reset the clock). After the
+    // cap the env promo stops applying and tier rates resume; the
+    // dashboard/bootstrap expose `until` so the admin UI can warn.
+    if (!store.data.envPromoStartedAt) {
+      store.data.envPromoStartedAt = nowIso();
+      store.save();
+    }
+    const startedMs = new Date(store.data.envPromoStartedAt).getTime();
+    const untilMs = startedMs + config.promoEnvMaxDays * 24 * 60 * 60 * 1000;
+    if (Date.now() > untilMs) return null;
+    return { commissionPct: config.promoCommissionPct, until: new Date(untilMs).toISOString(), source: 'env' };
   }
   return null;
 }
@@ -883,7 +1062,13 @@ function releasePackageBooking(b, mode) {
 // Refundable remainder of a package (terms §12): what the patient actually
 // paid minus the value of ALL days already released (weekly + final).
 // Unworked extra days are included (they are never released).
+// v2.1.13 (B3): a day under bulk-registration review is NEVER deducted —
+// while the package is flagged packageReviewRequired, its worked-days
+// claim is unproven (the admin has not cleared the review), so the
+// refundable remainder is the full amount. Once the admin clears the
+// review the released days count as worked again.
 function packageRefundRemaining(b) {
+  if (b.packageReviewRequired) return Math.max(0, refundAmount(b));
   const releasedGross = (b.packageDayReleases || []).reduce((s, x) => s + x.providerShareEgp + x.appShareEgp, 0);
   return Math.max(0, refundAmount(b) - releasedGross);
 }
@@ -940,34 +1125,35 @@ function recomputeRatingAvg(p) {
   return p.ratingAvg;
 }
 
+// v2.1.13 (M33-adjacent): the NET a cash booking contributes to the
+// settlement. The provider collected amountPayableEgp (total − voucher)
+// in cash; their earned share is providerShareEgp. The difference —
+// (total − providerShare) − voucher — is what the provider owes the
+// app when positive, and what the app owes the provider when negative
+// (a loyalty voucher bigger than the gross app share: the app funds
+// the voucher, so it tops the provider up). Without a voucher the net
+// is exactly the app share, as before. Packages have no vouchers, so
+// their net is always the release app share.
+function cashNetEgp(b) {
+  return ((b.amountEgp || 0) - (b.providerShareEgp || 0)) - (b.voucherDiscountEgp || 0);
+}
 function releaseBooking(b, mode) {
   const total = b.amountEgp;
   const pct = b.commissionPct ?? 0;
-  // v2.1.4 — launch-month shift offer (locked at accept time): the
-  // provider's share is computed on the REFERENCE total (700/1,200 base
-  // + distance fee), while the patient paid the offer price (500/850 +
-  // distance fee). The app share = amount actually paid − provider share,
-  // which goes NEGATIVE during the offer (e.g. Starter 12h: provider 595,
-  // app −95) — that negative share IS the launch cost the app funds, so
-  // it is NOT floored at 0 here (unlike the normal path below). A loyalty
-  // voucher still comes out of the app's share on top, as usual. The
-  // top-up (reference − paid) is recorded on the booking and audited as
-  // 'launch_offer.topup' for the ledger / admin view.
+  // v2.1.13 (M33/L17): shares come from sharesFor() — commission on the
+  // SERVICE base only (distance fee + NPWT equipment are pass-through,
+  // kept in full by the provider). The launch-offer branch pays the
+  // provider on the 700/1,200 reference base; the app share goes
+  // NEGATIVE by the top-up + any voucher (that negative share IS the
+  // launch cost the app funds, so it is NOT floored at 0 here — unlike
+  // the normal path, where the voucher discount is floored at 0).
+  const s = sharesFor(b, pct);
+  b.providerShareEgp = s.providerShareEgp;
+  b.appShareEgp = s.appShareEgp;
   const offerRef = b.launchOffer && b.launchOffer.referenceEgp != null ? b.launchOffer.referenceEgp : null;
   if (offerRef != null) {
-    const grossAppShare = Math.round(offerRef * (pct / 100));
-    b.providerShareEgp = offerRef - grossAppShare;
-    b.appShareEgp = total - b.providerShareEgp - (b.voucherDiscountEgp || 0);
-    b.launchOfferTopupEgp = offerRef - total;
+    b.launchOfferTopupEgp = s.topupEgp;
     store.audit('launch_offer.topup', b.providerId || 'system', { bookingId: b.id, serviceCode: b.serviceCode, referenceEgp: offerRef, amountEgp: total, commissionPct: pct, providerShareEgp: b.providerShareEgp, appShareEgp: b.appShareEgp, topupEgp: b.launchOfferTopupEgp, voucherDiscountEgp: b.voucherDiscountEgp || 0 });
-  } else {
-    const grossAppShare = Math.round(total * (pct / 100));
-    // v2.0.9 — the app funds any loyalty-voucher discount in full: the
-    // provider's share is computed on the FULL pre-discount price; the
-    // discount comes out of the app's share (floored at 0 — any shortfall
-    // is the app's cost of the voucher).
-    b.appShareEgp = Math.max(0, grossAppShare - (b.voucherDiscountEgp || 0));
-    b.providerShareEgp = total - grossAppShare;
   }
   // v2.1.1 (audit #18): language bonus — if the tourist booking's
   // language matches a VERIFIED language certificate the provider holds,
@@ -1049,20 +1235,53 @@ async function sweepAutoRelease() {
     store.audit('launch_offer.expired', 'system', {});
     changed = true;
   }
+  // v2.1.0 — unread-critical SMS fallback pass: a critical notification
+  // still unread 10 minutes after creation gets one SMS attempt.
+  // v2.1.13 (M9): this runs in its own try/catch BEFORE the release
+  // loop below (it used to run after the Thursday block, so a failure
+  // in the notifications could delay the releases).
+  let fb = { attempted: 0, sent: 0 };
+  try {
+    fb = await notify.processSmsFallbacks();
+  } catch (e) {
+    console.error('[sweep] sms fallback pass failed:', e.message);
+  }
   for (const b of Object.values(store.data.bookings)) {
+    // v2.1.13 (B4): a pending booking whose receipt was REJECTED more
+    // than 24h ago is auto-cancelled — it can never be accepted, and
+    // the patient may also cancel it at any time (see cancel endpoint).
+    if (b.status === 'held' && b.receipt && b.receipt.status === 'rejected') {
+      const rejectedMs = new Date(b.receipt.reviewedAt || b.receipt.uploadedAt || b.createdAt).getTime();
+      if (Number.isFinite(rejectedMs) && now - rejectedMs >= 24 * 60 * 60 * 1000) {
+        b.status = 'cancelled';
+        b.cancelledAt = nowIso();
+        b.refundEgp = refundAmount(b);
+        b.refundedAt = nowIso();
+        restoreVoucher(b);
+        store.audit('booking.auto_cancelled_rejected_receipt', 'system', { bookingId: b.id, refundEgp: b.refundEgp });
+        changed = true;
+        continue;
+      }
+    }
     if (b.status === 'patient_confirmed' && b.patientConfirmedAt && !b.review && !b.complaint) {
       // v2.0.8: a circumvention hold pauses auto-release just like a complaint.
       if (b.circumventionHold) continue;
       if (now - new Date(b.patientConfirmedAt).getTime() >= config.autoReleaseAfterMs) {
-        if (b.kind === 'package') releasePackageBooking(b, 'auto'); else releaseBooking(b, 'auto');
-        released.push(b.id);
+        // v2.1.13 (M9): one bad release must never kill the sweep —
+        // log it and keep going with the next booking.
+        try {
+          if (b.kind === 'package') releasePackageBooking(b, 'auto'); else releaseBooking(b, 'auto');
+          released.push(b.id);
+        } catch (e) { console.error('[sweep] auto-release failed:', b.id, e.message); }
       }
     }
     // 'reviewed' only persists when a complaint paused the release; once
     // the complaint is resolved as rejected, release it now.
     if (b.status === 'reviewed' && !b.complaint && !b.circumventionHold) {
-      if (b.kind === 'package') releasePackageBooking(b, 'reviewed'); else releaseBooking(b, 'reviewed');
-      released.push(b.id);
+      try {
+        if (b.kind === 'package') releasePackageBooking(b, 'reviewed'); else releaseBooking(b, 'reviewed');
+        released.push(b.id);
+      } catch (e) { console.error('[sweep] reviewed-release failed:', b.id, e.message); }
     }
     // v2.1.1 (audit #28): the 120-minute late-visit clock starts at the
     // FIRST on-site event (vitals / en-route / acceptance), not at
@@ -1131,14 +1350,6 @@ async function sweepAutoRelease() {
       }
     }
   }
-  // v2.1.0 — unread-critical SMS fallback pass: a critical notification
-  // still unread 10 minutes after creation gets one SMS attempt.
-  let fb = { attempted: 0, sent: 0 };
-  try {
-    fb = await notify.processSmsFallbacks();
-  } catch (e) {
-    console.error('[sweep] sms fallback pass failed:', e.message);
-  }
   // v2.1.1 (audit #5): weekly settlement records (records only).
   // v2.1.3 — release completed package days FIRST, so the week's
   // settlement records include them (settlePackageDays is idempotent:
@@ -1167,6 +1378,9 @@ router.get('/bootstrap', (req, res) => {
       riskLevel: s.riskLevel || 'standard',
       category: s.category || 'nursing',
       requiresDoctorOrder: s.requiresDoctorOrder === true,
+      // v2.1.13: nurse-only services (cannula + IV fluids) — assistants
+      // never see or accept them (enforced in radar + accept).
+      nurseOnly: s.nurseOnly === true,
       experience_bands: s.experience_bands || undefined,
       // v2.1.11 — physio_session carries its includes note (both
       // languages); the web app renders it under the service name.
@@ -1325,7 +1539,9 @@ router.get('/me/vouchers', requireAuth, (req, res) => {
 // the phone survives — that stale-flag gap is how the broadcast tab
 // sat at 0 devices with nobody able to see why.
 router.get('/me/devices', requireAuth, (req, res) => {
-  res.json({ ok: true, devices: notify.devicesFor(req.user.phone).length });
+  // v2.1.13 (L1): the count is ACTIVE devices only (a device with no
+  // successful send in 60 days is pruned from the count).
+  res.json({ ok: true, devices: notify.activeDeviceCount(req.user.phone) });
 });
 
 router.post('/me/devices', requireAuth, (req, res) => {
@@ -1621,6 +1837,31 @@ router.get('/me/documents', requireAuth, requireRole('provider'), (req, res) => 
   });
 });
 
+// v2.1.13 (M21): delete a document (owner only, before verification).
+// A document whose name matches a VERIFIED certificate/course entry
+// cannot be deleted — the verified entry is the proof of the credential.
+// Deleting also removes the mirrored UNVERIFIED cert/course entry with
+// the same name, refreshes the CV evaluation and recomputes points.
+// Replace = delete then re-upload (keeps the 10-file cap working).
+router.delete('/me/documents/:id', requireAuth, requireRole('provider'), (req, res) => {
+  const p = store.data.providers[req.user.providerId];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
+  const doc = (p.documents || []).find((d) => d.id === req.params.id);
+  if (!doc) return res.status(404).json({ error: 'not_found', message: 'Document not found.' });
+  const isVerifiedName = (list) => (list || []).some((c) => c.name === doc.name && c.verified === true);
+  if (isVerifiedName(p.certificates) || isVerifiedName(p.courses)) {
+    return res.status(409).json({ error: 'verified_document', message: 'This document is verified and cannot be deleted. Ask the admin to unverify it first.' });
+  }
+  p.documents = (p.documents || []).filter((d) => d.id !== doc.id);
+  if (doc.kind === 'certificate') p.certificates = (p.certificates || []).filter((c) => !(c.name === doc.name && !c.verified));
+  if (doc.kind === 'course') p.courses = (p.courses || []).filter((c) => !(c.name === doc.name && !c.verified));
+  refreshCvEvaluation(p);
+  recomputeProviderPoints(p);
+  store.audit('provider.document_deleted', req.user.phone, { providerId: p.id, docId: doc.id, kind: doc.kind, name: doc.name });
+  store.save();
+  res.json({ ok: true, documentId: doc.id, evaluation: p.cvEvaluation });
+});
+
 // Admin reads one uploaded document WITH content (admin only).
 router.get('/admin/providers/:id/documents/:docId', requireAdmin, (req, res) => {
   const p = store.data.providers[req.params.id];
@@ -1662,11 +1903,17 @@ router.post('/admin/applications/:id/approve', requireAdmin, (req, res) => {
   const p = store.data.providers[req.params.id];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
   if (p.status === 'verified') return bad(res, 409, 'This application is already approved (provider verified).');
+  // v2.1.13 (H14): approval requires a PASSED interview (a logged manual
+  // pass sets interviewStatus='passed' too) AND a licence on file — a
+  // provider must never be activated on documents alone.
+  if (p.interviewStatus !== 'passed') return res.status(409).json({ error: 'interview_required', message: 'Cannot approve: the provider has not passed the acceptance interview yet (interviewStatus must be passed).' });
+  if (!p.licenseHash && !p.licenseLast4) return res.status(409).json({ error: 'license_required', message: 'Cannot approve: no licence on file for this provider.' });
+  const reason = String(req.body?.reason || '').slice(0, 500) || null;
   p.status = 'verified';
   p.roleVerified = true;
   recomputeProviderPoints(p);
   refreshCvEvaluation(p);
-  store.audit('admin.application_approved', 'admin', { providerId: p.id, cvScore: p.cvEvaluation ? p.cvEvaluation.total : null, recommendation: p.cvEvaluation ? p.cvEvaluation.recommendation : null });
+  store.audit('admin.application_approved', 'admin', { providerId: p.id, reason, cvScore: p.cvEvaluation ? p.cvEvaluation.total : null, recommendation: p.cvEvaluation ? p.cvEvaluation.recommendation : null });
   store.save();
   res.json(applicationView(p));
 });
@@ -1680,6 +1927,20 @@ router.post('/admin/applications/:id/reject', requireAdmin, (req, res) => {
   p.rejectionReason = reason;
   p.rejectedAt = nowIso();
   store.audit('admin.application_rejected', 'admin', { providerId: p.id, reason, cvScore: p.cvEvaluation ? p.cvEvaluation.total : null });
+  store.save();
+  res.json(applicationView(p));
+});
+
+// v2.1.13 (H16): admin reopens a REJECTED application back to pending
+// (the provider can then re-register with updated documents).
+router.post('/admin/applications/:id/reopen', requireAdmin, (req, res) => {
+  const p = store.data.providers[req.params.id];
+  if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
+  if (p.status !== 'rejected') return bad(res, 409, `Only a rejected application can be reopened (status is ${p.status}).`);
+  p.status = 'pending';
+  p.rejectionReason = null;
+  p.rejectedAt = null;
+  store.audit('admin.application_reopened', 'admin', { providerId: p.id });
   store.save();
   res.json(applicationView(p));
 });
@@ -1835,8 +2096,8 @@ router.get('/monitor/summary', (req, res) => {
     if (!['released', 'auto_released'].includes(b.status)) continue;
     const holdOpen = b.complaintStatus === 'open' || b.circumventionHold;
     const windowOpen = b.complaintDeadline && Date.now() < new Date(b.complaintDeadline).getTime() && b.complaintStatus !== 'rejected';
-    if (holdOpen || windowOpen) hold += b.providerShareEgp || 0;
-    else if (b.cashCollectedByProvider) provOwes += b.appShareEgp || 0;
+    if (holdOpen || windowOpen) hold += isCashBooking(b) ? Math.abs(cashNetEgp(b)) : (b.providerShareEgp || 0);
+    else if (isCashBooking(b)) { const net = cashNetEgp(b); if (net >= 0) provOwes += net; else appOwes += -net; }
     else appOwes += b.providerShareEgp || 0;
   }
   for (const b of bookings) {
@@ -2199,6 +2460,10 @@ router.post('/auth/login-phone', (req, res) => {
   } else {
     requiresPassword = true;
   }
+  // v2.1.13 (M23): a login refreshes an expired TEMPORARY suspension —
+  // if suspendedUntil has passed, the suspension is cleared (audited)
+  // and the provider is unblocked. A permanent ban never expires.
+  if (provider) refreshSuspension(provider);
   // v2.1.10: password logins get a 30-day refresh (the password
   // verifies the caller, so the v2.1.6 C1 interim no longer applies);
   // legacy phone-only logins keep the SHORT 24h refresh until OTP
@@ -2321,6 +2586,11 @@ function normalizeBookingBody(raw) {
   b.surgeryType = b.surgeryType || b.operation || null;
   b.dressingSchedule = b.dressingSchedule || b.schedule || null;
   b.licenseNo = b.licenseNo || b.licence || null;
+  // v2.1.13 (H6): the web frontend sends the long field names — map
+  // them to the server's canonical short ones, and keep payerRole.
+  b.policyNo = b.policyNo || b.policyNumber || null;
+  b.passportNo = b.passportNo || b.passportNumber || null;
+  b.payerRole = b.payerRole || null;
   if (Array.isArray(b.certificates)) b.certificates = b.certificates.map((c) => (typeof c === 'string' ? c : c.name)).filter(Boolean);
   return b;
 }
@@ -2355,7 +2625,11 @@ function validateBookingInput(b) {
   if (b.patientName && typeof b.patientName === 'string' && b.patientName.length > 120) return { status: 400, error: 'validation_error', message: 'patientName is too long (max 120 characters).' };
   if (b.notes && String(b.notes).length > 1000) return { status: 400, error: 'validation_error', message: 'notes are too long (max 1000 characters).' };
   if (b.address && String(b.address).length > 300) return { status: 400, error: 'validation_error', message: 'address is too long (max 300 characters).' };
-  if (b.scheduledAt && !validScheduledAt(b.scheduledAt)) return { status: 400, error: 'validation_error', message: 'scheduledAt must be a valid date.' };
+  if (b.scheduledAt && !validScheduledAt(b.scheduledAt)) return { status: 400, error: 'validation_error', message: 'scheduledAt must be a valid date, not in the past.' };
+  // v2.1.13 (M5): a home visit needs an address — enforced only when
+  // the client explicitly says locMode is 'home' (older clients that
+  // do not send locMode are unaffected).
+  if (b.locMode === 'home' && (!b.address || !String(b.address).trim())) return { status: 400, error: 'validation_error', message: 'address is required for a home visit (locMode=home).' };
   if (b.triage && b.triage.dangerSigns !== undefined && !Array.isArray(b.triage.dangerSigns)) return { status: 400, error: 'validation_error', message: 'triage.dangerSigns must be an array.' };
   return null;
 }
@@ -2433,7 +2707,9 @@ router.post('/bookings', requireAuth, requireRole('patient'), (req, res) => {
   // v2.0.9 — auto-apply one loyalty voucher when the booking is >= 300 EGP.
   // The provider's share is computed on the FULL price at release; the
   // app funds the 50 EGP discount (see releaseBooking).
-  const vou = findVoucher(req.user.phone, priced.totalEgp);
+  // v2.1.13: the client may decline the voucher (useVoucher=false);
+  // by default it applies.
+  const vou = b.useVoucher === false ? null : findVoucher(req.user.phone, priced.totalEgp);
   const booking = {
     id, kind: 'standard', patientPhone: req.user.phone, patientName: capStr(b.patientName, 120),
     serviceCode: b.serviceCode, serviceName: cat.SERVICES[b.serviceCode].name_en,
@@ -2443,12 +2719,16 @@ router.post('/bookings', requireAuth, requireRole('patient'), (req, res) => {
     night: isNight(b.scheduledAt),
     status: 'held', // escrow: money held in-app from booking
     amountEgp: priced.totalEgp, baseEgp: priced.baseEgp, distanceFeeEgp: priced.distanceFeeEgp,
+    // v2.1.13 (M33): commission base = service only; the distance fee
+    // is pass-through, kept in full by the provider.
+    commissionBaseEgp: priced.baseEgp, passThroughEgp: priced.distanceFeeEgp,
     voucherId: vou ? vou.id : null, voucherDiscountEgp: vou ? vou.amountEgp : 0,
     amountPayableEgp: vou ? priced.totalEgp - vou.amountEgp : priced.totalEgp,
     distanceKm: priced.distanceKm, distanceBand: priced.band, distanceEstimate: true,
     transport: b.transport || 'none', hotelId: b.hotelId || null,
     currency: 'EGP', amountForeign: null, fxRate: null,
     paymentMethod: b.paymentMethod, respectCharterAccepted: true,
+    payerRole: b.payerRole || null, // v2.1.13 (H6)
     termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
     // v2.1.0 — doctor's order (required for high-risk services + suture
     // removal; recorded for catheter insertion and any other service that
@@ -2469,7 +2749,8 @@ router.post('/bookings', requireAuth, requireRole('patient'), (req, res) => {
     circumventionHold: false, circumventionReportId: null,
     complaintStatus: null, complaintDeadline: null, complaintAt: null, complaintResolvedAt: null,
     settleableAt: null, cancelledAt: null, refundedAt: null, refundEgp: null,
-    cashCollectedByProvider: false, overdue: false,
+    cashCollectedByProvider: b.paymentMethod === 'cash_receipt', // v2.1.13 (B1): cash derives from the payment method
+    overdue: false,
     createdAt: nowIso(), acceptedAt: null, providerConfirmedAt: null,
     patientConfirmedAt: null, reviewedAt: null, releasedAt: null, releaseMode: null,
   };
@@ -2525,29 +2806,43 @@ router.post('/bookings/:id/cancel', requireAuth, requireRole('patient'), (req, r
     if (beforeStart) {
       b.refundEgp = refundAmount(b);
     } else {
-      // v2.1.3 — refund exactly what was NOT worked: what the patient
-      // paid minus the logged days at their logged rates (the 26th day
-      // absorbs the rounding remainder, so this is exact to the pound).
-      const workedGross = (b.daysLog || []).reduce((s, d) => s + (d.rateEgp || 0), 0);
-      b.refundEgp = Math.max(0, refundAmount(b) - workedGross);
+      // v2.1.13 (B3): refund exactly what was NOT worked — the
+      // unreleased remainder (packageRefundRemaining counts RELEASED
+      // days only, so a day under packageReviewRequired is never
+      // deducted: its release never happened).
+      b.refundEgp = packageRefundRemaining(b);
     }
     b.refundedAt = nowIso();
+    // v2.1.13 (B2/M30): the unreleased refunded amount becomes a
+    // reversing adjustment (for a cash package the provider holds the
+    // cash, so the full refund is owed back to the app; for a non-cash
+    // package the adjustment is a record with no financial effect —
+    // the refund comes out of escrow) and any voucher is restored.
+    if (b.providerId) createSettlementAdjustment(b.providerId, b, 'package_cancel', { providerShareEgp: 0, appShareEgp: 0, refundEgp: b.refundEgp, settledProviderShareEgp: 0 });
+    restoreVoucher(b);
     store.audit('booking.cancelled', req.user.phone, { bookingId: b.id, kind: 'package', refundEgp: b.refundEgp, beforeStart });
     store.save();
     res.json({ ...pubBooking(req, b, { includePaymentNumber: false }), note: beforeStart ? 'Cancelled before the package start date — the full held amount is refunded.' : 'Cancelled after the start — the remaining days are refunded at the package daily rate.' });
     return;
   }
-  const deadline = new Date(b.createdAt).getTime() + config.cancelWindowMs;
-  if (Date.now() > deadline) {
-    return res.status(409).json({ error: 'cancel_window_closed', message: 'Cancellation is only allowed within 15 minutes of booking. The 15-minute window has passed.', cancelDeadline: new Date(deadline).toISOString() });
+  // v2.1.13 (B4): a PENDING booking (held, not yet accepted) can be
+  // cancelled at any time — the 15-minute window applies only once a
+  // provider has accepted. A pending booking has no provider yet, so
+  // cancelling it costs nobody anything.
+  if (b.status === 'accepted') {
+    const deadline = new Date(b.createdAt).getTime() + config.cancelWindowMs;
+    if (Date.now() > deadline) {
+      return res.status(409).json({ error: 'cancel_window_closed', message: 'Cancellation is only allowed within 15 minutes of booking once a provider has accepted. The 15-minute window has passed.', cancelDeadline: new Date(deadline).toISOString() });
+    }
   }
   b.status = 'cancelled';
   b.cancelledAt = nowIso();
   b.refundEgp = refundAmount(b); // full refund of what the patient actually paid (after any voucher discount)
   b.refundedAt = nowIso();
+  restoreVoucher(b); // v2.1.13 (M30): a cancelled booking's voucher goes back to the patient
   store.audit('booking.cancelled', req.user.phone, { bookingId: b.id, refundEgp: b.refundEgp, wasAccepted: !!b.providerId });
   store.save();
-  res.json({ ...pubBooking(req, b, { includePaymentNumber: false }), note: 'Cancelled within the 15-minute window — the full held amount is refunded.' });
+  res.json({ ...pubBooking(req, b, { includePaymentNumber: false }), note: b.providerId ? 'Cancelled within the 15-minute window — the full held amount is refunded.' : 'Cancelled before any provider accepted — the full held amount is refunded.' });
 });
 
 router.post('/bookings/:id/confirm-patient', requireAuth, requireRole('patient'), (req, res) => {
@@ -2577,8 +2872,11 @@ router.post('/bookings/:id/review', requireAuth, requireRole('patient'), (req, r
   // an admin circumvention report and HOLDS this booking's release for
   // manual review — exactly like an open complaint.
   const circumventionReported = req.body?.circumventionReported;
-  if (circumventionReported !== undefined && typeof circumventionReported !== 'boolean') {
-    return bad(res, 400, 'circumventionReported must be true or false.');
+  // v2.1.13 (M27): the anti-circumvention question is REQUIRED — a
+  // review without an answer is rejected (the old code only validated
+  // it when present, so reviews silently skipped the question).
+  if (typeof circumventionReported !== 'boolean') {
+    return bad(res, 400, 'circumventionReported is required and must be true or false.');
   }
   b.review = { rating, comment: String(req.body?.comment || '').slice(0, 1000), at: nowIso(), circumventionReported: circumventionReported === true };
   b.status = 'reviewed';
@@ -2672,6 +2970,18 @@ router.post('/bookings/:id/safety-report', requireAuth, (req, res) => {
   }
   store.audit('booking.safety_report', req.user.phone, { bookingId: b.id, type });
   store.save();
+  // v2.1.13 (H8): complaints and safety reports reach the ADMIN too —
+  // in-app + push to the admin phone (fire-and-forget, never blocks).
+  if (type === 'complaint' || type === 'safety') {
+    notifyAdmin({
+      type: 'safety_report', critical: true,
+      titleAr: type === 'complaint' ? 'شكوى جديدة' : 'بلاغ سلامة جديد',
+      titleEn: type === 'complaint' ? 'New complaint' : 'New safety report',
+      bodyAr: `حجز ${b.id} — ${desc.slice(0, 120)}`,
+      bodyEn: `Booking ${b.id}`,
+      data: { bookingId: b.id, reportId: report.id, reportType: type },
+    });
+  }
   res.status(201).json({ ok: true, reportId: report.id, complaintDeadline: b.complaintDeadline || null, note: type === 'complaint' ? 'Complaint recorded — automatic release is paused until admin review. You have 24 hours from service completion to complain; after admin review an accepted complaint is refunded in full.' : 'Report recorded for admin review.' });
 });
 
@@ -2685,12 +2995,22 @@ router.post('/bookings/:id/sos', requireAuth, (req, res) => {
   // v2.1.1 (M11): SOS is capped at 5/day per booking.
   const sosDayKey = `${b.id}:${new Date().toISOString().slice(0, 10)}`;
   const sosDaily = store.data.sosDaily || (store.data.sosDaily = {});
-  if ((sosDaily[sosDayKey] || 0) >= 5) return res.status(429).json({ error: 'rate_limited', message: 'Too many SOS alerts for this booking today (max 5).' });
+  if ((sosDaily[sosDayKey] || 0) >= 5) return res.status(429).json({ error: 'rate_limited', message: 'Too many SOS alerts for this booking today (max 5). If this is an emergency, call the ambulance — اتصل بالإسعاف 123.' });
   sosDaily[sosDayKey] = (sosDaily[sosDayKey] || 0) + 1;
   const alert = { id: newId('sos'), bookingId: b.id, phone: req.user.phone, role: req.user.role, at: nowIso(), status: 'open' };
   store.data.sos.push(alert);
   store.audit('sos.raised', req.user.phone, { bookingId: b.id });
   store.save();
+  // v2.1.13 (B5): SOS must reach the ADMIN — in-app + push to the
+  // admin phone (fire-and-forget, never blocks the response).
+  notifyAdmin({
+    type: 'sos', critical: true,
+    titleAr: 'تنبيه SOS — طوارئ',
+    titleEn: 'SOS alert — emergency',
+    bodyAr: `SOS من ${req.user.role === 'provider' ? 'مقدم الخدمة' : 'المريض'} — حجز ${b.id}`,
+    bodyEn: `SOS from ${req.user.role} — booking ${b.id}`,
+    data: { bookingId: b.id, sosId: alert.id },
+  });
   res.status(201).json({ ok: true, sosId: alert.id, message: 'SOS alert sent to admin immediately.' });
 });
 
@@ -2731,10 +3051,26 @@ router.post('/bookings/:id/messages', requireAuth, (req, res) => {
   res.status(201).json({ id: msg.id, senderRole: msg.senderRole, text: msg.text, at: msg.at });
 });
 
+// v2.1.13 (M28): admin read-only view of a booking's chat (moderation
+// / dispute review) — the admin can read the thread without being a
+// party to the booking.
+router.get('/admin/bookings/:id/messages', requireAdmin, (req, res) => {
+  const b = store.data.bookings[req.params.id];
+  if (!b) return res.status(404).json({ error: 'not_found', message: 'Booking not found.' });
+  const list = (store.data.messages[b.id] || []).map((m) => ({ id: m.id, senderRole: m.senderRole, text: m.text, at: m.at }));
+  res.json({ bookingId: b.id, messages: list, count: list.length });
+});
+
 router.post('/bookings/:id/cash-collected', requireAuth, requireRole('provider'), (req, res) => {
   const b = loadBooking(req, res);
   if (!b) return;
   if (b.providerId !== req.user.providerId) return res.status(403).json({ error: 'forbidden', message: 'Not your booking.' });
+  // v2.1.13 (B1): this endpoint is a MANUAL override for cash bookings
+  // only — a non-cash booking can never be marked cash-collected (cash
+  // is derived from the payment method at creation).
+  if (b.paymentMethod !== 'cash_receipt') {
+    return bad(res, 400, 'This booking was not paid in cash — only cash_receipt bookings can be marked cash-collected.');
+  }
   const blockedCash = providerBlocked(store.data.providers[req.user.providerId]);
   if (blockedCash) return res.status(403).json({ error: 'forbidden', message: blockedCash });
   if (!['released', 'auto_released'].includes(b.status)) {
@@ -2767,7 +3103,7 @@ router.post('/jobs/sweep', requireAdmin, async (req, res) => {
 // assessment visit" was deliberately NOT built: the patient can already
 // book a standard visit themselves and mention the package in the notes;
 // there is no admin-creates-booking path to build it on.
-function normalizePackageRequest(raw) {
+function normalizePackageRequest(raw, req) {
   const b = raw || {};
   return {
     packageType: String(b.packageType || '').trim(),
@@ -2779,7 +3115,10 @@ function normalizePackageRequest(raw) {
     // Currency of the quote: EGP for local packages; USD/EUR for
     // tourist residence packages (default USD).
     currency: String(b.currency || '').trim().toUpperCase() || null,
-    patientName: String(b.patientName || '').trim(),
+    // v2.1.13 (B6): the patient's name falls back to the account name,
+    // then the phone — the request no longer fails when the form omits
+    // a field the account already knows.
+    patientName: String(b.patientName || req?.user?.name || req?.user?.phone || '').trim(),
     condition: String(b.condition || '').trim(),
     conditionItems: Array.isArray(b.conditionItems) ? b.conditionItems.map((x) => String(x).trim()).filter(Boolean) : [],
     diagnosis: String(b.diagnosis || '').trim(),
@@ -2798,7 +3137,7 @@ function publicPackageRequest(r) { return r ? { ...r } : null; }
 // is required, like every booking.
 router.post('/package-requests', requireAuth, requireRole('patient'), (req, res) => {
   if (!termsAccepted(req.body)) return termsError(res);
-  const f = normalizePackageRequest(req.body);
+  const f = normalizePackageRequest(req.body, req);
   const pkg = packageTypeOf(f.packageType);
   if (!pkg) return bad(res, 400, 'packageType must be one of: ' + [...Object.keys(cat.MONTHLY_PACKAGES), ...Object.keys(cat.TOURIST_PACKAGES)].join(', '));
   const family = packageFamily(pkg);
@@ -2827,6 +3166,13 @@ router.post('/package-requests', requireAuth, requireRole('patient'), (req, res)
   // + condition + mobility + level needed.
   if (f.packageType.startsWith('package_elderly_') && !f.treatment) return bad(res, 400, 'treatment (medications) is required for elderly packages — the final price depends on it.');
   if (!f.patientName || f.patientName.length > 120) return bad(res, 400, 'patientName required (max 120 characters).');
+  // v2.1.13 (H7): a non-empty conditionItems array is an alternative to
+  // the condition text — the server synthesises the text from the items'
+  // Arabic labels, so the request never fails for a missing free-text
+  // condition. (Invalid items are still rejected by the check below.)
+  if (!f.condition && f.conditionItems.length) {
+    f.condition = f.conditionItems.map((c) => (cat.PACKAGE_CONDITIONS.find((x) => x.code === c) || {}).name_ar || c).join('، ');
+  }
   if (!f.condition || f.condition.length > 500) return bad(res, 400, 'condition required (what the patient suffers from, max 500 characters).');
   const badCond = f.conditionItems.filter((c) => !cat.PACKAGE_CONDITIONS.some((x) => x.code === c));
   if (badCond.length) return bad(res, 400, 'Unknown condition item: ' + badCond.join(', '));
@@ -2924,6 +3270,10 @@ router.post('/admin/package-requests/:id/quote', requireAdmin, (req, res) => {
   const totalEgp = finalPriceEgp + extraDaysPriceEgp;
   r.quote = {
     packageType: pkg.code, level: pkg.level, currency,
+    // v2.1.13 (L18): the FX rate is LOCKED at offer creation — the
+    // acceptance uses this rate, never a fresh lookup (the rate may
+    // have moved between quote and accept).
+    fxRate: fx,
     finalPrice, finalPriceEgp,
     extraDays: { option: extraDaysOption, days: extraDaysOption === 'none' ? 0 : cat.PACKAGE_OFF_DAYS, dailyRate: extraDaysOption === 'none' ? 0 : extraDailyRate, dailyRateEgp: extraDaysOption === 'none' ? 0 : Math.round(extraDailyRate * fx), price: extraDaysPrice, priceEgp: extraDaysPriceEgp, premiumWaived: extraDaysOption === 'overtime' ? waived : false },
     total, totalEgp, providerId, substituteProviderId,
@@ -2970,7 +3320,9 @@ router.post('/package-requests/:id/accept', requireAuth, requireRole('patient'),
   if (packageFamily(pkg) === 'tourist' && !touristCompatible(p)) return bad(res, 409, 'The assigned provider is not tourist-compatible (interview + in-app English test).');
   const pct = effectiveCommissionPct(p.tier);
   const currency = r.quote.currency || r.currency || 'EGP';
-  const fx = packageFxRate(currency);
+  // v2.1.13 (L18): use the rate LOCKED at quote time (fall back to a
+  // fresh lookup only for quotes written before v2.1.13).
+  const fx = r.quote.fxRate || packageFxRate(currency);
   const total = r.quote.total;
   const totalEgp = r.quote.totalEgp;
   const startDate = r.startDate;
@@ -3222,15 +3574,52 @@ router.post('/bookings/:id/package-complete', requireAuth, requireRole('provider
 module.exports = { router, sweepAutoRelease };
 
 // ---------------------------------------------------------------- providers
+// v2.1.13 (H17): Egyptian national-ID structure — 14 digits: first
+// digit 2 (born 1900s) or 3 (born 2000s); digits 2–7 a valid birthdate
+// (YYMMDD, leap years included); digits 8–9 a governorate code 01–27
+// or 88 (born abroad).
+function validEgyptianNationalId(id) {
+  if (!/^\d{14}$/.test(id)) return false;
+  const century = id[0] === '2' ? 1900 : id[0] === '3' ? 2000 : null;
+  if (century == null) return false;
+  const yy = Number(id.slice(1, 3)), mm = Number(id.slice(3, 5)), dd = Number(id.slice(5, 7));
+  if (mm < 1 || mm > 12 || dd < 1) return false;
+  if (dd > new Date(century + yy, mm, 0).getDate()) return false;
+  const gov = Number(id.slice(7, 9));
+  return (gov >= 1 && gov <= 27) || gov === 88;
+}
+// Uniqueness across providers. Hashes are salted, so comparison goes
+// through matchesSaltedHash (legacy plain-sha256 hashes are handled by
+// the same helper). `exceptId` excludes the provider's own record, so a
+// re-registration is not blocked by its own previous values.
+function duplicateNationalId(nationalId, exceptId) {
+  return Object.values(store.data.providers).some((x) => x.id !== exceptId && x.nationalIdHash && matchesSaltedHash(nationalId, x.nationalIdHash));
+}
+function duplicateLicense(licenseNo, exceptId) {
+  return Object.values(store.data.providers).some((x) => x.id !== exceptId && x.licenseHash && matchesSaltedHash(licenseNo, x.licenseHash));
+}
 router.post('/providers/register', requireAuth, (req, res) => {
   const b = normalizeBookingBody(req.body);
-  if (store.getProviderByPhone(req.user.phone)) {
+  const existing = store.getProviderByPhone(req.user.phone);
+  // v2.1.13 (H16): a REJECTED application may re-register — the record
+  // is reset to pending and the submitted fields updated, but the
+  // interview record is KEPT (no interview re-take is needed).
+  const reregistering = existing && existing.status === 'rejected';
+  if (existing && !reregistering) {
     return res.status(409).json({ error: 'conflict', message: 'This phone is already registered as a provider.' });
   }
   // v2.0.8 — Terms & Conditions (incl. the non-circumvention clause)
   // must be accepted with the current version before registration.
   if (!termsAccepted(req.body)) return termsError(res);
+  // v2.1.13 (M19): the body claim is not enough — the SERVER must hold
+  // a terms record for this phone (recorded by POST /api/me/terms, or
+  // by /auth/register). A client that only claims acceptance is refused.
+  const userRec = store.data.users[req.user.phone];
+  if (!userRec || userRec.termsAcceptedVersion !== config.termsVersion) {
+    return bad(res, 400, 'Terms & Conditions must be accepted in the app first (POST /api/me/terms) before registering as a provider.');
+  }
   if (!b.name || typeof b.name !== 'string') return bad(res, 400, 'name required.');
+  if (b.name.trim().length < 2) return bad(res, 400, 'name must be at least 2 characters.'); // v2.1.13 (L10)
   if (b.name.length > 120) return bad(res, 400, 'name is too long (max 120 characters).');
   // v2.1.1: providerType is validated against an allowlist; role is
   // provisional until admin verification sets the verified role.
@@ -3239,8 +3628,11 @@ router.post('/providers/register', requireAuth, (req, res) => {
   if (isReservedId(String(providerType))) return bad(res, 400, 'Invalid providerType.');
   const nationalId = String(b.nationalId || '');
   const licenseNo = String(b.licenseNo || '');
-  if (!/^\d{14}$/.test(nationalId)) return bad(res, 400, 'nationalId must be 14 digits.');
+  if (!validEgyptianNationalId(nationalId)) return bad(res, 400, 'nationalId must be a valid Egyptian national ID (14 digits: first digit 2 or 3, valid birthdate, governorate code 01–27 or 88).');
   if (!licenseNo || licenseNo.length < 4) return bad(res, 400, 'licenseNo required.');
+  // v2.1.13 (H17): a national ID / licence may belong to ONE provider.
+  if (duplicateNationalId(nationalId, reregistering ? existing.id : null)) return res.status(409).json({ error: 'conflict', message: 'This national ID is already registered to another provider.' });
+  if (duplicateLicense(licenseNo, reregistering ? existing.id : null)) return res.status(409).json({ error: 'conflict', message: 'This licence number is already registered to another provider.' });
   // Certificates / courses are metadata at registration ({name,
   // verified:false} until admin verifies them). The REAL files are
   // uploaded after registration via POST /api/me/documents (v2.1.2)
@@ -3266,6 +3658,35 @@ router.post('/providers/register', requireAuth, (req, res) => {
   const languageCertificates = Array.isArray(b.languageCertificates)
     ? b.languageCertificates.filter((l) => l && l.language).map((l) => ({ language: String(l.language).toLowerCase().slice(0, 10), certificateName: String(l.certificateName || l.name || '').slice(0, 200), verified: false })).slice(0, 5)
     : extraLanguages.filter((l) => l.certified).map((l) => ({ language: l.language, certificateName: '', verified: false }));
+  if (reregistering) {
+    // v2.1.13 (H16): reset to pending, update the submitted fields,
+    // clear the rejection — but KEEP the interview record
+    // (store.data.interviews + interviewStatus/Score/Points), the
+    // joined date and the points history.
+    Object.assign(existing, {
+      name: b.name.trim().slice(0, 120), role: providerType, providerType,
+      status: 'pending', rejectionReason: null, rejectedAt: null,
+      nationalIdHash: saltedSha256(nationalId), nationalIdLast4: nationalId.slice(-4),
+      licenseHash: saltedSha256(licenseNo), licenseLast4: licenseNo.slice(-4),
+      certificates, courses, languageCertificates, extraLanguages, claimedLanguages,
+      termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
+    });
+    recordTermsAcceptance(req.user.phone);
+    recomputeProviderPoints(existing);
+    refreshCvEvaluation(existing);
+    store.audit('provider.reregistered', req.user.phone, { providerId: existing.id, role: providerType, providerType });
+    store.save();
+    notifyAdmin({
+      type: 'provider_application', titleAr: 'طلب تسجيل مقدم خدمة جديد',
+      titleEn: 'New provider application',
+      bodyAr: `${existing.name} — ${providerType} (إعادة تسجيل)`,
+      bodyEn: `${existing.name} — ${providerType} (re-registration)`,
+      data: { providerId: existing.id },
+    });
+    const { refreshTtlDays, authMethod } = authMethodForPhone(req.user.phone);
+    const tokens = issueTokens({ phone: req.user.phone, role: 'provider', providerId: existing.id }, undefined, { refreshTtlDays, authMethod });
+    return res.status(200).json({ ...store.publicProvider(existing, { self: true, points: existing.points }), next: 'Take the 36-question interview: POST /api/providers/interview/start', tokens: { ...tokens, token: tokens.accessToken, role: 'provider', providerId: existing.id, phone: req.user.phone, authMethod } });
+  }
   const id = newId('prov');
   const p = {
     id, demo: false, phone: req.user.phone, name: b.name.trim().slice(0, 120), role: providerType, providerType,
@@ -3292,6 +3713,14 @@ router.post('/providers/register', requireAuth, (req, res) => {
   refreshCvEvaluation(p);
   store.audit('provider.registered', req.user.phone, { providerId: id, role: providerType, providerType });
   store.save();
+  // v2.1.13 (H10): a new provider application reaches the ADMIN too.
+  notifyAdmin({
+    type: 'provider_application', titleAr: 'طلب تسجيل مقدم خدمة جديد',
+    titleEn: 'New provider application',
+    bodyAr: `${p.name} — ${providerType}`,
+    bodyEn: `${p.name} — ${providerType}`,
+    data: { providerId: id },
+  });
   // v2.1.8 — return fresh provider-role tokens with the response, so
   // the client switches to the provider role WITHOUT re-logging in
   // (re-login would need the password the client does not store).
@@ -3332,6 +3761,9 @@ router.get('/providers/radar', requireAuth, requireRole('provider'), (req, res) 
       // bookings on the radar (they cannot accept them — enforced at
       // accept time too). Nurses and doctors see everything.
       && !(p.providerType === 'assistant' && cat.isHighRiskService(b.serviceCode))
+      // v2.1.13 (nurse-only): cannula + IV fluids are nurse-only —
+      // assistants never see them on the radar either.
+      && !(p.providerType === 'assistant' && cat.isNurseOnlyService(b.serviceCode))
       // v2.1.1 — physio-category services ONLY to providerType 'physio'.
       && !(b.category === 'physio' && p.providerType !== 'physio')
       // v2.1.2 — tourist bookings ONLY to providers who passed the
@@ -3385,9 +3817,12 @@ router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, 
   // until the admin confirms or rejects it. v2.1.6 (C6): an online
   // booking with NO receipt at all is blocked the same way.
   if (receiptBlocked(b)) {
+    const rec = b.receipt;
     const msg = receiptPending(b)
       ? 'This booking has a receipt photo under admin review — it cannot be accepted until the admin confirms or rejects the receipt.'
-      : 'This booking has an online payment with no receipt photo — it cannot be accepted until the patient uploads a receipt.';
+      : (rec && rec.status === 'rejected'
+        ? 'The receipt photo for this booking was rejected by the admin — it cannot be accepted until the patient uploads a new receipt.'
+        : 'This booking has an online payment with no receipt photo — it cannot be accepted until the patient uploads a receipt.');
     return res.status(403).json({ error: 'receipt_pending_review', message: msg });
   }
   if (b.category === 'physio' && p.providerType !== 'physio') {
@@ -3396,6 +3831,14 @@ router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, 
   // v2.0.8 — a suspended / banned provider cannot accept work.
   const blocked = providerBlocked(p);
   if (blocked) return res.status(403).json({ error: 'forbidden', message: blocked });
+  // v2.1.13 (nurse-only): cannula + IV fluids are for nurses (or
+  // doctors) only — assistants cannot accept them, enforced here and
+  // hidden from them on the radar.
+  if (cat.isNurseOnlyService(b.serviceCode)) {
+    if (p.role !== 'nurse' && p.role !== 'doctor') {
+      return res.status(403).json({ error: 'forbidden', message: 'Cannula + IV fluids can only be accepted by a verified nurse (or doctor). Nursing assistants cannot take this booking.' });
+    }
+  }
   // v2.1.0 — high-risk tier (owner refinement 26 Nov 2026): only VERIFIED
   // nurses (or doctors) may accept high-risk bookings. Nursing assistants
   // cannot — enforced here, and the radar hides these bookings from them.
@@ -3432,9 +3875,10 @@ router.post('/bookings/:id/accept', requireAuth, requireRole('provider'), (req, 
     b.launchOffer = null;
   }
   // v2.1.1 (audit M7): ESTIMATED provider share at accept time, so the
-  // wallet shows a pending amount before release (release recomputes
-  // exactly).
-  b.estimatedProviderShareEgp = Math.round((offerRef != null ? offerRef : b.amountEgp) * (1 - b.commissionPct / 100));
+  // wallet shows a pending amount before release. Computed with the
+  // SAME formula releaseBooking uses (sharesFor, v2.1.13 M33) so the
+  // estimate and the release always agree.
+  b.estimatedProviderShareEgp = sharesFor(b, b.commissionPct).providerShareEgp;
   b.status = 'accepted';
   b.acceptedAt = nowIso();
   store.audit('booking.accepted', req.user.phone, { bookingId: b.id, providerId: p.id, commissionPct: b.commissionPct, promoApplied: !!promoNow, launchOfferApplied: offerRef != null, launchOfferReferenceEgp: offerRef });
@@ -3592,8 +4036,8 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
       let direction, amountEgp;
       if (holdOpen || windowOpen) {
         direction = 'complaint_hold';
-        amountEgp = b.cashCollectedByProvider ? (rel.appShareEgp || 0) : (rel.providerShareEgp || 0);
-      } else if (b.cashCollectedByProvider) { direction = 'provider_owes_app'; amountEgp = rel.appShareEgp || 0; }
+        amountEgp = isCashBooking(b) ? (rel.appShareEgp || 0) : (rel.providerShareEgp || 0);
+      } else if (isCashBooking(b)) { direction = 'provider_owes_app'; amountEgp = rel.appShareEgp || 0; }
       else { direction = 'app_owes_provider'; amountEgp = rel.providerShareEgp || 0; }
       if (p.permanentBan && ['app_owes_provider', 'complaint_hold'].includes(direction)) { direction = 'forfeited'; amountEgp = 0; }
       ledger.push({
@@ -3641,10 +4085,15 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
       const windowOpen = b.complaintDeadline && nowMs < new Date(b.complaintDeadline).getTime() && b.complaintStatus !== 'rejected';
       if (holdOpen || windowOpen) {
         // Provisionally released, but held for the complaint window.
+        // Cash: the held amount is the settlement NET (what will move
+        // either way once the window closes).
         direction = 'complaint_hold';
-        amountEgp = b.cashCollectedByProvider ? (b.appShareEgp || 0) : (b.providerShareEgp || 0);
-      } else if (b.cashCollectedByProvider) { direction = 'provider_owes_app'; amountEgp = b.appShareEgp || 0; }
-      else { direction = 'app_owes_provider'; amountEgp = b.providerShareEgp || 0; }
+        amountEgp = isCashBooking(b) ? Math.abs(cashNetEgp(b)) : (b.providerShareEgp || 0);
+      } else if (isCashBooking(b)) {
+        const net = cashNetEgp(b);
+        if (net >= 0) { direction = 'provider_owes_app'; amountEgp = net; }
+        else { direction = 'app_owes_provider'; amountEgp = -net; }
+      } else { direction = 'app_owes_provider'; amountEgp = b.providerShareEgp || 0; }
     } else if (pending) {
       // v2.0.8 — a circumvention hold keeps the money in the hold bucket.
       // v2.1.1 (M7): pending lines show the ESTIMATED share computed at
@@ -3693,7 +4142,9 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
   // v2.1.1 — points snapshot + 90-day stay bonus + buddy + days since join.
   const pts = recomputeProviderPoints(p, { auditTier: false });
   const stay = stayBonusState(p);
-  const stayDue = stay.earned && !stay.paid ? cat.STAY_BONUS_EGP : 0;
+  // v2.1.13 (L19): the stay bonus shows as due only while it is neither
+  // paid NOR already allocated in a generated settlement.
+  const stayDue = stay.earned && !stay.paid && !stay.allocated ? cat.STAY_BONUS_EGP : 0;
   totals.stayBonusEgp = stayDue;
   if (stayDue > 0) totals.appOwesProviderEgp += stayDue;
   const buddy = p.buddyId ? store.data.providers[p.buddyId] : null;
@@ -3721,38 +4172,55 @@ router.get('/providers/wallet', requireAuth, requireRole('provider'), (req, res)
 
 // ---------------------------------------------------------------- interview (v2.1.1)
 // Expanded interview (owner-approved 26 Nov 2026, INTERVIEW-EXPANDED-
-// PROPOSAL.md): FIXED 30 common questions + 6 role-specific questions
-// (assistant / nurse / doctor / physio) = 36 per attempt, 30 minutes.
-// Dimensions: medical 8 / ethics 7 / safety 6 / communication 6 /
-// resilience 5 / conduct 4. Pass: total >= 24 AND medical >= 5 AND
+// PROPOSAL.md): 30 minutes. Pass: total >= 24 AND medical >= 5 AND
 // ethics >= 5 AND safety >= 4 AND no red flag. Manual review: total
 // 21–23, or a mandatory minimum missed by exactly 1, or any dimension
 // 0–1. Fail: total < 21 or a minimum missed by > 1. Red flag: any of
-// the 10 dangerous options -> instant fail ('red-flag') whatever the
+// the 13 dangerous options -> instant fail ('red-flag') whatever the
 // score. Retakes: normal fail -> +7 days, max 3 attempts then
 // admin-only; red flag -> +14 days AND admin approval before a new
 // attempt; 2nd red flag -> no retakes except by explicit admin decision.
 // Interview points: total >= 30 -> 20, 24–29 -> 15, manual-review admin
 // pass -> 10, else 0. English 0/3 -> englishBlocked (no tourist radar).
-// The 90-question rotating bank is Phase 2 — this is the fixed 36.
+// The 90-question rotating bank (v2.1.13, H15): the bank holds 54
+// common questions + 9 per role (assistant / nurse / doctor / physio),
+// and each attempt SAMPLES 36 by dimension quota (medical 8 / ethics 7
+// / safety 6 / communication 6 / resilience 5 / conduct 4) — so no two
+// attempts are the same and no answer key can be memorised.
+// v2.1.13 (M17): EXPIRED attempts do NOT count toward the 3-attempt
+// limit — only attempts that were actually submitted do.
+function countedAttempts(rec) {
+  return (rec.attempts || []).filter((a) => a.result !== 'expired' && a.status !== 'expired');
+}
 function buildAttemptQuestions(providerType) {
   const role = (providerType === 'assistant' || providerType === 'nurse' || providerType === 'doctor' || providerType === 'physio') ? providerType : 'nurse';
-  // Shuffle question order AND option order; keep the answer key +
-  // red-flag markers server-side ONLY (never sent to the client).
-  const questions = shuffle([...cat.INTERVIEW_COMMON, ...cat.INTERVIEW_ROLE_QUESTIONS[role]]);
+  // Sample 36 by dimension quota from the pooled bank for this role
+  // (common + role-specific), then shuffle question order AND option
+  // order. The answer key + red-flag markers are POSITIONS (0–3) into
+  // the published options, stored server-side ONLY (never sent to the
+  // client); published options carry text only, like the language test.
+  const pool = [...cat.INTERVIEW_COMMON, ...cat.INTERVIEW_ROLE_QUESTIONS[role]];
+  const quota = { medical: 8, ethics: 7, safety: 6, communication: 6, resilience: 5, conduct: 4 };
+  const sampled = [];
+  for (const [dim, n] of Object.entries(quota)) {
+    const ofDim = shuffle(pool.filter((q) => q.category === dim));
+    sampled.push(...ofDim.slice(0, n));
+  }
+  const questions = shuffle(sampled);
   const answerKey = {};
   const redFlagKey = {};
   const pub = questions.map((q) => {
     const opts = shuffle(q.options);
-    answerKey[q.id] = q.correct;
-    if (q.redFlagOption) redFlagKey[q.id] = q.redFlagOption;
-    return { id: q.id, category: q.category, text: q.text, options: opts };
+    answerKey[q.id] = opts.findIndex((o) => o.key === q.correct);
+    if (q.redFlagOption) redFlagKey[q.id] = opts.findIndex((o) => o.key === q.redFlagOption);
+    return { id: q.id, category: q.category, text: q.text, options: opts.map((o) => ({ text: o.text })) };
   });
   const en = shuffle(cat.ENGLISH_CHECK);
   const enKey = {};
   const enPub = en.map((q) => {
-    enKey[q.id] = q.correct;
-    return { id: q.id, text: q.text, options: shuffle(q.options) };
+    const opts = shuffle(q.options);
+    enKey[q.id] = opts.findIndex((o) => o.key === q.correct);
+    return { id: q.id, text: q.text, options: opts.map((o) => ({ text: o.text })) };
   });
   return { pub, answerKey, redFlagKey, enPub, enKey, role };
 }
@@ -3786,6 +4254,11 @@ function interviewCooldown(p) {
 router.post('/providers/interview/start', requireAuth, requireRole('provider'), (req, res) => {
   const p = store.data.providers[req.user.providerId];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
+  // v2.1.13 (M16): while the interview is in MANUAL REVIEW the provider
+  // cannot start a new attempt — the admin must decide first.
+  if (p.interviewStatus === 'manual-review') {
+    return res.status(409).json({ error: 'manual_review', message: 'Your interview is under manual review — an admin must decide before you can start a new attempt.' });
+  }
   const rec = store.data.interviews[p.id] || { attempts: [], active: null };
   if (rec.active && new Date(rec.active.deadlineAt).getTime() > Date.now()) {
     return res.status(409).json({ error: 'conflict', message: 'An interview attempt is already in progress.', deadlineAt: rec.active.deadlineAt });
@@ -3794,7 +4267,7 @@ router.post('/providers/interview/start', requireAuth, requireRole('provider'), 
   if (cd.blocked) {
     return res.status(409).json({ error: 'retake_blocked', message: cd.reason, canRetakeAt: cd.canRetakeAt });
   }
-  const attemptsUsed = (rec.attempts || []).length;
+  const attemptsUsed = countedAttempts(rec).length;
   if (attemptsUsed >= config.interviewMaxAttempts && p.interviewStatus !== 'passed') {
     return res.status(409).json({ error: 'attempts_exhausted', message: 'Maximum 3 interview attempts reached — further retakes need an admin decision.', attemptsUsed });
   }
@@ -3813,17 +4286,28 @@ router.post('/providers/interview/start', requireAuth, requireRole('provider'), 
 router.get('/providers/interview/questions', requireAuth, requireRole('provider'), (req, res) => {
   const p = store.data.providers[req.user.providerId];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider record not found.' });
+  // v2.1.13 (M16): manual review blocks a new attempt until the admin decides.
+  if (p.interviewStatus === 'manual-review') {
+    return res.status(409).json({ error: 'manual_review', message: 'Your interview is under manual review — an admin must decide before you can start a new attempt.' });
+  }
   const rec = store.data.interviews[p.id] || { attempts: [], active: null };
   let active = rec.active;
+  let previousAttemptExpired = false;
   if (!active || new Date(active.deadlineAt).getTime() <= Date.now()) {
-    if (active) { rec.active = null; }
+    if (active) {
+      // v2.1.13 (M17): an expired attempt is RECORDED (so the provider
+      // sees it) but does NOT count toward the 3-attempt limit.
+      rec.attempts.push({ attemptId: active.attemptId, startedAt: active.startedAt, submittedAt: nowIso(), result: 'expired', status: 'expired', scores: null, total: 0 });
+      rec.active = null;
+      previousAttemptExpired = true;
+    }
     const cd = interviewCooldown(p);
     if (cd.blocked) {
-      return res.status(409).json({ error: 'retake_blocked', message: cd.reason, canRetakeAt: cd.canRetakeAt });
+      return res.status(409).json({ error: 'retake_blocked', message: cd.reason, canRetakeAt: cd.canRetakeAt, previousAttemptExpired });
     }
-    const attemptsUsed = (rec.attempts || []).length;
+    const attemptsUsed = countedAttempts(rec).length;
     if (attemptsUsed >= config.interviewMaxAttempts && p.interviewStatus !== 'passed') {
-      return res.status(409).json({ error: 'attempts_exhausted', message: 'Maximum 3 interview attempts reached — further retakes need an admin decision.', attemptsUsed });
+      return res.status(409).json({ error: 'attempts_exhausted', message: 'Maximum 3 interview attempts reached — further retakes need an admin decision.', attemptsUsed, previousAttemptExpired });
     }
     const { pub, answerKey, redFlagKey, enPub, enKey, role } = buildAttemptQuestions(p.providerType || p.role);
     active = {
@@ -3836,7 +4320,7 @@ router.get('/providers/interview/questions', requireAuth, requireRole('provider'
     store.audit('provider.interview_started', req.user.phone, { providerId: p.id, attemptId: active.attemptId, role });
     store.save();
   }
-  res.json(interviewResponse(active));
+  res.json({ ...interviewResponse(active), previousAttemptExpired, previousAttemptExpiredMessage: previousAttemptExpired ? 'Your previous interview attempt expired without being submitted — it does not count toward your 3 attempts.' : null });
 });
 
 router.post('/providers/interview/submit', requireAuth, requireRole('provider'), (req, res) => {
@@ -3852,39 +4336,55 @@ router.post('/providers/interview/submit', requireAuth, requireRole('provider'),
   }
   if (new Date(active.deadlineAt).getTime() < Date.now()) {
     rec.active = null;
-    rec.attempts.push({ attemptId: active.attemptId, startedAt: active.startedAt, submittedAt: nowIso(), result: 'expired', scores: null, total: 0 });
+    rec.attempts.push({ attemptId: active.attemptId, startedAt: active.startedAt, submittedAt: nowIso(), result: 'expired', status: 'expired', scores: null, total: 0 });
     store.save();
-    return res.status(410).json({ error: 'expired', message: 'The 30-minute interview deadline passed (server time). Start a new attempt.' });
+    return res.status(410).json({ error: 'expired', message: 'The 30-minute interview deadline passed (server time). Start a new attempt — this expired attempt does not count toward your 3 attempts.' });
   }
-  // The frontend sends option INDEXES (0–3); map them back to option keys
-  // using the stored shuffled order. Accept key strings too.
-  const mapAnswers = (raw, pub) => {
+  // v2.1.13 (H15): answers are POSITIONS (0-3) into the options the
+  // start call published — scored against the position stored at start.
+  // A raw key letter ("a"–"d"), a non-integer, an out-of-range index, or
+  // an answer for a question that was not in this attempt is rejected
+  // with 400 (it can only come from someone reading the bank, not the
+  // app). A missing answer simply scores 0 for that question. Same
+  // pattern as the language-test submit (v2.1.6 C5).
+  const validateAnswers = (raw, pub) => {
+    const sampledIds = new Set((pub || []).map((q) => q.id));
     const out = {};
     for (const [qid, v] of Object.entries(raw || {})) {
-      const q = (pub || []).find((x) => x.id === qid);
-      if (!q) { out[qid] = v; continue; }
+      if (!sampledIds.has(qid)) {
+        return { error: `Answer for question ${qid} is not part of this attempt.`, questionId: qid };
+      }
       const idx = Number(v);
-      out[qid] = Number.isInteger(idx) && q.options[idx] ? q.options[idx].key : v;
+      if (!Number.isInteger(idx) || idx < 0 || idx > 3) {
+        return { error: 'Answers must be option positions (0-3) — key letters are not accepted.', questionId: qid };
+      }
+      out[qid] = idx;
     }
-    return out;
+    return { answers: out };
   };
-  const answers = mapAnswers(req.body?.answers, active.pub);
-  const enAnswers = mapAnswers(req.body?.englishAnswers || req.body?.english, active.enPub);
+  const checked = validateAnswers(req.body?.answers, active.pub);
+  if (checked.error) return bad(res, 400, checked.error, { questionId: checked.questionId });
+  const enChecked = validateAnswers(req.body?.englishAnswers || req.body?.english, active.enPub);
+  if (enChecked.error) return bad(res, 400, enChecked.error, { questionId: enChecked.questionId });
+  const answers = checked.answers;
+  const enAnswers = enChecked.answers;
   const scores = { medical: 0, ethics: 0, safety: 0, communication: 0, resilience: 0, conduct: 0 };
   let redFlag = false;
   const redFlagQuestions = [];
-  for (const q of [...cat.INTERVIEW_COMMON, ...(cat.INTERVIEW_ROLE_QUESTIONS[active.role] || [])]) {
+  // Score ONLY the sampled questions of this attempt (the sampled pub),
+  // against the stored positions — never the full bank.
+  for (const q of (active.pub || [])) {
     const a = answers[q.id];
-    if (a === active.answerKey[q.id]) scores[q.category] += 1;
-    if (active.redFlagKey[q.id] && a === active.redFlagKey[q.id]) {
+    if (a != null && a === active.answerKey[q.id]) scores[q.category] += 1;
+    if (active.redFlagKey[q.id] != null && a === active.redFlagKey[q.id]) {
       redFlag = true;
       redFlagQuestions.push(q.id);
     }
   }
   const total = Object.values(scores).reduce((a, b) => a + b, 0);
   let enCorrect = 0;
-  for (const q of cat.ENGLISH_CHECK) {
-    if (enAnswers[q.id] === active.enKey[q.id]) enCorrect += 1;
+  for (const q of (active.enPub || [])) {
+    if (enAnswers[q.id] != null && enAnswers[q.id] === active.enKey[q.id]) enCorrect += 1;
   }
   const english = { correct: enCorrect, total: 3, level: enCorrect >= 2 ? 'basic-ok' : enCorrect === 1 ? 'basic-weak' : 'needs-support', note: 'Unscored — reported separately; no certificate needed for English.' };
   // Pass / manual-review / fail (all three mandatory minima matter).
@@ -3909,7 +4409,9 @@ router.post('/providers/interview/submit', requireAuth, requireRole('provider'),
   // else 0.
   let interviewPoints = 0;
   if (status === 'passed') interviewPoints = total >= cat.POINTS.interview.excellentMin ? cat.POINTS.interview.excellentPts : cat.POINTS.interview.passPts;
-  const attemptsLeft = Math.max(0, config.interviewMaxAttempts - ((rec.attempts || []).length + 1));
+  // v2.1.13 (M17): attemptsLeft counts only SUBMITTED attempts —
+  // expired ones never consumed a slot.
+  const attemptsLeft = Math.max(0, config.interviewMaxAttempts - (countedAttempts(rec).length + 1));
   let canRetakeAt = null;
   if (status === 'red-flag') {
     p.redFlagCount = (p.redFlagCount || 0) + 1;
@@ -4130,9 +4632,10 @@ router.post('/tourist-bookings', requireAuth, requireRole('patient'), (req, res)
   const fx = currency === 'usd' ? config.usdEgp : config.eurEgp;
   const base = svc[currency];
   const urgent = b.urgent === true ? cat.TOURIST_URGENT_EXTRA[currency] : 0;
-  const distanceForeign = Math.round((fee.fee_egp / fx) * 100) / 100;
-  const amountForeign = Math.round((base + urgent + distanceForeign) * 100) / 100;
-  const amountEgp = Math.round(amountForeign * fx);
+  // v2.1.13 (L18): keep the distance fee in EGP and convert ONCE — the
+  // old foreign→EGP→foreign round-trip drifted the total by a few EGP.
+  const amountEgp = Math.round((base + urgent) * fx) + fee.fee_egp;
+  const amountForeign = Math.round((amountEgp / fx) * 100) / 100;
   const language = b.language ? String(b.language).toLowerCase() : 'en';
   // v2.1.2 — receipt photo for online payment (InstaPay / card); cash
   // bookings reject a receipt image (receipt at the visit instead).
@@ -4144,7 +4647,8 @@ router.post('/tourist-bookings', requireAuth, requireRole('patient'), (req, res)
   const id = newId('bk');
   // v2.0.9 — loyalty voucher (50 EGP, converted at this booking's fx rate).
   // Provider share is computed on the FULL pre-discount price at release.
-  const vou = findVoucher(req.user.phone, amountEgp);
+  // v2.1.13: the client may decline the voucher (useVoucher=false).
+  const vou = b.useVoucher === false ? null : findVoucher(req.user.phone, amountEgp);
   const voucherDiscountForeign = vou ? Math.round((vou.amountEgp / fx) * 100) / 100 : 0;
   const booking = {
     id, kind: 'tourist', patientPhone: req.user.phone, patientName: capStr(b.patientName, 120),
@@ -4153,6 +4657,9 @@ router.post('/tourist-bookings', requireAuth, requireRole('patient'), (req, res)
     preferredProviderId: b.preferredProviderId || null,
     night: isNight(b.scheduledAt),
     amountEgp, baseEgp: Math.round(base * fx), distanceFeeEgp: fee.fee_egp,
+    // v2.1.13 (M33): commission base = service only (base in EGP);
+    // the distance fee is pass-through, kept in full by the provider.
+    commissionBaseEgp: Math.round(base * fx), passThroughEgp: fee.fee_egp,
     voucherId: vou ? vou.id : null, voucherDiscountEgp: vou ? vou.amountEgp : 0,
     voucherDiscountForeign, amountPayableEgp: vou ? amountEgp - vou.amountEgp : amountEgp,
     distanceKm, distanceBand: fee.band, distanceEstimate: true,
@@ -4166,6 +4673,7 @@ router.post('/tourist-bookings', requireAuth, requireRole('patient'), (req, res)
       ? { amount: cat.EXTRA_LANGUAGE_BONUS[currency], currency: currency.toUpperCase(), appliesIf: 'Assigned provider holds a certificate for this language (non-English only). Added at release, not at booking.' }
       : null,
     paymentMethod: b.paymentMethod, respectCharterAccepted: true,
+    payerRole: b.payerRole || null, // v2.1.13 (H6)
     termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
     triage: { dangerSigns: danger, notes: triage.notes || null },
     insurer: b.insurer || null, policyNo: b.policyNo || null, passportNo: b.passportNo ? `****${String(b.passportNo).slice(-4)}` : null,
@@ -4177,7 +4685,8 @@ router.post('/tourist-bookings', requireAuth, requireRole('patient'), (req, res)
     circumventionHold: false, circumventionReportId: null,
     complaintStatus: null, complaintDeadline: null, complaintAt: null, complaintResolvedAt: null,
     settleableAt: null, cancelledAt: null, refundedAt: null, refundEgp: null,
-    cashCollectedByProvider: false, overdue: false,
+    cashCollectedByProvider: b.paymentMethod === 'cash_receipt', // v2.1.13 (B1)
+    overdue: false,
     createdAt: nowIso(), acceptedAt: null, providerConfirmedAt: null,
     patientConfirmedAt: null, reviewedAt: null, releasedAt: null, releaseMode: null,
   };
@@ -4200,15 +4709,23 @@ router.get('/bookings/:id/insurance-report', requireAuth, (req, res) => {
   if (!['en', 'de'].includes(lang)) return bad(res, 400, 'lang must be en or de (Phase 1).');
   const p = b.providerId ? store.data.providers[b.providerId] : null;
   const cur = b.currency || 'EGP';
+  // v2.1.13 (M6): the line items must SUM to the stated total. The
+  // service line is the BASE only (not the whole amount), then distance,
+  // urgency and the voucher discount; the total is the sum of the lines
+  // (foreign amounts rounded to 2dp, EGP integer).
+  const toCur = (egp) => (b.currency === 'EGP' ? egp : Math.round((egp / (b.fxRate || 1)) * 100) / 100);
   const items = [
-    { item: b.serviceName, amount: b.amountForeign ?? b.baseEgp, currency: cur },
-    { item: lang === 'de' ? 'Entfernungspauschale' : 'Distance fee', amount: b.currency === 'EGP' ? b.distanceFeeEgp : Math.round((b.distanceFeeEgp / (b.fxRate || 1)) * 100) / 100, currency: cur },
+    { item: b.serviceName, amount: toCur(b.baseEgp), currency: cur },
+    { item: lang === 'de' ? 'Entfernungspauschale' : 'Distance fee', amount: toCur(b.distanceFeeEgp), currency: cur },
   ];
   if (b.urgent) items.push({ item: lang === 'de' ? 'Dringlichkeitszuschlag' : 'Urgent surcharge', amount: cat.TOURIST_URGENT_EXTRA[cur.toLowerCase()] || 0, currency: cur });
   // v2.0.9 — loyalty-voucher discount (funded by the app; the provider's
   // share was computed on the full pre-discount price).
   if (b.voucherDiscountForeign) items.push({ item: lang === 'de' ? 'Treuegutschein' : 'Loyalty voucher discount', amount: -b.voucherDiscountForeign, currency: cur });
   else if (b.voucherDiscountEgp) items.push({ item: lang === 'de' ? 'Treuegutschein' : 'Loyalty voucher discount', amount: -b.voucherDiscountEgp, currency: cur });
+  const invoiceTotal = b.currency === 'EGP'
+    ? items.reduce((s, x) => s + x.amount, 0)
+    : Math.round(items.reduce((s, x) => s + x.amount, 0) * 100) / 100;
   // v2.1.1 (M4): procedures/medications lines from booking data when
   // present (procedures[] / medications[] on the booking, or the single
   // service as a fallback). No placeholder diagnosis text is invented
@@ -4228,7 +4745,7 @@ router.get('/bookings/:id/insurance-report', requireAuth, (req, res) => {
     procedures,
     medications,
     vitals: b.vitals || null,
-    invoice: { items, total: b.amountForeign ?? b.amountEgp, currency: cur, totalEgp: b.amountEgp },
+    invoice: { items, total: invoiceTotal, currency: cur, totalEgp: b.amountPayableEgp ?? b.amountEgp },
     provider: p ? { name: p.name, role: p.role, license: `****${p.licenseLast4}`, licenseVerified: p.status === 'verified' } : null,
     stamp: {
       text: lang === 'de' ? 'Elektronisch gestempelt — Shifa Care, El Quseir' : 'Electronically stamped — Shifa Care, El Quseir',
@@ -4278,6 +4795,10 @@ function calculateNpwt(body) {
   if (canisterFull && (!Number.isFinite(canisterPrice) || canisterPrice < 0)) return { error: 'canisterPrice must be a non-negative number when canisterFull=true.' };
   return {
     days, dressings, schedule: 'Dressing every 3 days',
+    // v2.1.13 (L17): the split the commission needs — the SERVICE
+    // portion (dressing visits, commissioned) vs the EQUIPMENT portion
+    // (rental + kits + canister, pass-through at cost). Total unchanged.
+    serviceEgp: visitCost, equipmentEgp: rental + kitCost + canisterPrice,
     breakdown: {
       deviceRentalEgp: rental, rentalRule: days <= 7 ? '750/week' : days <= 15 ? '1000/15 days' : '1000/15 days + 750 per extra week',
       visitsEgp: visitCost, visitUnitEgp: 600, visits: dressings,
@@ -4361,7 +4882,8 @@ router.post('/npwt/bookings', requireAuth, (req, res) => {
   const receiptErrNpwt = receiptRequiredError(b.paymentMethod, receiptParsedNpwt);
   if (receiptErrNpwt) return bad(res, 400, receiptErrNpwt);
   const id = newId('bk');
-  const vou = findVoucher(req.user.phone, totalEgp);
+  // v2.1.13: the client may decline the voucher (useVoucher=false).
+  const vou = b.useVoucher === false ? null : findVoucher(req.user.phone, totalEgp);
   const booking = {
     id, kind: 'npwt', patientPhone: req.user.phone, patientName: capStr(b.patientName, 120),
     serviceCode: 'npwt', serviceName: 'NPWT — vacuum-assisted closure (real device only)', status: 'held',
@@ -4369,12 +4891,18 @@ router.post('/npwt/bookings', requireAuth, (req, res) => {
     preferredProviderId: b.preferredProviderId || null,
     night: isNight(b.scheduledAt),
     amountEgp: totalEgp, baseEgp: calc.totalEgp, distanceFeeEgp,
+    // v2.1.13 (M33/L17): commission base = the SERVICE portion only
+    // (dressing visits); the equipment (rental + kits + canister) and
+    // the distance fee are pass-through, kept in full by the provider.
+    commissionBaseEgp: calc.serviceEgp, passThroughEgp: distanceFeeEgp + calc.equipmentEgp,
+    npwtServiceEgp: calc.serviceEgp, npwtEquipmentEgp: calc.equipmentEgp,
     voucherId: vou ? vou.id : null, voucherDiscountEgp: vou ? vou.amountEgp : 0,
     amountPayableEgp: vou ? totalEgp - vou.amountEgp : totalEgp,
     distanceKm: priced.distanceKm, distanceBand: priced.band, distanceEstimate: true,
     transport: b.transport || 'none', hotelId: b.hotelId || null,
     currency: 'EGP', amountForeign: null, fxRate: null,
     paymentMethod: b.paymentMethod, respectCharterAccepted: true,
+    payerRole: b.payerRole || null, // v2.1.13 (H6)
     termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
     doctorOrder: { doctorName: String(doctorOrder.doctorName).trim().slice(0, 120), orderNumber: String(doctorOrder.orderNumber).trim().slice(0, 80) },
     doctorOrderConfirmed: true, doctorOrderSeenByProvider: false,
@@ -4394,7 +4922,8 @@ router.post('/npwt/bookings', requireAuth, (req, res) => {
     circumventionHold: false, circumventionReportId: null,
     complaintStatus: null, complaintDeadline: null, complaintAt: null, complaintResolvedAt: null,
     settleableAt: null, cancelledAt: null, refundedAt: null, refundEgp: null,
-    cashCollectedByProvider: false, overdue: false,
+    cashCollectedByProvider: b.paymentMethod === 'cash_receipt', // v2.1.13 (B1)
+    overdue: false,
     createdAt: nowIso(), acceptedAt: null, providerConfirmedAt: null,
     patientConfirmedAt: null, reviewedAt: null, releasedAt: null, releaseMode: null,
   };
@@ -4431,7 +4960,8 @@ router.post('/postop', requireAuth, requireRole('patient'), (req, res) => {
   if (receiptErrPostop) return bad(res, 400, receiptErrPostop);
   const id = newId('bk');
   // v2.0.9 — loyalty voucher (same rule as standard bookings).
-  const vou = findVoucher(req.user.phone, priced.totalEgp);
+  // v2.1.13: the client may decline the voucher (useVoucher=false).
+  const vou = b.useVoucher === false ? null : findVoucher(req.user.phone, priced.totalEgp);
   const booking = {
     id, kind: 'postop', patientPhone: req.user.phone, patientName: capStr(b.patientName, 120),
     serviceCode: 'postop', serviceName: cat.SERVICES.postop.name_en, status: 'held',
@@ -4439,12 +4969,16 @@ router.post('/postop', requireAuth, requireRole('patient'), (req, res) => {
     preferredProviderId: b.preferredProviderId || null,
     night: isNight(b.scheduledAt),
     amountEgp: priced.totalEgp, baseEgp: priced.baseEgp, distanceFeeEgp: priced.distanceFeeEgp,
+    // v2.1.13 (M33): commission base = service only; the distance fee
+    // is pass-through, kept in full by the provider.
+    commissionBaseEgp: priced.baseEgp, passThroughEgp: priced.distanceFeeEgp,
     voucherId: vou ? vou.id : null, voucherDiscountEgp: vou ? vou.amountEgp : 0,
     amountPayableEgp: vou ? priced.totalEgp - vou.amountEgp : priced.totalEgp,
     distanceKm: priced.distanceKm, distanceBand: priced.band, distanceEstimate: true,
     transport: b.transport || 'none', hotelId: b.hotelId || null,
     currency: 'EGP', amountForeign: null, fxRate: null,
     paymentMethod: b.paymentMethod, respectCharterAccepted: true,
+    payerRole: b.payerRole || null, // v2.1.13 (H6)
     termsAcceptedVersion: config.termsVersion, termsAcceptedAt: nowIso(),
     triage: { dangerSigns: [], notes: null },
     surgeryType: b.surgeryType, surgeonInstructions: b.surgeonInstructions || null,
@@ -4455,7 +4989,8 @@ router.post('/postop', requireAuth, requireRole('patient'), (req, res) => {
     circumventionHold: false, circumventionReportId: null,
     complaintStatus: null, complaintDeadline: null, complaintAt: null, complaintResolvedAt: null,
     settleableAt: null, cancelledAt: null, refundedAt: null, refundEgp: null,
-    cashCollectedByProvider: false, overdue: false,
+    cashCollectedByProvider: b.paymentMethod === 'cash_receipt', // v2.1.13 (B1)
+    overdue: false,
     createdAt: nowIso(), acceptedAt: null, providerConfirmedAt: null,
     patientConfirmedAt: null, reviewedAt: null, releasedAt: null, releaseMode: null,
   };
@@ -4497,7 +5032,9 @@ router.post('/admin/pin/verify', (req, res) => {
   ipRec.lockedUntil = null;
   store.save();
   store.audit('admin.pin_verified', 'admin', {}, ip);
-  res.json({ ok: true, token: issueAdminToken(), expiresInSeconds: 30 * 60, role: 'admin' });
+  // v2.1.13 (L15): the admin session is 12 hours (config.adminSessionTtl),
+  // not 30 minutes — the old 30*60 here lied to the client.
+  res.json({ ok: true, token: issueAdminToken(), expiresInSeconds: 12 * 60 * 60, role: 'admin' });
 });
 
 router.get('/admin/dashboard', requireAdmin, (req, res) => {
@@ -4506,7 +5043,12 @@ router.get('/admin/dashboard', requireAdmin, (req, res) => {
     const pub = store.publicProvider(p, { admin: true });
     return { ...pub, licenceLast4: pub.licenseLast4, rating: pub.ratingAvg, visits: pub.completedVisits };
   });
-  const sosAlerts = store.data.sos.slice().reverse().map((s) => ({ ...s, createdAt: s.at }));
+  // v2.1.13 (M24): the dashboard SOS list shows OPEN alerts by
+  // default; ?sos=all returns resolved ones too.
+  const sosFilter = String(req.query.sos || 'open');
+  const sosAlerts = store.data.sos.slice().reverse()
+    .filter((s) => sosFilter === 'all' || s.status !== 'resolved')
+    .map((s) => ({ ...s, createdAt: s.at }));
   const overdue = Object.values(store.data.bookings)
     .filter((b) => b.overdue && ['accepted', 'provider_confirmed'].includes(b.status))
     .map((b) => ({ id: b.id, service: b.serviceName, startedAt: b.acceptedAt, providerId: b.providerId }));
@@ -4558,7 +5100,9 @@ router.get('/admin/dashboard', requireAdmin, (req, res) => {
     // number the broadcast dry-run reports as `users`. broadcastAccounts
     // is the registered-account count, shown separately so the tab labels
     // all three numbers honestly.
-    broadcastDevices: Object.values(store.data.devices || {}).reduce((n, list) => n + (Array.isArray(list) ? list.length : 0), 0),
+    // v2.1.13 (L1): broadcast device counts reflect ACTIVE devices
+    // only (a device with no successful send in 60 days is pruned).
+    broadcastDevices: notify.totalActiveDevices(),
     broadcastAccounts: Object.keys(store.data.users || {}).length,
     broadcastUsers: new Set([...Object.keys(store.data.users || {}), ...Object.keys(store.data.devices || {})]).size,
     // v2.1.6 — C8 anomaly flags (fake-visit farming signals) + C7
@@ -4589,20 +5133,33 @@ router.post('/admin/broadcast', requireAdmin, async (req, res) => {
   const users = store.data.users || {};
   const devices = store.data.devices || {};
   const phones = new Set([...Object.keys(users), ...Object.keys(devices)]);
-  const deviceCount = Object.values(devices).reduce((n, list) => n + (Array.isArray(list) ? list.length : 0), 0);
+  const deviceCount = notify.totalActiveDevices();
   if (req.body?.dryRun === true) {
-    return res.json({ ok: true, dryRun: true, devices: deviceCount, users: phones.size });
+    return res.json({ ok: true, dryRun: true, devices: deviceCount, users: phones.size, delivered: 0, pushSent: 0, pushFailed: 0, sent: 0, failed: 0 });
   }
-  let sent = 0, failed = 0;
+  // v2.1.13 (H9): split counters — delivered (in-app record written,
+  // counted unless notifyUser throws), pushSent (FCM accepted),
+  // pushFailed (FCM failed / no device). sent/failed are kept for
+  // compatibility (sent = pushSent, failed = audience − pushSent).
+  let delivered = 0, pushSent = 0, pushFailed = 0;
   for (const phone of phones) {
-    const rec = await notify.notifyUser(phone, {
-      type: 'broadcast', titleAr: title, titleEn: title, bodyAr: body, bodyEn: body,
-      data: { type: 'broadcast' }, critical: false,
-    });
-    if (rec.pushStatus === 'sent') sent += 1; else failed += 1;
+    let rec = null;
+    try {
+      rec = await notify.notifyUser(phone, {
+        type: 'broadcast', titleAr: title, titleEn: title, bodyAr: body, bodyEn: body,
+        data: { type: 'broadcast' }, critical: false,
+      });
+    } catch (e) {
+      console.error('[broadcast] notify failed:', phone, e.message);
+    }
+    if (!rec) continue;
+    delivered += 1;
+    if (rec.pushStatus === 'sent') pushSent += 1; else pushFailed += 1;
   }
-  store.audit('admin.broadcast', 'admin', { title, devices: deviceCount, users: phones.size, sent, failed });
-  res.json({ ok: true, dryRun: false, devices: deviceCount, users: phones.size, sent, failed });
+  const sent = pushSent;
+  const failed = phones.size - pushSent;
+  store.audit('admin.broadcast', 'admin', { title, devices: deviceCount, users: phones.size, delivered, pushSent, pushFailed, sent, failed });
+  res.json({ ok: true, dryRun: false, devices: deviceCount, users: phones.size, delivered, pushSent, pushFailed, sent, failed });
 });
 
 // ---------------------------------------------------------------- v2.1.8
@@ -4646,7 +5203,41 @@ router.get('/admin/persistence', requireAdmin, (req, res) => {
 router.get('/admin/settlements', requireAdmin, (req, res) => {
   const list = (store.data.settlements || []).slice().reverse();
   const providerId = req.query.providerId;
-  res.json({ settlements: providerId ? list.filter((x) => x.providerId === providerId) : list, count: list.length });
+  // v2.1.13 (M31): each record exposes its paid state (paidAt null
+  // until an admin marks it paid).
+  const withPaid = (list.filter((x) => !providerId || x.providerId === providerId)).map((s) => ({ ...s, paid: !!s.paidAt }));
+  res.json({ settlements: withPaid, count: withPaid.length });
+});
+
+// v2.1.13 (M31): mark a settlement PAID (money actually moved). The
+// bonus paid flags (volumeBonusPaid / stayBonusPaid) are set ONLY here,
+// never at generation (L19) — a generated-but-unpaid settlement must
+// never mark a bonus as paid.
+router.post('/admin/settlements/:id/mark-paid', requireAdmin, (req, res) => {
+  const s = (store.data.settlements || []).find((x) => x.id === req.params.id);
+  if (!s) return res.status(404).json({ error: 'not_found', message: 'Settlement not found.' });
+  if (s.paidAt) return res.status(409).json({ error: 'already_paid', message: 'This settlement was already marked paid.', paidAt: s.paidAt });
+  const paidRef = typeof req.body?.paidRef === 'string' ? req.body.paidRef.slice(0, 200) : null;
+  s.paidAt = nowIso();
+  s.paidBy = 'admin';
+  s.paidRef = paidRef;
+  const p = store.data.providers[s.providerId];
+  if (p) {
+    // Volume bonus: record the paid amount per month (current month +
+    // any carryover month) so it is never paid twice.
+    p.volumeBonusPaidByMonth = p.volumeBonusPaidByMonth || {};
+    if ((s.totals?.volumeBonusEgp || 0) > 0 && s.totals?.volumeBonusMonth) {
+      p.volumeBonusPaidByMonth[s.totals.volumeBonusMonth] = (p.volumeBonusPaidByMonth[s.totals.volumeBonusMonth] || 0) + s.totals.volumeBonusEgp;
+      p.volumeBonusPaid = { month: s.totals.volumeBonusMonth, amountEgp: p.volumeBonusPaidByMonth[s.totals.volumeBonusMonth] };
+    }
+    if ((s.totals?.volumeBonusCarryoverEgp || 0) > 0 && s.totals?.volumeBonusCarryoverMonth) {
+      p.volumeBonusPaidByMonth[s.totals.volumeBonusCarryoverMonth] = (p.volumeBonusPaidByMonth[s.totals.volumeBonusCarryoverMonth] || 0) + s.totals.volumeBonusCarryoverEgp;
+    }
+    if ((s.totals?.stayBonusEgp || 0) > 0) p.stayBonusPaid = true;
+  }
+  store.audit('settlement.marked_paid', 'admin', { settlementId: s.id, providerId: s.providerId, weekKey: s.weekKey, paidRef, volumeBonusEgp: s.totals?.volumeBonusEgp || 0, volumeBonusCarryoverEgp: s.totals?.volumeBonusCarryoverEgp || 0, stayBonusEgp: s.totals?.stayBonusEgp || 0 });
+  store.save();
+  res.json({ ...s, paid: true });
 });
 
 // v2.1.1 (audit #4): full data.json download for backup (admin JWT,
@@ -4660,7 +5251,12 @@ router.get('/admin/export', requireAdmin, (req, res) => {
 });
 
 router.get('/admin/providers', requireAdmin, (req, res) => {
-  res.json(Object.values(store.data.providers).map((p) => store.publicProvider(p, { admin: true })));
+  res.json(Object.values(store.data.providers).map((p) => ({
+    ...store.publicProvider(p, { admin: true }),
+    // v2.1.13 (M25): active bookings (accepted + provider_confirmed) —
+    // the suspend warning the web UI shows before suspending.
+    activeBookings: Object.values(store.data.bookings).filter((b) => b.providerId === p.id && ['accepted', 'provider_confirmed'].includes(b.status)).length,
+  })));
 });
 
 router.post('/admin/providers/:id/tier', requireAdmin, (req, res) => {
@@ -4679,9 +5275,17 @@ router.post('/admin/providers/:id/verify', requireAdmin, (req, res) => {
   const p = store.data.providers[req.params.id];
   if (!p) return res.status(404).json({ error: 'not_found', message: 'Provider not found.' });
   if (isReservedId(req.params.id)) return res.status(400).json({ error: 'validation_error', message: 'Invalid identifier.' });
+  // v2.1.13 (H14): verification requires a PASSED interview (a logged
+  // manual pass sets interviewStatus='passed' too) AND a licence on
+  // file — a provider must never be activated on documents alone.
+  if (p.interviewStatus !== 'passed') return res.status(409).json({ error: 'interview_required', message: 'Cannot verify: the provider has not passed the acceptance interview yet (interviewStatus must be passed).' });
+  if (!p.licenseHash && !p.licenseLast4) return res.status(409).json({ error: 'license_required', message: 'Cannot verify: no licence on file for this provider.' });
   const verifiedCertificates = Number(req.body?.verifiedCertificates);
   if (Number.isFinite(verifiedCertificates)) {
-    p.verifiedCertificates = Math.max(0, Math.min(3, Math.floor(verifiedCertificates))); // +5 pts each, max 15
+    // v2.1.13 (L11): the legacy counter is unified with the new path —
+    // +5 points each, cap 20 (4 certificates), same as catalog.js
+    // POINTS.certificateMax.
+    p.verifiedCertificates = Math.max(0, Math.min(4, Math.floor(verifiedCertificates))); // +5 pts each, max 20
   }
   // v2.1.1 (audit #29): the admin sets the VERIFIED role — the role is
   // no longer purely self-selected at registration.
@@ -4717,13 +5321,21 @@ router.post('/admin/providers/:id/interview', requireAdmin, (req, res) => {
     p.interviewPoints = cat.POINTS.interview.manualReviewPts; // 10
     p.canRetakeAt = null;
     recomputeProviderPoints(p);
-    store.audit('admin.interview_passed', 'admin', { providerId: p.id, interviewPoints: p.interviewPoints });
+    store.audit('admin.interview_passed', 'admin', { providerId: p.id, interviewPoints: p.interviewPoints, previousStatus: 'manual-review' });
   } else if (decision === 'fail') {
+    // v2.1.13 (L13): fail is guarded to manual-review/failed states
+    // only — an admin cannot fail a provider who already passed (or one
+    // who never took the interview).
+    if (!['manual-review', 'failed'].includes(p.interviewStatus)) return bad(res, 409, `Only a manual-review or failed interview can be failed by admin (status is ${p.interviewStatus}).`);
+    const previousStatus = p.interviewStatus;
     p.interviewStatus = 'failed';
     p.interviewPoints = 0;
     p.canRetakeAt = new Date(Date.now() + config.interviewRetakeDays * 24 * 60 * 60 * 1000).toISOString();
-    store.audit('admin.interview_failed', 'admin', { providerId: p.id });
+    store.audit('admin.interview_failed', 'admin', { providerId: p.id, previousStatus });
   } else {
+    // v2.1.13 (L14): allow-retake requires a red flag or a manual-review
+    // decision — a plain fail goes through the normal 7-day cooldown.
+    if (!(p.redFlagCount > 0 || p.interviewStatus === 'manual-review')) return bad(res, 409, 'A retake can only be allowed after a red-flag failure or a manual-review decision.');
     // allow-retake: clears the cooldown AND the red-flag approval gate.
     p.canRetakeAt = null;
     p.redFlagApprovalRequired = false;
@@ -4744,21 +5356,37 @@ router.post('/admin/providers/:id/credentials', requireAdmin, (req, res) => {
   const name = String(req.body?.name || '').trim().slice(0, 200);
   if (!name) return bad(res, 400, 'name required.');
   const verified = req.body?.verified === true;
+  // v2.1.13 (M22): no duplicate names per kind (normalised: trim,
+  // lowercase, collapse whitespace) — the same certificate must not be
+  // added twice and scored twice.
+  const normName = (s) => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const listForKind = kind === 'certificate' ? (p.certificates || []) : kind === 'course' ? (p.courses || []) : (p.languageCertificates || []);
+  if (listForKind.some((e) => normName(e.name || e.certificateName) === normName(name))) {
+    return res.status(409).json({ error: 'conflict', message: `A ${kind} with this name already exists for this provider.` });
+  }
+  // v2.1.13 (M22): linking an uploaded document requires verified:true
+  // AND the document id to exist in the provider's documents.
+  let documentId = null;
+  if (req.body?.documentId) {
+    if (!verified) return bad(res, 400, 'Linking an uploaded document requires verified:true.');
+    documentId = String(req.body.documentId);
+    if (!(p.documents || []).some((d) => d.id === documentId)) return bad(res, 400, 'documentId does not match any uploaded document for this provider.');
+  }
   if (kind === 'certificate') {
     p.certificates = p.certificates || [];
-    p.certificates.push({ name, verified });
+    p.certificates.push({ name, verified, documentId });
   } else if (kind === 'course') {
     p.courses = p.courses || [];
-    p.courses.push({ name, verified });
+    p.courses.push({ name, verified, documentId });
   } else {
     const language = String(req.body?.language || '').trim().toLowerCase().slice(0, 10);
     if (!language) return bad(res, 400, 'language required for a language certificate.');
     p.languageCertificates = p.languageCertificates || [];
-    p.languageCertificates.push({ language, certificateName: name, verified });
+    p.languageCertificates.push({ language, certificateName: name, verified, documentId });
   }
   recomputeProviderPoints(p);
   refreshCvEvaluation(p);
-  store.audit('admin.credential_added', 'admin', { providerId: p.id, kind, name, verified });
+  store.audit('admin.credential_added', 'admin', { providerId: p.id, kind, name, verified, documentId });
   store.save();
   res.status(201).json(store.publicProvider(p, { admin: true, points: p.points }));
 });
@@ -4914,7 +5542,11 @@ router.post('/admin/providers/:id/suspend', requireAdmin, (req, res) => {
   p.permanentBan = permanent;
   store.audit(permanent ? 'admin.provider_banned' : 'admin.provider_suspended', 'admin', { providerId: p.id, reason, until: p.suspendedUntil });
   store.save();
-  res.json(store.publicProvider(p, { admin: true }));
+  // v2.1.13 (M25): the response includes how many active bookings the
+  // suspension strands (accepted + provider_confirmed) so the admin
+  // sees the impact before suspending.
+  const activeBookings = Object.values(store.data.bookings).filter((x) => x.providerId === p.id && ['accepted', 'provider_confirmed'].includes(x.status)).length;
+  res.json({ ...store.publicProvider(p, { admin: true }), activeBookings });
 });
 
 router.post('/admin/providers/:id/unsuspend', requireAdmin, (req, res) => {
@@ -4927,6 +5559,44 @@ router.post('/admin/providers/:id/unsuspend', requireAdmin, (req, res) => {
   store.audit('admin.provider_unsuspended', 'admin', { providerId: p.id });
   store.save();
   res.json(store.publicProvider(p, { admin: true }));
+});
+
+// v2.1.13 (M25): admin cancels a booking — full refund + audit +
+// patient notification. 409 if already cancelled/refunded. For a
+// package only the unreleased remainder is refunded (the released days
+// were worked); the refund becomes a reversing adjustment (B2) and any
+// loyalty voucher is restored (M30).
+router.post('/admin/bookings/:id/cancel', requireAdmin, (req, res) => {
+  const b = store.data.bookings[req.params.id];
+  if (!b) return res.status(404).json({ error: 'not_found', message: 'Booking not found.' });
+  if (['cancelled', 'refunded'].includes(b.status)) return bad(res, 409, `Booking is already ${b.status}.`);
+  if (b.kind === 'package') {
+    b.refundEgp = packageRefundRemaining(b);
+    if (b.providerId) createSettlementAdjustment(b.providerId, b, 'admin_cancel', { providerShareEgp: 0, appShareEgp: 0, refundEgp: b.refundEgp, settledProviderShareEgp: 0 });
+  } else {
+    // v2.1.13 (B2): a CASH booking collects money only at the visit —
+    // cancelling before the visit means nothing was paid, so there is
+    // no refund and no reversing adjustment (the provider holds no
+    // cash to return). Online payments are prepaid at booking, so the
+    // refund is real at any status.
+    const moneyMoved = b.paymentMethod !== 'cash_receipt' || ['provider_confirmed', 'patient_confirmed', 'reviewed', 'released', 'auto_released'].includes(b.status);
+    b.refundEgp = moneyMoved ? refundAmount(b) : 0;
+    if (b.providerId && moneyMoved) createSettlementAdjustment(b.providerId, b, 'admin_cancel', { providerShareEgp: b.providerShareEgp || 0, appShareEgp: b.appShareEgp || 0, refundEgp: b.refundEgp });
+  }
+  b.status = 'cancelled';
+  b.cancelledAt = nowIso();
+  b.refundedAt = nowIso();
+  restoreVoucher(b);
+  store.audit('admin.booking_cancelled', 'admin', { bookingId: b.id, providerId: b.providerId || null, refundEgp: b.refundEgp, reason: String(req.body?.reason || '').slice(0, 500) || null });
+  store.save();
+  notify.notifyUser(b.patientPhone, {
+    type: 'booking_cancelled', critical: true,
+    titleAr: 'تم إلغاء حجزك', titleEn: 'Your booking was cancelled',
+    bodyAr: b.refundEgp > 0 ? 'ألغت الإدارة حجزك وسيتم رد المبلغ كاملًا.' : 'ألغت الإدارة حجزك — لم يكن قد تم دفع أي مبلغ بعد.',
+    bodyEn: b.refundEgp > 0 ? 'Admin cancelled your booking — a full refund is on its way.' : 'Admin cancelled your booking — no payment had been made yet.',
+    data: { bookingId: b.id },
+  }).catch((e) => console.error('[notify] admin.cancel:', e.message));
+  res.json(pubBooking(req, b, { includePaymentNumber: false }));
 });
 
 // Circumvention reports (from patient reviews) + computed pattern flags.
@@ -4957,16 +5627,36 @@ router.post('/admin/circumvention/:reportId/resolve', requireAdmin, (req, res) =
   if (b && b.circumventionReportId === report.id) {
     b.circumventionHold = false;
     if (decision === 'confirmed') {
-      b.refundEgp = refundAmount(b); // what the patient actually paid (after any voucher discount)
-      b.refundedAt = nowIso();
-      b.refundedShares = { appShareEgp: b.appShareEgp || 0, providerShareEgp: b.providerShareEgp || 0 };
-      b.appShareEgp = 0;
-      b.providerShareEgp = 0;
-      b.status = 'refunded';
-      // v2.1.6 (C4): if this booking was already settled, the refunded
-      // shares become a reversing adjustment on the next settlement —
-      // the money recorded as "paid" is clawed back, not lost.
-      if (b.settledWeekKey) createSettlementAdjustment(b.providerId, b, 'circumvention_confirmed');
+      if (b.kind === 'package') {
+        // v2.1.13 (B2): circumvention on a package refunds the FULL
+        // amount — the released days (the visit was taken off-platform)
+        // PLUS the unreleased remainder (packageRefundRemaining). The
+        // adjustment is linked to the daily release entries (never
+        // b.settledWeekKey — packages never set it): only the provider
+        // share inside ALREADY-SETTLED releases is clawed back.
+        const releasedTotals = packageDayTotals(b);
+        const releasedGross = releasedTotals.providerShareEgp + releasedTotals.appShareEgp;
+        const settledProv = (b.packageDayReleases || []).filter((r) => r.settledWeekKey).reduce((s, r) => s + (r.providerShareEgp || 0), 0);
+        b.refundEgp = packageRefundRemaining(b) + releasedGross;
+        b.refundedShares = { appShareEgp: releasedTotals.appShareEgp, providerShareEgp: releasedTotals.providerShareEgp };
+        b.appShareEgp = releasedTotals.appShareEgp;
+        b.providerShareEgp = releasedTotals.providerShareEgp;
+        b.refundedAt = nowIso();
+        b.status = 'refunded';
+        if (b.providerId) createSettlementAdjustment(b.providerId, b, 'circumvention_confirmed', { providerShareEgp: releasedTotals.providerShareEgp, appShareEgp: releasedTotals.appShareEgp, refundEgp: b.refundEgp, settledProviderShareEgp: settledProv });
+      } else {
+        b.refundEgp = refundAmount(b); // what the patient actually paid (after any voucher discount)
+        b.refundedAt = nowIso();
+        b.refundedShares = { appShareEgp: b.appShareEgp || 0, providerShareEgp: b.providerShareEgp || 0 };
+        b.appShareEgp = 0;
+        b.providerShareEgp = 0;
+        b.status = 'refunded';
+        // v2.1.13 (B2): the reversing adjustment is created ALWAYS on
+        // refund (before or after settlement) — the old code only
+        // created it when the booking was already settled.
+        if (b.providerId) createSettlementAdjustment(b.providerId, b, 'circumvention_confirmed');
+      }
+      restoreVoucher(b); // v2.1.13 (M30)
       store.audit('circumvention.resolved_confirmed', 'admin', { bookingId: b.id, reportId: report.id, refundEgp: b.refundEgp });
     } else {
       store.audit('circumvention.resolved_rejected', 'admin', { bookingId: b.id, reportId: report.id });
@@ -5010,17 +5700,23 @@ router.post('/admin/complaints/:reportId/resolve', requireAdmin, (req, res) => {
       b.refundedShares = { appShareEgp: releasedTotals.appShareEgp, providerShareEgp: releasedTotals.providerShareEgp };
       b.appShareEgp = releasedTotals.appShareEgp;
       b.providerShareEgp = releasedTotals.providerShareEgp;
+      // v2.1.13 (B2): the unreleased refunded amount becomes a
+      // reversing adjustment (for a cash package the provider holds the
+      // cash, so the full refund is owed back to the app).
+      if (b.providerId) createSettlementAdjustment(b.providerId, b, 'complaint_accepted_refund', { providerShareEgp: 0, appShareEgp: 0, refundEgp: b.refundEgp, settledProviderShareEgp: 0 });
     } else {
       b.refundEgp = refundAmount(b); // full refund of what the patient actually paid (after any voucher discount)
       b.refundedShares = { appShareEgp: b.appShareEgp || 0, providerShareEgp: b.providerShareEgp || 0 };
       b.appShareEgp = 0;
       b.providerShareEgp = 0;
-      // v2.1.6 (C4): if this booking was already settled, the refunded
-      // shares become a reversing adjustment on the next settlement.
-      if (b.settledWeekKey) createSettlementAdjustment(b.providerId, b, 'complaint_accepted_refund');
+      // v2.1.13 (B2): the reversing adjustment is created ALWAYS on
+      // refund (before or after settlement) — the old code only created
+      // it when the booking was already settled.
+      if (b.providerId) createSettlementAdjustment(b.providerId, b, 'complaint_accepted_refund');
     }
     b.refundedAt = nowIso();
     b.status = 'refunded';
+    restoreVoucher(b); // v2.1.13 (M30)
     store.audit('complaint.resolved_refund', 'admin', { bookingId: b.id, reportId: report.id, refundEgp: b.refundEgp });
   } else {
     b.complaintStatus = 'rejected';
@@ -5048,6 +5744,18 @@ router.get('/admin/sos', requireAdmin, (req, res) => {
     .filter((b) => b.overdue && ['accepted', 'provider_confirmed'].includes(b.status))
     .map((b) => ({ bookingId: b.id, providerId: b.providerId, acceptedAt: b.acceptedAt, note: 'Visit open >120 minutes without closure.' }));
   res.json({ sos: list.slice().reverse(), overdue, safetyReports: store.data.safetyReports.slice().reverse() });
+});
+
+// v2.1.13 (M24): admin resolves an SOS alert.
+router.post('/admin/sos/:id/resolve', requireAdmin, (req, res) => {
+  const alert = store.data.sos.find((s) => s.id === req.params.id);
+  if (!alert) return res.status(404).json({ error: 'not_found', message: 'SOS alert not found.' });
+  if (alert.status === 'resolved') return bad(res, 409, 'This SOS alert is already resolved.');
+  alert.status = 'resolved';
+  alert.resolvedAt = nowIso();
+  store.audit('admin.sos_resolved', 'admin', { sosId: alert.id, bookingId: alert.bookingId });
+  store.save();
+  res.json({ ok: true, sos: alert });
 });
 
 router.get('/admin/audit', requireAdmin, (req, res) => {

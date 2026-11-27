@@ -11,9 +11,6 @@ const { spawn } = require('child_process');
 // the bank, not the API — the API never leaks 'correct' or red flags).
 const { MCQ, ENGLISH_CHECK, LANGUAGE_TESTS, LANGUAGE_TEST_TOPICS } = require('../src/catalog');
 const LANG_CORRECT = {}; for (const [lang, qs] of Object.entries(LANGUAGE_TESTS)) for (const q of qs) LANG_CORRECT[`${lang}:${q.id}`] = q.correct;
-const CORRECT = Object.fromEntries(MCQ.map((q) => [q.id, q.correct]));
-const RED_FLAG = Object.fromEntries(MCQ.filter((q) => q.redFlagOption).map((q) => [q.id, q.redFlagOption]));
-const EN_CORRECT = Object.fromEntries(ENGLISH_CHECK.map((q) => [q.id, q.correct]));
 
 // Test-only admin PIN: generated fresh on every run (never a fixed value).
 // The server seeds NO default PIN, so the admin-login checks below need
@@ -99,13 +96,19 @@ async function main() {
       return cr.json?.code || null;
     }
     // Register a fresh provider + return a provider-role token.
+    // v2.1.13 (H17/M19): the national ID must be a valid Egyptian ID
+    // (first digit 3, birthdate 2003-04-19, governorate 01) UNIQUE per
+    // phone, the licence unique per phone, and the server terms record
+    // must exist first (POST /api/me/terms with the OTP token).
     async function registerProvider(phone, role, extra = {}) {
       await req('POST', '/api/otp/request', { body: { phone, channel: 'whatsapp' } });
       const code = await mockCode(phone);
       const v = await req('POST', '/api/otp/verify', { body: { phone, code } });
       const tok = v.json?.accessToken;
+      await req('POST', '/api/me/terms', { token: tok, body: { acceptedTerms: true, termsVersion: '1.0' } });
+      const nationalId = `303041901${phone.slice(-4)}1`;
       const reg = await req('POST', '/api/providers/register', { token: tok, body: { ...TERMS,
-        name: `Test ${role}`, providerType: role, role, nationalId: '12345678901234', licenseNo: 'LIC-TEST1',
+        name: `Test ${role}`, providerType: role, role, nationalId, licenseNo: `LIC-${phone.slice(-4)}`,
         certificates: extra.certificates || [],
       } });
       const login = await req('POST', '/api/auth/login-phone', { body: { phone, role: 'provider' } });
@@ -116,19 +119,54 @@ async function main() {
       return { token: login.json?.accessToken || tok, providerId: login.json?.providerId || reg.json?.id, reg, regStatus: reg.status };
     }
     // Answer an interview attempt in a given mode.
+    // v2.1.13 (H15): answers are POSITIONS (0-3) into the published
+    // options, computed by matching the correct option TEXT — never a
+    // key letter (the server rejects key letters with 400). The bank is
+    // 90 questions and each attempt samples 36, so the correct position
+    // is found per question from the bank text. In 'red-flag' mode EVERY
+    // sampled red-flag question is answered with its red-flag option
+    // (at least one is sampled in practice — 13 red flags in the bank).
     async function answerInterview(token, mode) {
       const st = await req('POST', '/api/providers/interview/start', { token });
       if (st.status !== 200) return { start: st, submit: null };
       const answers = {};
+      // v2.1.13 (H15): a deliberately-wrong answer must NEVER be the
+      // red-flag option — otherwise the attempt ends 'red-flag' instead
+      // of the intended 'failed'/'manual-review' (the red-flag position
+      // is shuffled per attempt, so picking (correct+1)%4 blindly is a
+      // ~1-in-3 coin flip per red-flag question).
+      const wrongIdxFor = (q) => {
+        const bankQ = MCQ.find((x) => x.id === q.id);
+        const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+        const correctIdx = q.options.findIndex((o) => o.text === correctText);
+        const rfText = bankQ?.redFlagOption ? bankQ.options.find((o) => o.key === bankQ.redFlagOption)?.text : null;
+        const rfIdx = rfText != null ? q.options.findIndex((o) => o.text === rfText) : -1;
+        for (let d = 1; d <= 3; d++) {
+          const cand = (correctIdx + d) % q.options.length;
+          if (cand !== rfIdx) return cand;
+        }
+        return (correctIdx + 1) % q.options.length;
+      };
       for (const q of st.json.questions) {
-        if (mode === 'all-correct') answers[q.id] = CORRECT[q.id];
-        else if (mode === 'all-wrong') answers[q.id] = 'zzz';
-        else if (mode === 'ethics-wrong') answers[q.id] = q.category === 'ethics' ? 'zzz' : CORRECT[q.id];
-        else if (mode === 'manual-review') answers[q.id] = ['communication', 'resilience', 'conduct'].includes(q.category) ? 'zzz' : CORRECT[q.id];
-        else if (mode === 'red-flag') answers[q.id] = q.id === 'm1' ? RED_FLAG[q.id] : CORRECT[q.id];
+        const bankQ = MCQ.find((x) => x.id === q.id);
+        const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+        const correctIdx = q.options.findIndex((o) => o.text === correctText);
+        const wrongIdx = wrongIdxFor(q);
+        if (mode === 'all-correct') answers[q.id] = correctIdx;
+        else if (mode === 'all-wrong') answers[q.id] = wrongIdx;
+        else if (mode === 'ethics-wrong') answers[q.id] = q.category === 'ethics' ? wrongIdx : correctIdx;
+        else if (mode === 'manual-review') answers[q.id] = ['communication', 'resilience', 'conduct'].includes(q.category) ? wrongIdx : correctIdx;
+        else if (mode === 'red-flag') {
+          const rfText = bankQ?.redFlagOption ? bankQ.options.find((o) => o.key === bankQ.redFlagOption)?.text : null;
+          answers[q.id] = rfText != null ? q.options.findIndex((o) => o.text === rfText) : correctIdx;
+        }
       }
       const enAnswers = {};
-      for (const q of st.json.englishCheck.questions) enAnswers[q.id] = EN_CORRECT[q.id];
+      for (const q of st.json.englishCheck.questions) {
+        const bankQ = ENGLISH_CHECK.find((x) => x.id === q.id);
+        const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+        enAnswers[q.id] = q.options.findIndex((o) => o.text === correctText);
+      }
       const sub = await req('POST', '/api/providers/interview/submit', { token, body: { attemptId: st.json.attemptId, answers, englishAnswers: enAnswers } });
       return { start: st, submit: sub };
     }
@@ -270,10 +308,28 @@ async function main() {
     check('interview dimensions carry minima (medical 5, ethics 5, safety 4)', Array.isArray(r.json?.dimensions) && r.json.dimensions.find((d) => d.key === 'medical')?.min === 5 && r.json.dimensions.find((d) => d.key === 'ethics')?.min === 5 && r.json.dimensions.find((d) => d.key === 'safety')?.min === 4);
     check('english check present, 3 questions', r.json?.englishCheck?.questions?.length === 3);
     // All-wrong -> FAILED (total 0 < 21), retake blocked for 7 days.
+    // v2.1.13 (H15): answers must be valid positions (0-3) — the old
+    // 'zzz' placeholder is now rejected with 400, so a deliberately
+    // wrong answer is a real wrong POSITION (never the red-flag
+    // option, or the attempt would end 'red-flag' instead of 'failed').
     const wrong = {};
-    for (const q of r.json.questions) wrong[q.id] = 'zzz';
+    for (const q of r.json.questions) {
+      const bankQ = MCQ.find((x) => x.id === q.id);
+      const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+      const correctIdx = q.options.findIndex((o) => o.text === correctText);
+      const rfText = bankQ?.redFlagOption ? bankQ.options.find((o) => o.key === bankQ.redFlagOption)?.text : null;
+      const rfIdx = rfText != null ? q.options.findIndex((o) => o.text === rfText) : -1;
+      let w = (correctIdx + 1) % q.options.length;
+      if (w === rfIdx) w = (correctIdx + 2) % q.options.length;
+      wrong[q.id] = w;
+    }
     const enWrong = {};
-    for (const q of r.json.englishCheck.questions) enWrong[q.id] = 'zzz';
+    for (const q of r.json.englishCheck.questions) {
+      const bankQ = ENGLISH_CHECK.find((x) => x.id === q.id);
+      const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+      const correctIdx = q.options.findIndex((o) => o.text === correctText);
+      enWrong[q.id] = (correctIdx + 1) % q.options.length;
+    }
     const attemptId = r.json?.attemptId;
     r = await req('POST', '/api/providers/interview/submit', { token: prov1Token, body: { attemptId, answers: wrong, englishAnswers: enWrong } });
     check('all-wrong interview -> failed, total 0, 7-day cooldown', r.status === 200 && r.json?.status === 'failed' && r.json?.total === 0 && !!r.json?.canRetakeAt && r.json?.attemptsLeft === 2, JSON.stringify(r.json));
@@ -305,12 +361,14 @@ async function main() {
     check('21/36 -> manual-review', manual.submit?.status === 200 && manual.submit?.json?.status === 'manual-review' && manual.submit?.json?.total === 21, JSON.stringify(manual.submit?.json));
     r = await req('POST', `/api/admin/providers/${manualProv.providerId}/interview`, { token: adminToken, body: { decision: 'pass' } });
     check('admin passes manual-review interview -> passed, points 10', r.status === 200 && r.json?.interviewStatus === 'passed' && r.json?.points?.interview === 10, JSON.stringify(r.json));
-    // Red flag: correct everywhere except the unconscious-patient question
-    // (treat at home instead of calling 123) -> instant 'red-flag' fail.
+    // Red flag: correct everywhere except the red-flag options
+    // (e.g. treating an unconscious patient at home instead of calling
+    // 123) -> instant 'red-flag' fail. The total is 36 minus however
+    // many red-flag questions the sampled 36 contained (v2.1.13 H15).
     const redProv = await registerProvider('01016161616', 'nurse');
     check('red-flag provider registered', redProv.regStatus === 201, JSON.stringify(redProv.reg));
     const red = await answerInterview(redProv.token, 'red-flag');
-    check('red-flag answer -> instant red-flag fail at 35/36', red.submit?.status === 200 && red.submit?.json?.status === 'red-flag' && red.submit?.json?.redFlag === true && red.submit?.json?.total === 35 && !!red.submit?.json?.canRetakeAt, JSON.stringify(red.submit?.json));
+    check('red-flag answer -> instant red-flag fail', red.submit?.status === 200 && red.submit?.json?.status === 'red-flag' && red.submit?.json?.redFlag === true && (red.submit?.json?.redFlagQuestions || []).length >= 1 && red.submit?.json?.total < 36 && !!red.submit?.json?.canRetakeAt, JSON.stringify(red.submit?.json));
     r = await req('POST', '/api/providers/interview/start', { token: redProv.token });
     check('red-flag retake needs admin approval -> 409', r.status === 409 && r.json?.error === 'retake_blocked', JSON.stringify(r.json));
     r = await req('POST', `/api/admin/providers/${redProv.providerId}/interview`, { token: adminToken, body: { decision: 'allow-retake' } });
@@ -358,20 +416,21 @@ async function main() {
     check('review before patient confirm -> 409', r.status === 409, JSON.stringify(r.json));
     r = await req('POST', `/api/bookings/${bkId}/confirm-patient`, { token: patientToken2 });
     check('patient confirms -> patient_confirmed', r.status === 200 && r.json?.status === 'patient_confirmed', JSON.stringify(r.json));
-    r = await req('POST', `/api/bookings/${bkId}/review`, { token: patientToken2, body: { rating: 5, comment: 'Great, professional nurse.' } });
-    check('review -> released, app 15% of 375 = 56, provider 319', r.status === 200 && r.json?.status === 'released' && r.json?.appShareEgp === 56 && r.json?.providerShareEgp === 319, JSON.stringify(r.json));
+    r = await req('POST', `/api/bookings/${bkId}/review`, { token: patientToken2, body: { rating: 5, comment: 'Great, professional nurse.', circumventionReported: false } });
+    // v2.1.13 (M33): commission on the SERVICE base only (275), not the
+    // total — app 15% of 275 = 41, provider 375 − 41 = 334 (distance
+    // fee 100 is pass-through, kept in full by the provider).
+    check('review -> released, app 15% of 275 = 41, provider 334', r.status === 200 && r.json?.status === 'released' && r.json?.appShareEgp === 41 && r.json?.providerShareEgp === 334, JSON.stringify(r.json));
     // Wallet ledger reflects it.
     r = await req('GET', '/api/providers/wallet', { token: provToken });
     const entry = r.json?.ledger?.find((l) => l.bookingId === bkId);
     // v2.0.1: released but inside the 24h complaint window -> held, not settleable yet.
-    check('wallet ledger: released amount held for complaint window (319)', r.status === 200 && entry?.direction === 'complaint_hold' && entry?.amountEgp === 319 && r.json?.totals?.complaintHoldEgp === 319, JSON.stringify(r.json?.totals));
+    check('wallet ledger: released amount held for complaint window (334)', r.status === 200 && entry?.direction === 'complaint_hold' && entry?.amountEgp === 334 && r.json?.totals?.complaintHoldEgp === 334, JSON.stringify(r.json?.totals));
     check('wallet has next Thursday settlement', !!r.json?.nextSettlementThursday);
-    // Cash-collected creates a debt entry.
+    // v2.1.13 (B1): cash-collected is a MANUAL override for cash
+    // bookings only — this booking is instapay, so it must refuse.
     r = await req('POST', `/api/bookings/${bkId}/cash-collected`, { token: provToken });
-    check('cash-collected marks booking', r.status === 200 && r.json?.cashCollectedByProvider === true, JSON.stringify(r.json));
-    r = await req('GET', '/api/providers/wallet', { token: provToken });
-    const entry2 = r.json?.ledger?.find((l) => l.bookingId === bkId);
-    check('wallet after cash: app share held for complaint window (56)', entry2?.direction === 'complaint_hold' && entry2?.amountEgp === 56, JSON.stringify(entry2));
+    check('cash-collected on an instapay booking -> 400 (B1 guard)', r.status === 400, JSON.stringify(r.json));
 
     // --- 8. auto-release sweep ------------------------------------------
     console.log('\n[auto-release]');
@@ -438,11 +497,13 @@ async function main() {
     const nm = await mockCode(newPhone);
     const nl = await req('POST', '/api/otp/verify', { body: { phone: newPhone, code: nm || '000000' } });
     const newToken = nl.json?.accessToken;
+    // v2.1.13 (M19): the server terms record must exist before registering.
+    await req('POST', '/api/me/terms', { token: newToken, body: { acceptedTerms: true, termsVersion: '1.0' } });
     r = await req('POST', '/api/providers/register', { token: newToken, body: { ...TERMS,
-      name: 'New Nurse', role: 'nurse', nationalId: '12345678901234', licenseNo: 'LIC-98765',
+      name: 'New Nurse', role: 'nurse', nationalId: '30304190155551', licenseNo: 'LIC-98765',
       certificates: ['BLS'], extraLanguages: [{ language: 'de', certified: true }],
     } });
-    check('provider registered, nationalId/license never returned full', r.status === 201 && r.json?.nationalIdLast4 === '1234' && !JSON.stringify(r.json).includes('12345678901234') && !JSON.stringify(r.json).includes('LIC-98765'), JSON.stringify(r.json));
+    check('provider registered, nationalId/license never returned full', r.status === 201 && r.json?.nationalIdLast4 === '5551' && !JSON.stringify(r.json).includes('30304190155551') && !JSON.stringify(r.json).includes('LIC-98765'), JSON.stringify(r.json));
     check('new provider starts Starter', r.json?.tier === 'Starter');
 
     // --- 13. admin PIN lockout -------------------------------------------
@@ -476,7 +537,10 @@ async function main() {
     r = await req('GET', `/api/providers/wallet`, { token: provToken });
     const cancelEntry = r.json?.ledger?.find((l) => l.bookingId === bkC);
     check('cancelled booking excluded from settlement', cancelEntry?.direction === 'cancelled' && cancelEntry?.amountEgp === 0, JSON.stringify(cancelEntry));
-    // Too late: create, wait out the 5s test window, cancel must be refused.
+    // Too late: create, accept, wait out the 5s test window, cancel must be refused.
+    // v2.1.13 (B4): a PENDING (held) booking cancels at any time — the
+    // window applies only once a provider has accepted. So first prove
+    // the held booking cancels after the window, then an accepted one.
     r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
       patientName: 'Test Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
       distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
@@ -484,7 +548,16 @@ async function main() {
     const bkLate = r.json?.id;
     await sleep(6000);
     r = await req('POST', `/api/bookings/${bkLate}/cancel`, { token: patientToken2 });
-    check('cancel after window -> 409 cancel_window_closed', r.status === 409 && r.json?.error === 'cancel_window_closed', JSON.stringify(r.json));
+    check('v2.1.13 (B4): held booking cancels any time, even after the window', r.status === 200 && r.json?.status === 'cancelled' && r.json?.refundEgp === 250, JSON.stringify(r.json));
+    r = await req('POST', '/api/bookings', { token: patientToken2, body: { ...TERMS,
+      patientName: 'Test Patient', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    const bkLate2 = r.json?.id;
+    await req('POST', `/api/bookings/${bkLate2}/accept`, { token: provToken });
+    await sleep(6000);
+    r = await req('POST', `/api/bookings/${bkLate2}/cancel`, { token: patientToken2 });
+    check('cancel after window (accepted) -> 409 cancel_window_closed', r.status === 409 && r.json?.error === 'cancel_window_closed', JSON.stringify(r.json));
     // Complaint on the released booking (bkId): file, duplicate refused,
     // admin rejects -> the held app share becomes settleable at once.
     r = await req('POST', `/api/bookings/${bkId}/safety-report`, { token: patientToken2, body: { type: 'complaint', description: 'Visit was late, please review.' } });
@@ -498,7 +571,10 @@ async function main() {
     check('admin rejects complaint -> booking complaintStatus rejected', r.status === 200 && r.json?.booking?.complaintStatus === 'rejected', JSON.stringify(r.json));
     r = await req('GET', `/api/providers/wallet`, { token: provToken });
     const entry3 = r.json?.ledger?.find((l) => l.bookingId === bkId);
-    check('after rejection: provider owes app 56 (cash, now settleable)', entry3?.direction === 'provider_owes_app' && entry3?.amountEgp === 56, JSON.stringify(entry3));
+    // v2.1.13 (B1/M33): this booking is instapay (cash-collected no
+    // longer applies to it), so after rejection the app owes the
+    // provider the service-based share 334.
+    check('after rejection: app owes provider 334 (instapay, now settleable)', entry3?.direction === 'app_owes_provider' && entry3?.amountEgp === 334, JSON.stringify(entry3));
     // Refund path: complaint on the auto-released booking, admin accepts.
     r = await req('POST', `/api/bookings/${bk2}/safety-report`, { token: patientToken2, body: { type: 'complaint', description: 'Service was not satisfactory, request refund.' } });
     check('complaint on auto-released booking -> 201', r.status === 201, JSON.stringify(r.json));
@@ -541,7 +617,7 @@ async function main() {
     const rl2 = await req('POST', '/api/otp/verify', { body: { phone: regPhone, code: rm || '000000' } });
     const regToken = rl2.json?.accessToken;
     r = await req('POST', '/api/providers/register', { token: regToken, body: {
-      name: 'No Terms Nurse', role: 'nurse', nationalId: '12345678901234', licenseNo: 'LIC-11111',
+      name: 'No Terms Nurse', role: 'nurse', nationalId: '30304190166661', licenseNo: 'LIC-11111',
     } });
     check('register without acceptedTerms -> 400', r.status === 400, JSON.stringify(r.json));
 
@@ -623,7 +699,7 @@ async function main() {
       if (cp.status !== 200) return { ok: false, step: 'complete-provider', res: cp };
       const cf = await req('POST', `/api/bookings/${id}/confirm-patient`, { token: patientTok });
       if (cf.status !== 200) return { ok: false, step: 'confirm-patient', res: cf };
-      const rv = await req('POST', `/api/bookings/${id}/review`, { token: patientTok, body: { rating: 5, comment: 'Good.' } });
+      const rv = await req('POST', `/api/bookings/${id}/review`, { token: patientTok, body: { rating: 5, comment: 'Good.', circumventionReported: false } });
       if (rv.status !== 200 || rv.json?.status !== 'released') return { ok: false, step: 'review', res: rv };
       return { ok: true, id, created: c.json, complete: cp.json, released: rv.json };
     };
@@ -726,7 +802,10 @@ async function main() {
     check('a completion crossed a cases/weekly-double threshold (earned>=1)', volEarnedPositive, 'no completion in 29 cycles earned points');
     r = await req('GET', '/api/providers/wallet', { token: provToken });
     check('wallet: 34 cases this month, bonus 1000 (new 15/30/60 thresholds), title الممرض الذهبي', r.status === 200 && r.json?.monthlyCases === 34 && r.json?.volumeBonusEgp === 1000 && r.json?.volumeBonus?.title === 'الممرض الذهبي' && r.json?.volumeBonus?.nextBonusAt === 60 && r.json?.volumeBonus?.casesToNextBonus === 26, JSON.stringify(r.json?.volumeBonus));
-    check('wallet totals carry the 1000 bonus into what app owes provider', r.json?.totals?.volumeBonusEgp === 1000 && r.json?.totals?.appOwesProviderEgp === 1000, JSON.stringify(r.json?.totals));
+    // v2.1.13 (B1/M33): bkId's complaint was REJECTED at §15, so its
+    // instapay provider share (334) is settleable at once and is owed
+    // on top of the bonus — appOwes is 334 + 1000, not 1000 alone.
+    check('wallet totals carry the 1000 bonus into what app owes provider', r.json?.totals?.volumeBonusEgp === 1000 && r.json?.totals?.appOwesProviderEgp === 1334, JSON.stringify(r.json?.totals));
     r = await req('GET', '/api/me/vouchers', { token: volToken });
     check('volume patient earned vouchers (29 visits -> 7, next after 3 more)', r.status === 200 && r.json?.vouchers?.length === 7 && r.json?.completedPaidVisits === 29 && r.json?.visitsToNextVoucher === 3, JSON.stringify(r.json)?.slice(0, 300));
     // --- 17c. promo months ------------------------------------------------
@@ -753,7 +832,9 @@ async function main() {
     r = await req('POST', `/api/bookings/${bkPromo}/accept`, { token: provToken });
     check('accept under 0% promo locks commissionPct 0', r.status === 200 && r.json?.commissionPct === 0 && r.json?.promoCommissionPct === 0, JSON.stringify(r.json));
     r = await req('GET', '/api/providers/wallet', { token: provToken });
-    check('wallet under 0% promo: bonus paused, title kept', r.json?.volumeBonus?.paused === true && r.json?.volumeBonusEgp === 0 && r.json?.volumeBonus?.title === 'الممرض الذهبي' && r.json?.totals?.appOwesProviderEgp === 0, JSON.stringify(r.json?.volumeBonus));
+    // v2.1.13 (B1/M33): the bonus is paused (0), but bkId's settleable
+    // instapay share (334, complaint rejected at §15) is still owed.
+    check('wallet under 0% promo: bonus paused, title kept', r.json?.volumeBonus?.paused === true && r.json?.volumeBonusEgp === 0 && r.json?.volumeBonus?.title === 'الممرض الذهبي' && r.json?.totals?.appOwesProviderEgp === 334, JSON.stringify(r.json?.volumeBonus));
     check('wallet shows promo 0%', r.json?.promo?.active === true && r.json?.promo?.commissionPct === 0, JSON.stringify(r.json?.promo));
     r = await req('POST', '/api/admin/promo', { token: adminToken, body: { commissionPct: null } });
     check('admin clears promo -> inactive', r.status === 200 && r.json?.promo?.active === false, JSON.stringify(r.json));
@@ -813,8 +894,11 @@ async function main() {
     await req('POST', `/api/bookings/${bkVou}/vitals`, { token: provToken, body: { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 } });
     await req('POST', `/api/bookings/${bkVou}/complete-provider`, { token: provToken });
     await req('POST', `/api/bookings/${bkVou}/confirm-patient`, { token: vouToken });
-    r = await req('POST', `/api/bookings/${bkVou}/review`, { token: vouToken, body: { rating: 5, comment: 'Used my voucher.' } });
-    check('voucher visit released: provider 297 on full price, app 3', r.status === 200 && r.json?.status === 'released' && r.json?.providerShareEgp === 297 && r.json?.appShareEgp === 3, JSON.stringify(r.json));
+    r = await req('POST', `/api/bookings/${bkVou}/review`, { token: vouToken, body: { rating: 5, comment: 'Used my voucher.', circumventionReported: false } });
+    // v2.1.13 (M33): commission on the SERVICE base only (250) — gross
+    // app 38, voucher 50 funded by the app, so app 0 and provider
+    // 350 − 38 = 312 (the provider is paid on the full pre-discount price).
+    check('voucher visit released: provider 312 on full price, app 0', r.status === 200 && r.json?.status === 'released' && r.json?.providerShareEgp === 312 && r.json?.appShareEgp === 0, JSON.stringify(r.json));
     r = await req('GET', '/api/me/vouchers', { token: vouToken });
     check('voucher now used, none active', r.status === 200 && r.json?.vouchers?.length === 0 && r.json?.used?.length === 1 && r.json?.used?.[0]?.usedBookingId === bkVou, JSON.stringify(r.json)?.slice(0, 300));
     r = await req('POST', '/api/bookings', { token: vouToken, body: { ...TERMS,
@@ -850,16 +934,16 @@ async function main() {
     check('drain_removal 300 high-risk (owner-set)', svc('drain_removal')?.price_egp === 300 && svc('drain_removal')?.riskLevel === 'high');
     check('trach_care 400 high-risk', svc('trach_care')?.price_egp === 400 && svc('trach_care')?.riskLevel === 'high');
     check('iv_infusion 400 high-risk', svc('iv_infusion')?.price_egp === 400 && svc('iv_infusion')?.riskLevel === 'high');
-    check('cannula_iv 350 now high-risk', svc('cannula_iv')?.price_egp === 350 && svc('cannula_iv')?.riskLevel === 'high');
+    check('cannula_iv 250 standard nurse-only (v2.1.13: no longer high-risk)', svc('cannula_iv')?.price_egp === 250 && svc('cannula_iv')?.riskLevel === 'standard' && svc('cannula_iv')?.nurseOnly === true);
     check('suture_removal 250 standard + requiresDoctorOrder', svc('suture_removal')?.price_egp === 250 && svc('suture_removal')?.riskLevel === 'standard' && svc('suture_removal')?.requiresDoctorOrder === true);
-    check('standard new services priced', svc('blood_draw')?.price_egp === 200 && svc('injection')?.price_egp === 150 && svc('vitals_check')?.price_egp === 150 && svc('stoma_care')?.price_egp === 300);
+    check('standard new services priced (v2.1.13 floor 250)', svc('blood_draw')?.price_egp === 250 && svc('injection')?.price_egp === 250 && svc('vitals_check')?.price_egp === 250 && svc('stoma_care')?.price_egp === 300);
     check('cvp_dressing 300 high-risk (owner-set 26 Nov)', svc('cvp_dressing')?.price_egp === 300 && svc('cvp_dressing')?.riskLevel === 'high' && svc('cvp_dressing')?.requiresDoctorOrder === true);
     // v2.1.4 (owner-approved 26 Nov 2026, «سيبها: 500 / 850»): single-day
     // shift prices go BACK to 12h 500 / 24h 850 (they were 700 / 1,200
     // only in v2.1.3). The residence ladder and elderly floors are untouched.
     check('elderly shift mobile 600 / bedridden 700 (owner-set minimums, v2.1.3)', svc('elderly_shift_mobile')?.price_egp === 600 && svc('elderly_shift_mobile')?.riskLevel === 'standard' && svc('elderly_shift_bedridden')?.price_egp === 700 && svc('elderly_shift_bedridden')?.riskLevel === 'standard');
     check('12h shift 500 / 24h shift 850 (v2.1.4 — back from 700 / 1,200)', svc('shift12')?.price_egp === 500 && svc('shift24')?.price_egp === 850);
-    check('bootstrap highRiskServices has 11 incl npwt + cannula_iv + cvp + iron', Array.isArray(r.json?.highRiskServices) && r.json.highRiskServices.length === 11 && r.json.highRiskServices.includes('npwt') && r.json.highRiskServices.includes('cannula_iv') && r.json.highRiskServices.includes('cvp_dressing') && r.json.highRiskServices.includes('iron_infusion'), JSON.stringify(r.json?.highRiskServices));
+    check('bootstrap highRiskServices has 10 incl npwt + cvp + iron (cannula_iv removed, v2.1.13)', Array.isArray(r.json?.highRiskServices) && r.json.highRiskServices.length === 10 && r.json.highRiskServices.includes('npwt') && !r.json.highRiskServices.includes('cannula_iv') && r.json.highRiskServices.includes('cvp_dressing') && r.json.highRiskServices.includes('iron_infusion'), JSON.stringify(r.json?.highRiskServices));
     check('bootstrap highRiskChecklist has 4 items', Array.isArray(r.json?.highRiskChecklist) && r.json.highRiskChecklist.length === 4 && r.json.highRiskChecklist.includes('sterileTechnique'), JSON.stringify(r.json?.highRiskChecklist));
     check('bootstrap otp/push/persistence flags (all off in test)', r.json?.otp?.smsConfigured === false && r.json?.otp?.whatsappConfigured === false && r.json?.push?.fcmConfigured === false && r.json?.persistence === 'file', JSON.stringify({ otp: r.json?.otp, push: r.json?.push, persistence: r.json?.persistence }));
     // --- 18b. doctor-order gate + high-risk accept + checklist --------
@@ -888,8 +972,10 @@ async function main() {
     const al = await req('POST', '/api/otp/verify', { body: { phone: asstPhone, code: am || '000000' } });
     check('assistant otp verify 200', al.status === 200 && !!al.json?.accessToken, JSON.stringify(al.json)?.slice(0, 150));
     const asstToken = al.json?.accessToken;
+    // v2.1.13 (M19): the server terms record must exist before registering.
+    await req('POST', '/api/me/terms', { token: asstToken, body: { acceptedTerms: true, termsVersion: '1.0' } });
     r = await req('POST', '/api/providers/register', { token: asstToken, body: { ...TERMS,
-      name: 'Test Assistant', role: 'assistant', nationalId: '12345678901234', licenseNo: 'LIC-ASST1',
+      name: 'Test Assistant', role: 'assistant', nationalId: '30304190144441', licenseNo: 'LIC-ASST1',
     } });
     check('assistant registered', r.status === 201 && r.json?.role === 'assistant', JSON.stringify(r.json));
     const asstProviderId = r.json?.id;
@@ -1022,7 +1108,7 @@ async function main() {
     r = await req('GET', '/api/me/notifications', { token: patientToken2 });
     const remNotif = (r.json?.notifications || []).find((n) => n.type === 'review_reminder' && n.data?.bookingId === bkRem);
     check('patient got review_reminder for the confirmed visit', !!remNotif, JSON.stringify((r.json?.notifications || []).map((n) => n.type)));
-    r = await req('POST', `/api/bookings/${bkRem}/review`, { token: patientToken2, body: { rating: 5, comment: 'Reviewed after reminder.' } });
+    r = await req('POST', `/api/bookings/${bkRem}/review`, { token: patientToken2, body: { rating: 5, comment: 'Reviewed after reminder.', circumventionReported: false } });
     check('review after reminder releases the visit', r.status === 200 && r.json?.status === 'released', JSON.stringify(r.json));
     // --- 18f. admin persistence endpoint --------------------------------
     r = await req('GET', '/api/admin/persistence', { token: adminToken });
@@ -1087,7 +1173,7 @@ async function main() {
     check('physio complete-provider -> 200 + points', r.status === 200 && r.json?.status === 'provider_confirmed' && r.json?.points, JSON.stringify(r.json)?.slice(0, 300));
     r = await req('POST', `/api/bookings/${bkPhysio}/confirm-patient`, { token: patientToken2 });
     check('physio patient confirm -> 200', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
-    r = await req('POST', `/api/bookings/${bkPhysio}/review`, { token: patientToken2, body: { rating: 5, comment: 'Good.' } });
+    r = await req('POST', `/api/bookings/${bkPhysio}/review`, { token: patientToken2, body: { rating: 5, comment: 'Good.', circumventionReported: false } });
     check('physio review releases visit', r.status === 200 && r.json?.status === 'released', JSON.stringify(r.json)?.slice(0, 200));
     // 21d. v2.1.2 tourist badge gating (TEST-based, supersedes the
     // v2.1.1 certificate rule) + language bonus on release.
@@ -1133,7 +1219,7 @@ async function main() {
     check('tourist complete-provider -> 200 + points payload', r.status === 200 && r.json?.status === 'provider_confirmed' && r.json?.points && typeof r.json.points.earned === 'number', JSON.stringify(r.json)?.slice(0, 300));
     r = await req('POST', `/api/bookings/${bkTourist}/confirm-patient`, { token: patientToken2 });
     check('tourist patient confirm -> 200', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
-    r = await req('POST', `/api/bookings/${bkTourist}/review`, { token: patientToken2, body: { rating: 5, comment: 'Great.' } });
+    r = await req('POST', `/api/bookings/${bkTourist}/review`, { token: patientToken2, body: { rating: 5, comment: 'Great.', circumventionReported: false } });
     check('tourist review releases visit', r.status === 200 && r.json?.status === 'released', JSON.stringify(r.json)?.slice(0, 200));
     r = await req('GET', '/api/providers/wallet', { token: provToken });
     const tourLine = (r.json?.ledger || []).find((l) => l.bookingId === bkTourist);
@@ -1325,6 +1411,9 @@ async function main() {
     r = await req('GET', '/api/monitor/summary', { monitorToken: 'monitor-test-token' });
     const pendApp = (r.json?.pendingApplications?.items || []).find((a) => a.providerId === appA.providerId);
     check('monitor pendingApplications has A with scores, no PII', r.status === 200 && !!pendApp && typeof pendApp.cvScore === 'number' && !('phone' in pendApp) && !('name' in pendApp) && !JSON.stringify(pendApp).includes('01018181818'), JSON.stringify(pendApp));
+    // v2.1.13 (H14): approval requires a PASSED interview first.
+    const appAInterview = await answerInterview(appA.token, 'all-correct');
+    check('application provider A passes interview before approval', appAInterview.submit?.status === 200 && appAInterview.submit?.json?.status === 'passed', JSON.stringify(appAInterview.submit?.json)?.slice(0, 200));
     r = await req('POST', `/api/admin/applications/${appA.providerId}/approve`, { token: adminToken });
     check('admin approves application A -> 200 verified', r.status === 200 && r.json?.status === 'verified', JSON.stringify(r.json)?.slice(0, 200));
     r = await req('POST', `/api/admin/applications/${appA.providerId}/approve`, { token: adminToken });
@@ -1403,8 +1492,12 @@ async function main() {
     const pkgReq = async (body) => req('POST', '/api/package-requests', { token: patientToken2, body: { ...TERMS, patientName: 'Package Patient', packageType: 'package_technician_12', condition: 'After hip surgery, needs daily care', conditionItems: ['post_surgery'], diagnosis: 'Post hip replacement', treatment: 'Painkillers + antibiotics', needs: ['mobility', 'wound_care'], startDate: TODAY, address: 'Quseir, Corniche St 12', distanceKm: 3, notes: '', ...body } });
     r = await pkgReq({ packageType: 'nope' });
     check('package request unknown type -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await pkgReq({ condition: '', conditionItems: [] });
+    check('package request without condition and without items -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    // v2.1.13 (H7): conditionItems alone (no free-text condition) is
+    // enough — the server synthesises the condition from the items.
     r = await pkgReq({ condition: '' });
-    check('package request without condition -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    check('package request with conditionItems but no condition text -> 201 synthesised', r.status === 201 && typeof r.json?.condition === 'string' && r.json.condition.length > 0, JSON.stringify(r.json)?.slice(0, 300));
     r = await pkgReq({ startDate: '2020-01-05' });
     check('package request past start date -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
     r = await pkgReq({ needs: ['teleport'] });
@@ -1702,7 +1795,7 @@ async function main() {
       if (cp.status !== 200) return { ok: false, step: 'complete-provider', res: cp };
       const cf = await req('POST', `/api/bookings/${id}/confirm-patient`, { token: offerToken });
       if (cf.status !== 200) return { ok: false, step: 'confirm-patient', res: cf };
-      const rv = await req('POST', `/api/bookings/${id}/review`, { token: offerToken, body: { rating: 5, comment: 'Good shift.' } });
+      const rv = await req('POST', `/api/bookings/${id}/review`, { token: offerToken, body: { rating: 5, comment: 'Good shift.', circumventionReported: false } });
       if (rv.status !== 200 || rv.json?.status !== 'released') return { ok: false, step: 'review', res: rv };
       return { ok: true, id, created: c.json, accepted: a.json, released: rv.json };
     };
@@ -1888,10 +1981,20 @@ async function main() {
     // THAT attempt here (re-serve its questions, submit all-correct).
     // Starting a fresh attempt would 409 ("already in progress").
     const redQ = await req('GET', '/api/providers/interview/questions', { token: redToken });
+    // v2.1.13 (H15): answers are POSITIONS (0-3) into the published
+    // options, computed by matching the correct option TEXT.
     const redAnswers = {};
-    for (const q of redQ.json?.questions || []) redAnswers[q.id] = CORRECT[q.id];
+    for (const q of redQ.json?.questions || []) {
+      const bankQ = MCQ.find((x) => x.id === q.id);
+      const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+      redAnswers[q.id] = q.options.findIndex((o) => o.text === correctText);
+    }
     const redEn = {};
-    for (const q of redQ.json?.englishCheck?.questions || []) redEn[q.id] = EN_CORRECT[q.id];
+    for (const q of redQ.json?.englishCheck?.questions || []) {
+      const bankQ = ENGLISH_CHECK.find((x) => x.id === q.id);
+      const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+      redEn[q.id] = q.options.findIndex((o) => o.text === correctText);
+    }
     const redRetake = await req('POST', '/api/providers/interview/submit', { token: redToken, body: { attemptId: redQ.json?.attemptId, answers: redAnswers, englishAnswers: redEn } });
     check('C2 redProv retakes interview all-correct -> passed', redRetake.status === 200 && redRetake.json?.status === 'passed', JSON.stringify(redRetake.json)?.slice(0, 200));
     r = await req('POST', `/api/admin/providers/${redProv.providerId}/verify`, { token: adminToken, body: { role: 'nurse' } });
@@ -1917,7 +2020,7 @@ async function main() {
       if (cp.status !== 200) return { ok: false, step: 'complete-provider', res: cp };
       const cf = await req('POST', `/api/bookings/${id}/confirm-patient`, { token: patientTok });
       if (cf.status !== 200) return { ok: false, step: 'confirm-patient', res: cf };
-      const rv = await req('POST', `/api/bookings/${id}/review`, { token: patientTok, body: { rating: 5, comment: 'Good.' } });
+      const rv = await req('POST', `/api/bookings/${id}/review`, { token: patientTok, body: { rating: 5, comment: 'Good.', circumventionReported: false } });
       if (rv.status !== 200 || rv.json?.status !== 'released') return { ok: false, step: 'review', res: rv };
       if (pay === 'cash_receipt') {
         // The provider collected the cash by hand and marks it — this
@@ -2221,9 +2324,9 @@ async function main() {
       const ua = (obj) => run(`__out = updateAvailable(${JSON.stringify(obj)});`);
       check('§28 update: no latestApp -> no update', ua(null) === false);
       check('§28 update: code 0 / empty URL -> no update', ua({ code: 0, apkUrl: '' }) === false);
-      check('§28 update: same code -> no update', ua({ code: 26, apkUrl: 'https://x/app.apk' }) === false);
-      check('§28 update: newer code + URL -> update', ua({ code: 27, apkUrl: 'https://x/app.apk' }) === true);
-      check('§28 update: newer code but no URL -> no update', ua({ code: 27, apkUrl: '' }) === false);
+      check('§28 update: same code -> no update', ua({ code: 27, apkUrl: 'https://x/app.apk' }) === false);
+      check('§28 update: newer code + URL -> update', ua({ code: 28, apkUrl: 'https://x/app.apk' }) === true);
+      check('§28 update: newer code but no URL -> no update', ua({ code: 28, apkUrl: '' }) === false);
       const dc = (obj) => run(`__out = updateDialogConfig(${JSON.stringify(obj)});`);
       check('§28 update dialog: optional update can be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: false }).hideCancel === false);
       check('§28 update dialog: forced update cannot be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: true }).hideCancel === true);
@@ -2324,7 +2427,7 @@ async function main() {
     check('§28 terms page shows a prominent scroll-to-accept hint', webJs.includes('termsScrollMust') && webJs.includes('termsScrollHintBox'), 'no prominent terms hint');
     check('§28 last-screen restore is wired (save on navigate, restore at boot)', webJs.includes('saveLastScreen(hash)') && webJs.includes('restoreLastScreen'), 'last-screen restore not wired');
     check('§28 update checker runs after bootstrap on launch', webJs.includes('await loadBootstrap(); checkForAppUpdate();'), 'update check not wired');
-    check('§28 version header is v2.1.12 code 26', webJs.includes('v2.1.12, code 26'), 'header not bumped');
+    check('§28 version header is v2.1.13 code 27', webJs.includes('v2.1.13, code 27'), 'header not bumped');
   }
 
   // --- §29. v2.1.8: password-gated login + push de-automation + responsive layout ---
@@ -2435,11 +2538,11 @@ async function main() {
     // the notifications-screen Settings fallback (syncPushRegistration,
     // only when the permission is already granted). It must NEVER run
     // from the login path: that was the 2.1.7 login kill.
-    check('§29 no automatic push registration on the login path (registerPushToken only via tap/sync)', noComments.includes('async function registerPushToken(push)') && !clBody.includes('registerPushToken'), 'registerPushToken on the login path');
+    check('§29 no automatic push registration on the login path (registerPushToken only via tap/sync)', noComments.includes('async function registerPushToken(push, opts)') && !clBody.includes('registerPushToken'), 'registerPushToken on the login path');
     check('§29 completeLogin shows only the DOM explain card, no native push', clBody.includes('maybeShowPushExplainCard();') && !clBody.includes('getPushPlugin') && !clBody.includes('PushNotifications') && !clBody.includes('registerPushToken'), 'completeLogin still touches push');
     check('§29 getPushPlugin is called only from requestPushPermission + syncPushRegistration', (webJs.match(/getPushPlugin\(\)/g) || []).length === 3, `getPushPlugin() occurrences: ${(webJs.match(/getPushPlugin\(\)/g) || []).length}`);
     check('§29 no silent permission check on the login path (checkPermissions only via tap/sync)', !clBody.includes('checkPermissions'), 'checkPermissions on the login path');
-    check('§29 native push.register() lives only in registerPushToken (tap/sync call it)', (webJs.match(/push\.register\(\)/g) || []).length === 1 && webJs.includes('async function registerPushToken(push)'), 'push.register() outside registerPushToken');
+    check('§29 native push.register() lives only in registerPushToken (tap/sync call it)', (webJs.match(/push\.register\(\)/g) || []).length === 1 && webJs.includes('async function registerPushToken(push, opts)'), 'push.register() outside registerPushToken');
     check('§29 explicit-tap entry points exist (card Allow + notifications button)', webJs.includes('await requestPushPermission();') && webJs.includes('requestPushPermission();'), 'explicit-tap entry missing');
     check('§29 death-step markers wrap every native push call', webJs.includes('setDeathStep("push:requestPermissions")') && webJs.includes('setDeathStep("push:register")') && webJs.includes('setDeathStep("push:addListener")') && webJs.includes('clearDeathStep()'), 'step markers missing');
     const ruStart = webJs.indexOf('async function refreshUnreadCount');
@@ -2489,8 +2592,8 @@ async function main() {
   // 29f. Version header + responsive layout (360–430px audit).
   {
     const webJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
-    check('§29 version header is v2.1.12 code 26', webJs.includes('v2.1.12, code 26'), 'header not bumped');
-    check('§29 APP_VERSION_CODE is 26 / NAME is 2.1.12', webJs.includes('const APP_VERSION_CODE = 26;') && webJs.includes('const APP_VERSION_NAME = "2.1.12";'), 'version constants not bumped');
+    check('§29 version header is v2.1.13 code 27', webJs.includes('v2.1.13, code 27'), 'header not bumped');
+    check('§29 APP_VERSION_CODE is 27 / NAME is 2.1.13', webJs.includes('const APP_VERSION_CODE = 27;') && webJs.includes('const APP_VERSION_NAME = "2.1.13";'), 'version constants not bumped');
     check('§29 footer shows the installed version in-app', webJs.includes('v${APP_VERSION_NAME} (${APP_VERSION_CODE})'), 'footer has no version');
     const css = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'style.css'), 'utf8');
     check('§29 CSS: no horizontal page scroll (overflow-x clip safety net)', css.includes('overflow-x: clip'), 'no overflow-x guard');
@@ -2513,7 +2616,7 @@ async function main() {
     r = await req('POST', '/api/auth/register', { xff, body: { phone: dualPhone, password: 'dualpass1', terms: { acceptedTerms: true, termsVersion: '1.0' } } });
     check('§29 dual-role setup: patient registration -> 201', r.status === 201, JSON.stringify(r.json));
     const dualPatientToken = r.json?.accessToken;
-    r = await req('POST', '/api/providers/register', { xff, token: dualPatientToken, body: { ...TERMS, name: 'Dual Role Nurse', providerType: 'nurse', role: 'nurse', nationalId: '12345678901234', licenseNo: 'LIC-DUAL1', certificates: [] } });
+    r = await req('POST', '/api/providers/register', { xff, token: dualPatientToken, body: { ...TERMS, name: 'Dual Role Nurse', providerType: 'nurse', role: 'nurse', nationalId: '30304190100051', licenseNo: 'LIC-DUAL1', certificates: [] } });
     check('§29 dual-role setup: same phone registers as a provider -> 201', r.status === 201, JSON.stringify(r.json));
     r = await req('POST', '/api/auth/login-phone', { xff, body: { phone: dualPhone, password: 'dualpass1', role: 'patient' } });
     check('§29 dual-role login as patient returns a PATIENT token', r.status === 200 && r.json?.role === 'patient', JSON.stringify(r.json)?.slice(0, 200));
@@ -2576,14 +2679,16 @@ async function main() {
     // 30c. File inputs: the 9 receipt/certificate uploads remain — the
     // system chooser is a full activity, not a WebView popup, and there
     // is no in-app replacement without the Capacitor Camera plugin.
-    const fileIds = ['bkReceipt', 'trackReceipt', 'tuReceipt', 'npReceipt', 'poReceipt', 'prCerts', 'docFile'];
-    check('§30 all 9 file inputs are the known receipt/certificate uploads', fileIds.every((id) => webJs.includes(`id="${id}"`)) && (webJs.match(/type="file"/g) || []).length === 9, `file inputs: ${(webJs.match(/type="file"/g) || []).length}`);
+    const fileIds = ['bkReceipt', 'tuReceipt', 'npReceipt', 'poReceipt', 'prCerts', 'docFile'];
+    // trackReceipt is dynamic (trackReceipt_<bookingId>, one input per
+    // booking in the list) — match the prefix, not a literal id.
+    check('§30 all 9 file inputs are the known receipt/certificate uploads', fileIds.every((id) => webJs.includes(`id="${id}"`)) && webJs.includes('trackReceipt_') && (webJs.match(/type="file"/g) || []).length === 9, `file inputs: ${(webJs.match(/type="file"/g) || []).length}`);
     // 30d. Safe-area topbar + sheet styles in CSS.
     check('§30 CSS: topbar respects the Android safe area', css.includes('env(safe-area-inset-top'), 'no safe-area rule');
     check('§30 CSS: option-sheet field + list styles exist', css.includes('.app-select') && css.includes('.opt-item') && css.includes('.opt-search'), 'sheet styles missing');
     check('§30 CSS: large complaint rows exist', css.includes('.opt-list.opt-large .opt-item'), 'large-row styles missing');
     // 30e. Version header.
-    check('§30 version header is v2.1.12 code 26', webJs.includes('v2.1.12, code 26') && webJs.includes('const APP_VERSION_CODE = 26;') && webJs.includes('const APP_VERSION_NAME = "2.1.12";'), 'header not bumped');
+    check('§30 version header is v2.1.13 code 27', webJs.includes('v2.1.13, code 27') && webJs.includes('const APP_VERSION_CODE = 27;') && webJs.includes('const APP_VERSION_NAME = "2.1.13";'), 'header not bumped');
     // 30g. The v2.1.9 interview SyntaxError (found by the zero-defect
     // tap-through): three radios embedded JSON.stringify (double
     // quotes) inside a DOUBLE-quoted inline handler — the attribute
@@ -2642,8 +2747,8 @@ async function main() {
     check('§31 requestPushPermission skips the dialog when already granted', reqFn.includes('perm.receive === "granted"') && reqFn.includes('await registerPushToken(push)'), 'granted fast-path missing');
     check('§31 requestPushPermission shows Settings hint when denied', reqFn.includes('perm.receive === "denied"') && reqFn.includes('showPushDeniedHint()'), 'denied hint missing');
     check('§31 requestPushPermission returns early when already registered', reqFn.includes('pushRegistered()'), 'already-registered early return missing');
-    check('§31 registerPushToken + syncPushRegistration exist', webJs.includes('async function registerPushToken(push)') && webJs.includes('async function syncPushRegistration()'), 'push helpers missing');
-    check('§31 syncPushRegistration runs from the notifications screen only', webJs.slice(webJs.indexOf('async function loadNotifications()'), webJs.indexOf('async function loadNotifications()') + 600).includes('syncPushRegistration();'), 'sync not wired to loadNotifications');
+    check('§31 registerPushToken + syncPushRegistration exist', webJs.includes('async function registerPushToken(push, opts)') && webJs.includes('async function syncPushRegistration()'), 'push helpers missing');
+    check('§31 syncPushRegistration runs from the notifications screen only', webJs.slice(webJs.indexOf('async function loadNotifications()'), webJs.indexOf('\n}\n', webJs.indexOf('async function loadNotifications()'))).includes('syncPushRegistration();'), 'sync not wired to loadNotifications');
     check('§31 syncPushRegistration never runs from login', !webJs.slice(webJs.indexOf('async function completeLogin'), webJs.indexOf('async function completeLogin') + 2500).includes('syncPushRegistration') && !webJs.slice(webJs.indexOf('async function afterPasswordSet'), webJs.indexOf('async function afterPasswordSet') + 800).includes('syncPushRegistration'), 'sync leaked into the login path');
     // v2.1.12: the one-liner became a try/catch with a visible failure
     // path — the mark + toast still happen only after the POST succeeds,
@@ -2656,7 +2761,7 @@ async function main() {
     check('§31 broadcast tab shows accounts/devices/audience', webJs.includes('broadcastAccounts') && webJs.includes('broadcastAudience') && webJs.includes('d.broadcastAccounts'), 'broadcast tab labels missing');
     check('§31 broadcast i18n exists in both languages', webJs.includes('broadcastAccounts: "حسابات مسجلة"') && webJs.includes('broadcastAccounts: "Registered accounts"') && webJs.includes('broadcastAudience: "جمهور البث"') && webJs.includes('broadcastAudience: "Broadcast audience"'), 'broadcast i18n missing');
     // 31d. Version bump.
-    check('§31 app.js header + APP_VERSION_NAME are 2.1.12 / code 26', webJs.includes('v2.1.12, code 26') && webJs.includes('const APP_VERSION_NAME = "2.1.12"'), 'version not bumped');
+    check('§31 app.js header + APP_VERSION_NAME are 2.1.13 / code 27', webJs.includes('v2.1.13, code 27') && webJs.includes('const APP_VERSION_NAME = "2.1.13"'), 'version not bumped');
     // 31e. Dashboard counts: the true audience equals the dry-run users
     // count, and it always includes the registered accounts (the v2.1.9
     // 0/0 bug: broadcastUsers counted only phones with an FCM device, so
@@ -2671,7 +2776,7 @@ async function main() {
     // logic touched, nothing stored, nothing logged.
     const css31 = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'style.css'), 'utf8');
     const pwIds = ['loginPassword', 'loginPasswordConfirm', 'setPassword', 'setPasswordConfirm', 'adminPinInput'];
-    check('§31 every password field is wrapped with an eye button (6 fields)', (webJs.match(/type="password"/g) || []).length === 6 && (webJs.match(/class="pw-wrap"/g) || []).length === 6, `password inputs: ${(webJs.match(/type="password"/g) || []).length}, wraps: ${(webJs.match(/class="pw-wrap"/g) || []).length}`);
+    check('§31 every password field is wrapped with an eye button (6 fields)', (webJs.match(/type="password"/g) || []).length === 6 && (webJs.match(/class="pw-wrap/g) || []).length === 6, `password inputs: ${(webJs.match(/type="password"/g) || []).length}, wraps: ${(webJs.match(/class="pw-wrap/g) || []).length}`);
     check('§31 pwEye is wired for every password field id', pwIds.every((id) => webJs.includes(`pwEye("${id}")`)), 'a password field has no eye button');
     check('§31 togglePw + pwEye helpers exist', webJs.includes('window.togglePw = function (inputId, btn)') && webJs.includes('function pwEye(id)'), 'eye helpers missing');
     check('§31 togglePw only flips the type, never stores or logs the password', webJs.slice(webJs.indexOf('window.togglePw'), webJs.indexOf('function pwEye')).includes('el.type = show ? "text" : "password"') && !/localStorage|sessionStorage|console\.log|api\(/.test(webJs.slice(webJs.indexOf('window.togglePw'), webJs.indexOf('function pwEye'))), 'togglePw touches storage/logs');
@@ -2830,7 +2935,7 @@ async function main() {
     check('§34 broadcast form has an in-app clear button', webJs34.includes('onclick="clearBroadcastForm()"') && webJs34.includes('t("broadcastClear")'), 'clear button missing');
     check('§34 broadcastClear i18n exists in both languages', webJs34.includes('broadcastClear: "مسح الرسالة"') && webJs34.includes('broadcastClear: "Clear message"'), 'clear i18n missing');
     check('§34 broadcast title/body text and flow unchanged', webJs34.includes('id="bcTitle"') && webJs34.includes('id="bcBody"') && webJs34.includes('window.sendBroadcast = async function (dryRun)'), 'broadcast form/flow changed');
-    check('§34 version header is v2.1.12 code 26', webJs34.includes('v2.1.12, code 26') && webJs34.includes('const APP_VERSION_CODE = 26;') && webJs34.includes('const APP_VERSION_NAME = "2.1.12";'), 'version not bumped');
+    check('§34 version header is v2.1.13 code 27', webJs34.includes('v2.1.13, code 27') && webJs34.includes('const APP_VERSION_CODE = 27;') && webJs34.includes('const APP_VERSION_NAME = "2.1.13";'), 'version not bumped');
     // 34c. Static: the native guard exists in MainActivity.
     const main34 = fs.readFileSync(path.join(__dirname, '..', '..', 'android', 'android', 'app', 'src', 'main', 'java', 'com', 'shifacare', 'elquseir', 'MainActivity.java'), 'utf8');
     check('§34 MainActivity aborts floating action modes at creation', main34.includes('public ActionMode onWindowStartingActionMode(ActionMode.Callback callback, int type)') && main34.includes('if (type == ActionMode.TYPE_FLOATING)') && main34.includes('return null;'), 'onWindowStartingActionMode guard missing');
@@ -2956,7 +3061,7 @@ async function main() {
     }
     // 35b. Static: listeners-first order + the 10s timeout arm + the
     // visible status box + the failure paths that used to be silent.
-    const regFnIdx = webJs35.indexOf('async function registerPushToken(push)');
+    const regFnIdx = webJs35.indexOf('async function registerPushToken(push, opts)');
     const regFnEnd = webJs35.indexOf('\n}\n', regFnIdx);
     const regFnBody = regFnIdx === -1 ? '' : webJs35.slice(regFnIdx, regFnEnd === -1 ? regFnIdx + 3000 : regFnEnd);
     check('§35 registerPushToken attaches listeners BEFORE register()', regFnBody.indexOf('attachPushListeners(push)') !== -1 && regFnBody.indexOf('push.register()') !== -1 && regFnBody.indexOf('attachPushListeners(push)') < regFnBody.indexOf('push.register()'), 'listeners-first order broken');
@@ -3076,6 +3181,392 @@ async function main() {
     }
     await sweepOnStore36(path.join(__dirname, 'sweep-fresh-data.json'), 'fresh');
     await sweepOnStore36(path.join(__dirname, 'sweep-partial-data.json'), 'partial');
+  }
+
+  // --- §37. v2.1.13: audit-fix regression checks ----------------------
+  // One block per fix family, all against the live server. B3's live
+  // regression already exists in §23i (cancel after start refunds
+  // total − released days only); the review-day guard is pinned
+  // statically below. The 24h sweep auto-cancel for rejected receipts
+  // (B4) cannot be aged in-test — it is covered by the accept-403
+  // below plus the sweep code path.
+  console.log('\n[§37 v2.1.13]');
+  {
+    const XFF37A = '10.37.0.1';
+    const XFF37B = '10.37.0.2';
+    const XFF37C = '10.37.0.3';
+    const XFF37D = '10.37.0.4';
+    // Fresh patient (fresh XFF bucket — the main IP's login/OTP buckets
+    // are exhausted by the earlier sections).
+    await req('POST', '/api/otp/request', { xff: XFF37A, body: { phone: '01037373738', channel: 'whatsapp' } });
+    const code37 = await mockCode('01037373738');
+    const v37 = await req('POST', '/api/otp/verify', { xff: XFF37A, body: { phone: '01037373738', code: code37 } });
+    const p37 = v37.json?.accessToken;
+    check('§37 fresh patient logs in (OTP, fresh XFF bucket)', v37.status === 200 && !!p37, JSON.stringify(v37.json)?.slice(0, 200));
+    // Full visit cycle with appA (Starter, 15%) as the provider.
+    const cycle37 = async (patientTok, km, extraBody = {}) => {
+      const c = await req('POST', '/api/bookings', { token: patientTok, body: { ...TERMS,
+        patientName: 'Cycle37', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+        distanceKm: km, respectCharterAccepted: true, triage: { dangerSigns: [] }, ...extraBody,
+      } });
+      if (c.status !== 201) return { ok: false, step: 'create', res: c };
+      const id = c.json.id;
+      const a = await req('POST', `/api/bookings/${id}/accept`, { token: appA.token });
+      if (a.status !== 200) return { ok: false, step: 'accept', res: a };
+      const v = await req('POST', `/api/bookings/${id}/vitals`, { token: appA.token, body: { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 } });
+      if (v.status !== 200) return { ok: false, step: 'vitals', res: v };
+      const cp = await req('POST', `/api/bookings/${id}/complete-provider`, { token: appA.token });
+      if (cp.status !== 200) return { ok: false, step: 'complete-provider', res: cp };
+      const cf = await req('POST', `/api/bookings/${id}/confirm-patient`, { token: patientTok });
+      if (cf.status !== 200) return { ok: false, step: 'confirm-patient', res: cf };
+      const rv = await req('POST', `/api/bookings/${id}/review`, { token: patientTok, body: { rating: 5, comment: 'Good.', circumventionReported: false } });
+      if (rv.status !== 200 || rv.json?.status !== 'released') return { ok: false, step: 'review', res: rv };
+      return { ok: true, id, created: c.json, accept: a.json, released: rv.json };
+    };
+    const complain37 = async (bookingId, decision) => {
+      const sr = await req('POST', `/api/bookings/${bookingId}/safety-report`, { token: p37, body: { type: 'complaint', description: '§37 test complaint.' } });
+      if (sr.status !== 201) return { ok: false, step: 'complaint', res: sr };
+      const rr = await req('POST', `/api/admin/complaints/${sr.json?.reportId}/resolve`, { token: adminToken, body: { decision } });
+      return { ok: rr.status === 200, step: 'resolve', res: rr, reportId: sr.json?.reportId };
+    };
+    const walletEntry37 = async (bookingId) => {
+      const w = await req('GET', '/api/providers/wallet', { token: appA.token });
+      return (w.json?.ledger || []).find((l) => l.bookingId === bookingId);
+    };
+    const audit37 = async () => {
+      const a = await req('GET', '/api/admin/audit?limit=200', { token: adminToken });
+      return Array.isArray(a.json) ? a.json : [];
+    };
+
+    // 37a. H15: 90-question bank, 36 sampled per attempt, answers are
+    // positions only — key letters / out-of-range / unknown ids 400.
+    check('§37 interview bank is 90 questions', MCQ.length === 90, `MCQ=${MCQ.length}`);
+    const st37 = await req('POST', '/api/providers/interview/start', { token: provToken });
+    check('§37 interview start returns 36 sampled questions', st37.status === 200 && Array.isArray(st37.json?.questions) && st37.json.questions.length === 36, JSON.stringify(st37.json)?.slice(0, 200));
+    const qs37 = st37.json?.questions || [];
+    const dims37 = {};
+    for (const q of qs37) dims37[q.category] = (dims37[q.category] || 0) + 1;
+    check('§37 sampled questions cover the 6 dimensions by quota (8/7/6/6/5/4)', dims37.medical === 8 && dims37.ethics === 7 && dims37.safety === 6 && dims37.communication === 6 && dims37.resilience === 5 && dims37.conduct === 4, JSON.stringify(dims37));
+    check('§37 sampled ids are all in the 90-question bank', qs37.every((q) => MCQ.some((x) => x.id === q.id)), JSON.stringify(qs37.map((q) => q.id).slice(0, 5)));
+    check('§37 published options carry text only (no key/correct/red-flag)', qs37.every((q) => Array.isArray(q.options) && q.options.length === 4 && q.options.every((o) => typeof o.text === 'string' && !('key' in o) && !('correct' in o))), JSON.stringify(qs37[0]?.options));
+    const correctPos37 = {};
+    for (const q of qs37) {
+      const bankQ = MCQ.find((x) => x.id === q.id);
+      const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+      correctPos37[q.id] = q.options.findIndex((o) => o.text === correctText);
+    }
+    const enPos37 = {};
+    for (const q of (st37.json?.englishCheck?.questions || [])) {
+      const bankQ = ENGLISH_CHECK.find((x) => x.id === q.id);
+      const correctText = bankQ?.options.find((o) => o.key === bankQ.correct)?.text;
+      enPos37[q.id] = q.options.findIndex((o) => o.text === correctText);
+    }
+    const attempt37 = st37.json?.attemptId;
+    r = await req('POST', '/api/providers/interview/submit', { token: provToken, body: { attemptId: attempt37, answers: { ...correctPos37, [qs37[0].id]: 'a' }, englishAnswers: enPos37 } });
+    check('§37 interview answer as a key letter -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/providers/interview/submit', { token: provToken, body: { attemptId: attempt37, answers: { ...correctPos37, [qs37[1].id]: 4 }, englishAnswers: enPos37 } });
+    check('§37 interview answer out of range (4) -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/providers/interview/submit', { token: provToken, body: { attemptId: attempt37, answers: { ...correctPos37, nope_qid: 0 }, englishAnswers: enPos37 } });
+    check('§37 interview answer for a question outside this attempt -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', '/api/providers/interview/submit', { token: provToken, body: { attemptId: attempt37, answers: correctPos37, englishAnswers: enPos37 } });
+    check('§37 the same attempt still submits all-correct -> passed 36/36 (400s did not consume it)', r.status === 200 && r.json?.status === 'passed' && r.json?.total === 36 && r.json?.scores?.medical === 8 && r.json?.scores?.ethics === 7 && r.json?.scores?.safety === 6, JSON.stringify(r.json)?.slice(0, 300));
+
+    // 37b. M16: manual-review blocks start/fetch until an admin decides.
+    const register37 = async (phone, role) => {
+      await req('POST', '/api/otp/request', { xff: XFF37B, body: { phone, channel: 'whatsapp' } });
+      const code = await mockCode(phone);
+      const v = await req('POST', '/api/otp/verify', { xff: XFF37B, body: { phone, code } });
+      const tok = v.json?.accessToken;
+      await req('POST', '/api/me/terms', { xff: XFF37B, token: tok, body: { acceptedTerms: true, termsVersion: '1.0' } });
+      const nationalId = `303041901${phone.slice(-4)}1`;
+      const reg = await req('POST', '/api/providers/register', { xff: XFF37B, token: tok, body: { ...TERMS,
+        name: `Test ${role}`, providerType: role, role, nationalId, licenseNo: `LIC-${phone.slice(-4)}`, certificates: [],
+      } });
+      const login = await req('POST', '/api/auth/login-phone', { xff: XFF37B, body: { phone, role: 'provider' } });
+      return { token: login.json?.accessToken || tok, providerId: login.json?.providerId || reg.json?.id, reg, regStatus: reg.status };
+    };
+    const mr37 = await register37('01037373737', 'nurse');
+    check('§37 manual-review provider registered', mr37.regStatus === 201, JSON.stringify(mr37.reg));
+    const mrInterview = await answerInterview(mr37.token, 'manual-review');
+    check('§37 21/36 -> manual-review', mrInterview.submit?.status === 200 && mrInterview.submit?.json?.status === 'manual-review' && mrInterview.submit?.json?.total === 21, JSON.stringify(mrInterview.submit?.json));
+    r = await req('POST', '/api/providers/interview/start', { token: mr37.token });
+    check('§37 interview start while manual-review -> 409', r.status === 409 && String(JSON.stringify(r.json)).includes('manual_review'), JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', '/api/providers/interview/questions', { token: mr37.token });
+    check('§37 interview questions fetch while manual-review -> 409', r.status === 409 && String(JSON.stringify(r.json)).includes('manual_review'), JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/providers/${mr37.providerId}/interview`, { token: adminToken, body: { decision: 'pass' } });
+    check('§37 admin passes manual-review interview -> passed, points 10', r.status === 200 && r.json?.interviewStatus === 'passed' && r.json?.points?.interview === 10, JSON.stringify(r.json)?.slice(0, 300));
+    const mrPass = await answerInterview(mr37.token, 'all-correct');
+    check('§37 after the admin pass the provider can retake and pass 36/36', mrPass.submit?.status === 200 && mrPass.submit?.json?.status === 'passed' && mrPass.submit?.json?.total === 36, JSON.stringify(mrPass.submit?.json));
+
+    // 37c. H17/H16: national-ID validation + uniqueness, re-registration
+    // after rejection keeps the interview record; admin reopen path.
+    const rereg37 = async (nationalId, licenseNo) => req('POST', '/api/providers/register', { token: appB.token, body: { ...TERMS,
+      name: 'Test nurse', providerType: 'nurse', role: 'nurse', nationalId, licenseNo, certificates: [{ name: 'BLS' }],
+    } });
+    r = await rereg37('10304190119191', 'LIC-1919');
+    check('§37 re-register with a national ID starting with 1 -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await rereg37('30313010119191', 'LIC-1919');
+    check('§37 re-register with an impossible birth month (13) -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await rereg37('30304190118181', 'LIC-1919');
+    check('§37 re-register with appA\'s national ID -> 409 duplicate', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    r = await rereg37('30304190119192', 'LIC-1818');
+    check('§37 re-register with appA\'s licence number -> 409 duplicate', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    r = await rereg37('30304190119192', 'LIC-1919');
+    check('§37 re-register with a valid unique ID -> 200 pending, interview record kept (not_started)', r.status === 200 && r.json?.status === 'pending' && r.json?.interviewStatus === 'not_started', JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', `/api/admin/applications/${appB.providerId}/reject`, { token: adminToken, body: { reason: '§37 test reject' } });
+    check('§37 admin rejects appB again -> rejected', r.status === 200 && r.json?.status === 'rejected', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/applications/${appB.providerId}/reopen`, { token: adminToken, body: {} });
+    check('§37 admin reopens a rejected application -> pending', r.status === 200 && r.json?.status === 'pending', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/applications/${appB.providerId}/reopen`, { token: adminToken, body: {} });
+    check('§37 reopening a non-rejected application -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+
+    // 37d. B1/B2/M30 + cash-voucher net: 4 cycles earn a voucher, then
+    // #1 (cash 250, complaint rejected -> provider owes the 38 app
+    // share), #2 (cash 350 with the voucher, complaint refunded ->
+    // adjustment 300 = what the patient actually paid, voucher
+    // restored), #3 (cash 350 with the restored voucher, complaint
+    // rejected -> the APP owes the provider 20: voucher 50 minus gross
+    // app share 30), #4 + #5 (8th PAID visit -> second voucher earned).
+    // NOTE (approved points system): appA auto-upgrades Starter -> Pro
+    // at the 5th rated visit (interview 20 + rating 20 = 40 points), so
+    // #1 locks Starter 15% but #2/#3 lock Pro 12% (gross app share on
+    // the 250 service base is 30, not 38). And a REFUNDED visit is not
+    // a paid visit (completedPaidVisits counts released bookings only),
+    // so #2's refund means the 8th paid visit is #5, not #4.
+    let cycles37Ok = true; let cycles37Fail = '';
+    for (let i = 0; i < 4; i++) {
+      const cyc = await cycle37(p37, 2);
+      if (!cyc.ok) { cycles37Ok = false; cycles37Fail = `${cyc.step} ${JSON.stringify(cyc.res?.json || cyc.res)}`; break; }
+      if (i === 0) {
+        check('§37 cash booking is flagged cash at creation (B1)', cyc.created?.cashCollectedByProvider === true && cyc.created?.amountEgp === 250 && cyc.created?.amountPayableEgp === 250, JSON.stringify(cyc.created)?.slice(0, 300));
+        check('§37 accept locks Starter 15%, estimated share 212 (250 − 38)', cyc.accept?.commissionPct === 15 && cyc.accept?.estimatedProviderShareEgp === 212, JSON.stringify(cyc.accept)?.slice(0, 300));
+        check('§37 cycle release: provider 212, app 38', cyc.released?.providerShareEgp === 212 && cyc.released?.appShareEgp === 38, JSON.stringify(cyc.released)?.slice(0, 300));
+      }
+    }
+    check('§37 4 voucher-earning cycles complete', cycles37Ok, cycles37Fail.slice(0, 300));
+    r = await req('GET', '/api/me/vouchers', { token: p37 });
+    const voucher37 = (r.json?.vouchers || [])[0];
+    check('§37 after 4 paid visits the patient holds one 50 EGP voucher', r.status === 200 && (r.json?.vouchers || []).length === 1 && voucher37?.amountEgp === 50 && r.json?.completedPaidVisits === 4 && r.json?.vouchersEarned === 1, JSON.stringify(r.json)?.slice(0, 300));
+    const c1 = await cycle37(p37, 2);
+    check('§37 #1 cash 250 cycle completes', c1.ok, c1.ok ? '' : `${c1.step} ${JSON.stringify(c1.res?.json || c1.res)}`.slice(0, 300));
+    const rc1 = await complain37(c1.id, 'rejected');
+    check('§37 #1 complaint rejected -> settleable at once', rc1.ok && rc1.res?.json?.booking?.complaintStatus === 'rejected', JSON.stringify(rc1.res?.json)?.slice(0, 300));
+    const w1 = await walletEntry37(c1.id);
+    check('§37 #1 wallet: provider owes the app 38 (cash app share)', w1?.direction === 'provider_owes_app' && w1?.amountEgp === 38, JSON.stringify(w1));
+    const c2 = await cycle37(p37, 8);
+    check('§37 #2 cash 350 cycle completes, voucher applied (payable 300)', c2.ok && c2.created?.amountEgp === 350 && c2.created?.amountPayableEgp === 300 && c2.created?.voucherDiscountEgp === 50, JSON.stringify(c2.created)?.slice(0, 300));
+    check('§37 #2 release: provider 320 on the full price, app 0 (voucher eats the 30)', c2.released?.providerShareEgp === 320 && c2.released?.appShareEgp === 0, JSON.stringify(c2.released)?.slice(0, 300));
+    const rc2 = await complain37(c2.id, 'accepted_refund');
+    check('§37 #2 complaint accepted -> refunded 300 (what the patient paid)', rc2.ok && rc2.res?.json?.booking?.status === 'refunded' && rc2.res?.json?.booking?.refundEgp === 300, JSON.stringify(rc2.res?.json)?.slice(0, 300));
+    const adj37 = (await audit37()).find((a) => a.action === 'settlement.adjustment_created' && a.details?.bookingId === c2.id);
+    check('§37 #2 reversing adjustment: refund 300 (not 350), cash, provider 320 / app 0', !!adj37 && adj37.details?.refundEgp === 300 && adj37.details?.cash === true && adj37.details?.providerShareEgp === 320 && adj37.details?.appShareEgp === 0, JSON.stringify(adj37?.details));
+    r = await req('GET', '/api/me/vouchers', { token: p37 });
+    check('§37 #2 refund restores the voucher to active (M30)', r.status === 200 && (r.json?.vouchers || []).length === 1 && (r.json?.vouchers || [])[0]?.id === voucher37?.id && (r.json?.vouchers || [])[0]?.usedBookingId == null, JSON.stringify(r.json)?.slice(0, 300));
+    const w2 = await walletEntry37(c2.id);
+    check('§37 #2 wallet: refunded, nothing to settle', w2?.direction === 'refunded' && w2?.amountEgp === 0, JSON.stringify(w2));
+    const c3 = await cycle37(p37, 8);
+    check('§37 #3 cash 350 cycle completes with the restored voucher (payable 300)', c3.ok && c3.created?.amountPayableEgp === 300 && c3.created?.voucherDiscountEgp === 50, JSON.stringify(c3.created)?.slice(0, 300));
+    const rc3 = await complain37(c3.id, 'rejected');
+    check('§37 #3 complaint rejected -> settleable at once', rc3.ok && rc3.res?.json?.booking?.complaintStatus === 'rejected', JSON.stringify(rc3.res?.json)?.slice(0, 300));
+    const w3 = await walletEntry37(c3.id);
+    check('§37 #3 wallet: the APP owes the provider 20 (voucher 50 − gross app share 30)', w3?.direction === 'app_owes_provider' && w3?.amountEgp === 20, JSON.stringify(w3));
+    const c4 = await cycle37(p37, 2);
+    check('§37 #4 cash 250 cycle completes (7th paid visit — #2 was refunded)', c4.ok, c4.ok ? '' : `${c4.step} ${JSON.stringify(c4.res?.json || c4.res)}`.slice(0, 300));
+    const c5 = await cycle37(p37, 2);
+    check('§37 #5 cash 250 cycle completes (8th paid visit)', c5.ok, c5.ok ? '' : `${c5.step} ${JSON.stringify(c5.res?.json || c5.res)}`.slice(0, 300));
+    r = await req('GET', '/api/me/vouchers', { token: p37 });
+    check('§37 after 8 paid visits a second voucher is earned', r.status === 200 && (r.json?.vouchers || []).length === 1 && r.json?.completedPaidVisits === 8 && r.json?.vouchersEarned === 2, JSON.stringify(r.json)?.slice(0, 300));
+
+    // 37e. H9: broadcast counters split (delivered / pushSent / pushFailed).
+    r = await req('POST', '/api/admin/broadcast', { token: adminToken, body: { title: '§37 dry run', body: 'test', dryRun: true } });
+    check('§37 broadcast dry-run reports the audience with zero counters', r.status === 200 && r.json?.dryRun === true && r.json?.users > 0 && r.json?.delivered === 0 && r.json?.pushSent === 0 && r.json?.pushFailed === 0 && r.json?.sent === 0 && r.json?.failed === 0, JSON.stringify(r.json)?.slice(0, 300));
+    const bcUsers = r.json?.users;
+    r = await req('POST', '/api/admin/broadcast', { token: adminToken, body: { title: '§37 test broadcast', body: 'v2.1.13 regression check — please ignore.' } });
+    check('§37 broadcast live: delivered = audience, pushSent 0 (no FCM), pushFailed = delivered, sent 0, failed = audience', r.status === 200 && r.json?.users === bcUsers && r.json?.delivered === bcUsers && r.json?.pushSent === 0 && r.json?.pushFailed === bcUsers && r.json?.sent === 0 && r.json?.failed === bcUsers, JSON.stringify(r.json)?.slice(0, 300));
+
+    // 37f. B5/H8/H10: SOS + safety report + provider application reach
+    // the admin's in-app notifications; M24: SOS resolve + open filter.
+    r = await req('POST', '/api/bookings', { token: p37, body: { ...TERMS,
+      patientName: 'SOS37', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    check('§37 SOS test booking created', r.status === 201, JSON.stringify(r.json)?.slice(0, 200));
+    const bkSos37 = r.json?.id;
+    r = await req('POST', `/api/bookings/${bkSos37}/accept`, { token: appA.token });
+    check('§37 SOS test booking accepted by appA', r.status === 200, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkSos37}/sos`, { token: appA.token });
+    check('§37 SOS raised -> 201', r.status === 201 && !!r.json?.sosId, JSON.stringify(r.json)?.slice(0, 200));
+    const sosId37 = r.json?.sosId;
+    r = await req('POST', `/api/bookings/${bkSos37}/safety-report`, { token: p37, body: { type: 'safety', description: '§37 safety test report.' } });
+    check('§37 safety report filed -> 201', r.status === 201 && !!r.json?.reportId, JSON.stringify(r.json)?.slice(0, 200));
+    const srId37 = r.json?.reportId;
+    const adminLogin37 = await req('POST', '/api/auth/login-phone', { xff: XFF37C, body: { phone: '01008629060' } });
+    const adminPhoneTok37 = adminLogin37.json?.accessToken;
+    check('§37 admin phone logs in (fresh XFF bucket)', adminLogin37.status === 200 && !!adminPhoneTok37, JSON.stringify(adminLogin37.json)?.slice(0, 200));
+    r = await req('GET', '/api/me/notifications', { token: adminPhoneTok37 });
+    const ntf37 = r.json?.notifications || [];
+    check('§37 admin inbox has the SOS notification (bookingId + sosId)', ntf37.some((n) => n.type === 'sos' && n.data?.bookingId === bkSos37 && n.data?.sosId === sosId37), JSON.stringify(ntf37.filter((n) => n.type === 'sos').slice(0, 2)));
+    check('§37 admin inbox has the safety-report notification (bookingId + reportId)', ntf37.some((n) => n.type === 'safety_report' && n.data?.bookingId === bkSos37 && n.data?.reportId === srId37), JSON.stringify(ntf37.filter((n) => n.type === 'safety_report').slice(0, 2)));
+    check('§37 admin inbox has the provider-application notification for appA (§22d registration)', ntf37.some((n) => n.type === 'provider_application' && n.data?.providerId === appA.providerId), JSON.stringify(ntf37.filter((n) => n.type === 'provider_application').slice(0, 2)));
+    r = await req('POST', `/api/admin/sos/${sosId37}/resolve`, { token: adminToken, body: {} });
+    check('§37 admin resolves the SOS -> resolved', r.status === 200 && r.json?.sos?.status === 'resolved' && !!r.json?.sos?.resolvedAt, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', `/api/admin/sos/${sosId37}/resolve`, { token: adminToken, body: {} });
+    check('§37 resolving an already-resolved SOS -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', '/api/admin/sos?open=true', { token: adminToken });
+    check('§37 open SOS list no longer contains the resolved alert', r.status === 200 && !(r.json?.sos || []).some((s) => s.id === sosId37), JSON.stringify((r.json?.sos || []).map((s) => s.id).slice(0, 5)));
+    r = await req('GET', '/api/admin/dashboard', { token: adminToken });
+    check('§37 dashboard SOS list defaults to open (resolved alert hidden)', r.status === 200 && !(r.json?.sosAlerts || []).some((s) => s.id === sosId37), JSON.stringify((r.json?.sosAlerts || []).map((s) => s.id).slice(0, 5)));
+    r = await req('GET', '/api/admin/dashboard?sos=all', { token: adminToken });
+    check('§37 dashboard ?sos=all shows the resolved alert', r.status === 200 && (r.json?.sosAlerts || []).some((s) => s.id === sosId37), JSON.stringify((r.json?.sosAlerts || []).map((s) => s.id).slice(0, 5)));
+
+    // 37g. B4: a rejected receipt blocks acceptance.
+    r = await req('POST', '/api/bookings', { token: p37, body: { ...TERMS,
+      patientName: 'Receipt37', serviceCode: 'standard', paymentMethod: 'instapay',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] }, receiptImage: RECEIPT_JPEG,
+    } });
+    check('§37 instapay booking with receipt created (pending)', r.status === 201 && r.json?.receipt?.status === 'pending', JSON.stringify(r.json)?.slice(0, 300));
+    const bkRec37 = r.json?.id;
+    r = await req('POST', `/api/admin/bookings/${bkRec37}/receipt/reject`, { token: adminToken, body: { note: '§37 test rejection — blurry photo.' } });
+    check('§37 admin rejects the receipt -> rejected', r.status === 200 && r.json?.receipt?.status === 'rejected', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkRec37}/accept`, { token: appA.token });
+    check('§37 accept with a rejected receipt -> 403 naming the rejection', r.status === 403 && String(JSON.stringify(r.json)).includes('rejected'), JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', `/api/bookings/${bkRec37}/cancel`, { token: p37 });
+    check('§37 patient cancels the held booking with the rejected receipt -> 200', r.status === 200 && r.json?.status === 'cancelled', JSON.stringify(r.json)?.slice(0, 200));
+
+    // 37h. M3: past scheduled dates rejected; useVoucher=false.
+    r = await req('POST', '/api/bookings', { token: p37, body: { ...TERMS,
+      name: 'Past37', phone: '01037373738', service: 'standard', date: '2020-01-01', time: '10:00',
+      address: 'Test St', km: 2, transportProvided: false, paymentMethod: 'cash', charterAccepted: true,
+    } });
+    check('§37 booking scheduled in the past -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', '/api/bookings', { token: p37, body: { ...TERMS,
+      patientName: 'NoVoucher37', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 8, respectCharterAccepted: true, triage: { dangerSigns: [] }, useVoucher: false,
+    } });
+    check('§37 useVoucher=false: 350 booking pays the full 350, no discount', r.status === 201 && r.json?.amountEgp === 350 && r.json?.amountPayableEgp === 350 && (r.json?.voucherDiscountEgp || 0) === 0, JSON.stringify(r.json)?.slice(0, 300));
+    const bkNv37 = r.json?.id;
+    r = await req('GET', '/api/me/vouchers', { token: p37 });
+    check('§37 useVoucher=false leaves the voucher active for later', (r.json?.vouchers || []).length === 1, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkNv37}/cancel`, { token: p37 });
+    check('§37 the useVoucher=false booking cancels while held -> 200', r.status === 200 && r.json?.status === 'cancelled', JSON.stringify(r.json)?.slice(0, 200));
+
+    // 37i. L17: NPWT split; M33: distance is a pass-through (dressing
+    // 275 + fee 100 = 375, commission 12% of 275 = 33 — appA is Pro by
+    // now, see §37d — provider 342).
+    // M25/B2 gate: admin-cancel of a pre-visit CASH booking refunds 0
+    // and creates no reversing adjustment (no cash was collected yet).
+    r = await req('POST', '/api/npwt/calculate', { token: p37, body: { days: 14, kitPrice: 300 } });
+    check('§37 NPWT 14d split: total 5500 = service 3000 + equipment 2500', r.status === 200 && r.json?.totalEgp === 5500 && r.json?.serviceEgp === 3000 && r.json?.equipmentEgp === 2500, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', '/api/bookings', { token: p37, body: { ...TERMS,
+      patientName: 'Dress37', serviceCode: 'dressing', paymentMethod: 'cash_receipt',
+      distanceKm: 8, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    check('§37 dressing booking at 8km created (275 + 100 fee = 375)', r.status === 201 && r.json?.amountEgp === 375, JSON.stringify(r.json)?.slice(0, 300));
+    const bkDr37 = r.json?.id;
+    r = await req('POST', `/api/bookings/${bkDr37}/accept`, { token: appA.token });
+    check('§37 dressing accept: commission on the 275 service only -> provider 342', r.status === 200 && r.json?.commissionPct === 12 && r.json?.estimatedProviderShareEgp === 342, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', `/api/admin/bookings/${bkDr37}/cancel`, { token: adminToken, body: { reason: '§37 test cancel' } });
+    check('§37 admin cancels a pre-visit cash booking -> refund 0 (nothing was paid)', r.status === 200 && r.json?.status === 'cancelled' && r.json?.refundEgp === 0, JSON.stringify(r.json)?.slice(0, 300));
+    const adjDr37 = (await audit37()).find((a) => a.action === 'settlement.adjustment_created' && a.details?.bookingId === bkDr37);
+    check('§37 no reversing adjustment for a pre-visit cash admin-cancel', !adjDr37, JSON.stringify(adjDr37?.details || null));
+
+    // 37j. M27: the review requires circumventionReported (boolean).
+    r = await req('POST', '/api/bookings', { token: p37, body: { ...TERMS,
+      patientName: 'Circ37', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    const bkCirc37 = r.json?.id;
+    await req('POST', `/api/bookings/${bkCirc37}/accept`, { token: provToken });
+    await req('POST', `/api/bookings/${bkCirc37}/vitals`, { token: provToken, body: { bpSystolic: 120, bpDiastolic: 80, pulse: 78, glucose: 110, oxygen: 98, temp: 36.6 } });
+    await req('POST', `/api/bookings/${bkCirc37}/complete-provider`, { token: provToken });
+    await req('POST', `/api/bookings/${bkCirc37}/confirm-patient`, { token: p37 });
+    r = await req('POST', `/api/bookings/${bkCirc37}/review`, { token: p37, body: { rating: 5, comment: 'Good.' } });
+    check('§37 review without circumventionReported -> 400', r.status === 400, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkCirc37}/review`, { token: p37, body: { rating: 5, comment: 'Good.', circumventionReported: false } });
+    check('§37 review with circumventionReported=false -> 200 released', r.status === 200 && r.json?.status === 'released', JSON.stringify(r.json)?.slice(0, 200));
+
+    // 37k. M28: phone numbers are filtered after normalisation
+    // (Arabic-Indic digits, spaced digits); admin can read the chat.
+    r = await req('POST', '/api/bookings', { token: p37, body: { ...TERMS,
+      patientName: 'Msg37', serviceCode: 'standard', paymentMethod: 'cash_receipt',
+      distanceKm: 2, respectCharterAccepted: true, triage: { dangerSigns: [] },
+    } });
+    const bkMsg37 = r.json?.id;
+    await req('POST', `/api/bookings/${bkMsg37}/accept`, { token: appA.token });
+    r = await req('POST', `/api/bookings/${bkMsg37}/messages`, { token: p37, body: { text: 'تواصل معي على ٠١٠٠٨٦٢٩٠٦٠' } });
+    check('§37 message with Arabic-Indic digits phone -> 400 phone_number_not_allowed', r.status === 400 && r.json?.error === 'phone_number_not_allowed', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkMsg37}/messages`, { token: p37, body: { text: 'call me on 0100 862 9060' } });
+    check('§37 message with spaced digits phone -> 400', r.status === 400 && r.json?.error === 'phone_number_not_allowed', JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/bookings/${bkMsg37}/messages`, { token: p37, body: { text: 'مرحبا، متى تصل؟' } });
+    check('§37 clean message -> 201', r.status === 201, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', `/api/admin/bookings/${bkMsg37}/messages`, { token: adminToken });
+    check('§37 admin reads the booking chat (1 clean message, blocked ones absent)', r.status === 200 && r.json?.count === 1 && (r.json?.messages || [])[0]?.text === 'مرحبا، متى تصل؟', JSON.stringify(r.json)?.slice(0, 300));
+
+    // 37l. M25: suspend reports the stranded active bookings; admin
+    // cancel refunds + 409 on repeat. M23: an expired suspension is
+    // cleared on the next login (permanent bans stay).
+    r = await req('POST', `/api/admin/bookings/${bkSos37}/cancel`, { token: adminToken, body: { reason: '§37 test cancel' } });
+    check('§37 admin cancels the SOS booking (pre-visit cash) -> refund 0', r.status === 200 && r.json?.status === 'cancelled' && r.json?.refundEgp === 0, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', `/api/admin/providers/${appA.providerId}/suspend`, { token: adminToken, body: { reason: '§37 test suspension.' } });
+    check('§37 suspend reports 1 active booking (the accepted message booking)', r.status === 200 && r.json?.suspended === true && r.json?.activeBookings === 1, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', `/api/admin/providers/${appA.providerId}/unsuspend`, { token: adminToken, body: {} });
+    check('§37 unsuspend -> 200', r.status === 200 && r.json?.suspended === false, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/bookings/${bkMsg37}/cancel`, { token: adminToken, body: { reason: '§37 test cancel' } });
+    check('§37 admin cancels the message booking (pre-visit cash) -> refund 0', r.status === 200 && r.json?.status === 'cancelled' && r.json?.refundEgp === 0, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', `/api/admin/bookings/${bkMsg37}/cancel`, { token: adminToken, body: { reason: '§37 test cancel again' } });
+    check('§37 admin cancels an already-cancelled booking -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('POST', `/api/admin/providers/${appA.providerId}/suspend`, { token: adminToken, body: { reason: '§37 expired suspension.', until: new Date(Date.now() - 60 * 60 * 1000).toISOString() } });
+    check('§37 suspend with an already-past until -> 200 suspended (for now)', r.status === 200 && r.json?.suspended === true, JSON.stringify(r.json)?.slice(0, 200));
+    const appALogin37 = await req('POST', '/api/auth/login-phone', { xff: XFF37D, body: { phone: '01018181818', role: 'provider' } });
+    check('§37 provider logs in after the suspension expired -> 200', appALogin37.status === 200 && !!appALogin37.json?.accessToken, JSON.stringify(appALogin37.json)?.slice(0, 200));
+    r = await req('GET', '/api/admin/providers', { token: adminToken });
+    const appARec37 = (r.json || []).find((p) => p.id === appA.providerId);
+    check('§37 expired suspension is cleared on login (suspended false)', !!appARec37 && appARec37.suspended === false, JSON.stringify(appARec37)?.slice(0, 300));
+    const suspAudit37 = (await audit37()).find((a) => a.action === 'admin.suspension_expired' && a.details?.providerId === appA.providerId);
+    check('§37 the expiry is audited (admin.suspension_expired)', !!suspAudit37, JSON.stringify(suspAudit37?.details || null));
+
+    // 37m. B1/B2 settlement: one record for appA — provider owes 38
+    // (#1) + 300 (#2 refund) = 338, app owes 20 (#3 voucher net),
+    // 2 settleable cases, 6 held (4 × 38 at 15% + #4/#5 × 30 at 12%)
+    // = 212, no bonus. M31/L19:
+    // mark-paid sets the paid fields (and only there do bonus flags
+    // move — verified on redProv's 500-bonus settlement).
+    r = await req('POST', '/api/jobs/sweep', { token: adminToken });
+    check('§37 sweep runs', r.status === 200 && r.json?.ok === true, JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('GET', `/api/admin/settlements?providerId=${appA.providerId}`, { token: adminToken });
+    const stl37 = (r.json?.settlements || [])[0];
+    check('§37 settlement for appA: provider owes 338, app owes 20, 2 cases, hold 212, no bonus, unpaid',
+      !!stl37 && stl37.totals.providerOwesAppEgp === 338 && stl37.totals.appOwesProviderEgp === 20
+      && stl37.totals.releasedCases === 2 && stl37.totals.complaintHoldEgp === 212
+      && stl37.totals.volumeBonusEgp === 0 && stl37.totals.cashAppShareEgp === 38
+      && stl37.paid === false && stl37.paidAt == null, JSON.stringify(stl37?.totals));
+    await req('POST', '/api/jobs/sweep', { token: adminToken });
+    r = await req('GET', `/api/admin/settlements?providerId=${appA.providerId}`, { token: adminToken });
+    check('§37 second sweep creates no second settlement for appA (no double-pay)', r.status === 200 && (r.json?.settlements || []).length === 1, JSON.stringify({ count: (r.json?.settlements || []).length }));
+    r = await req('POST', `/api/admin/settlements/${stl37.id}/mark-paid`, { token: adminToken, body: { paidRef: '§37-test' } });
+    check('§37 mark-paid -> 200 with paidAt/paidBy/paidRef', r.status === 200 && !!r.json?.paidAt && r.json?.paidBy === 'admin' && r.json?.paidRef === '§37-test', JSON.stringify(r.json)?.slice(0, 300));
+    r = await req('POST', `/api/admin/settlements/${stl37.id}/mark-paid`, { token: adminToken, body: { paidRef: '§37-test-again' } });
+    check('§37 marking an already-paid settlement -> 409', r.status === 409, JSON.stringify(r.json)?.slice(0, 200));
+    r = await req('GET', `/api/admin/settlements?providerId=${appA.providerId}`, { token: adminToken });
+    check('§37 settlement list exposes paid=true after mark-paid', (r.json?.settlements || [])[0]?.paid === true && !!(r.json?.settlements || [])[0]?.paidAt, JSON.stringify((r.json?.settlements || [])[0])?.slice(0, 300));
+    r = await req('GET', `/api/admin/settlements?providerId=${redProv.providerId}`, { token: adminToken });
+    const stlRed37 = (r.json?.settlements || [])[0];
+    const redBonus37 = stlRed37?.totals?.volumeBonusEgp;
+    r = await req('POST', `/api/admin/settlements/${stlRed37.id}/mark-paid`, { token: adminToken, body: { paidRef: '§37-redprov' } });
+    check('§37 redProv bonus settlement marks paid', r.status === 200 && !!r.json?.paidAt, JSON.stringify(r.json)?.slice(0, 300));
+    const mpAudit37 = (await audit37()).find((a) => a.action === 'settlement.marked_paid' && a.details?.providerId === redProv.providerId);
+    check('§37 mark-paid audit carries the bonus amounts (volume bonus moves only here, L19)', !!mpAudit37 && mpAudit37.details?.volumeBonusEgp === redBonus37 && redBonus37 === 500, JSON.stringify(mpAudit37?.details));
+
+    // 37n. Static pins: M32 env-promo cap (~62 days from first sight,
+    // exposed in the dashboard), B3 review-day guard, L1 device pruning.
+    const routesJs37 = fs.readFileSync(path.join(__dirname, '..', 'src', 'routes.js'), 'utf8');
+    check('§37 M32: env promo capped in code (~62 days from first sight)', routesJs37.includes('promoEnvMaxDays') && routesJs37.includes('envPromoStartedAt') && routesJs37.includes("source: 'env'"), 'env promo cap missing');
+    r = await req('GET', '/api/admin/dashboard', { token: adminToken });
+    check('§37 dashboard exposes the promo state (inactive, no env promo configured)', r.status === 200 && r.json?.promo?.active === false && r.json?.promo?.commissionPct === null && r.json?.promo?.until === null, JSON.stringify(r.json?.promo));
+    const refundFn37 = routesJs37.slice(routesJs37.indexOf('function packageRefundRemaining'), routesJs37.indexOf('function packageRefundRemaining') + 900);
+    check('§37 B3: packageRefundRemaining skips days under packageReviewRequired', refundFn37.includes('packageReviewRequired'), refundFn37.slice(0, 200));
+    const notifyJs37 = fs.readFileSync(path.join(__dirname, '..', 'src', 'notify.js'), 'utf8');
+    check('§37 L1: devices store lastSentAt and prune after 60 days without a send', notifyJs37.includes('lastSentAt') && notifyJs37.includes('DEVICE_INACTIVE_MS') && notifyJs37.includes('activeDeviceCount'), 'device activity tracking missing');
   }
 
   // --- 14. logout / refresh revocation ---------------------------------

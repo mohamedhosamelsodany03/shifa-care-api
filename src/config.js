@@ -36,6 +36,13 @@ const config = {
   otpMaxRequestsPerHour: 5,
   // Payment number — shown ONLY after a booking is confirmed, never in bootstrap.
   paymentNumber: process.env.PAYMENT_NUMBER || '01008629060',
+  // Admin phone for server-side alerts (SOS / safety reports / new
+  // provider applications, v2.1.13 B5/H8/H10). Defaults to the payment
+  // number; override with ADMIN_PHONE when the admin's phone differs.
+  adminPhone: process.env.ADMIN_PHONE || process.env.PAYMENT_NUMBER || '01008629060',
+  // v2.1.13 (M32): an env promo (PROMO_COMMISSION_PCT) has no end date
+  // of its own, so the code caps it at this many days from first sight.
+  promoEnvMaxDays: 62,
   // FX rates used only to show the EGP equivalent of tourist prices.
   // Override via env; treat as approximate until a live rate source exists.
   usdEgp: envInt('USD_EGP', 48),

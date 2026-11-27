@@ -121,7 +121,9 @@ function requireRole(...roles) {
   };
 }
 
-// Admin JWT issued by POST /api/admin/pin/verify (30-min session).
+// Admin JWT issued by POST /api/admin/pin/verify (12h session —
+// config.adminSessionTtl; v2.1.10 raised it from 30m, which was
+// unusable for an admin living in the panel).
 // v2.1.1: signed with the SEPARATE admin secret (config.adminJwtSecret)
 // so a leaked user secret cannot forge admin tokens, and vice versa.
 function issueAdminToken() {

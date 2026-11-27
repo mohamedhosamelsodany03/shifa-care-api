@@ -37,11 +37,47 @@ const { sendSmsText } = require('./sms');
 const SMS_FALLBACK_DELAY_MS = 10 * 60 * 1000; // unread after 10 min -> SMS
 const MAX_NOTIFICATIONS_PER_USER = 100;
 const MAX_DEVICES_PER_USER = 5;
+// v2.1.13 (L1): a device with no successful push in this long is dead
+// (app uninstalled / token rotated without an unregister call) — it is
+// pruned from every count, so the broadcast tab never counts ghosts.
+const DEVICE_INACTIVE_MS = 60 * 24 * 60 * 60 * 1000; // 60 days
+function deviceIsActive(d, nowMs = Date.now()) {
+  const last = d.lastSentAt || d.updatedAt;
+  if (!last) return false;
+  const t = new Date(last).getTime();
+  return Number.isFinite(t) && nowMs - t <= DEVICE_INACTIVE_MS;
+}
+// Prune dead devices for one phone (in place); returns the live list.
+// NOTE: the pruned list is a NEW array (Array.filter always copies), so
+// it must be stored back — otherwise callers that mutate the returned
+// list (registerDevice pushes into it) write to a detached array and
+// the device is lost on the next read (v2.1.13 L1 regression: second
+// device stayed at 1, GET /me/devices read back 0).
+function pruneDevices(phone) {
+  const list = (store.data.devices || {})[phone] || [];
+  const live = list.filter((d) => deviceIsActive(d));
+  store.data.devices[phone] = live;
+  if (live.length !== list.length) store.save();
+  return live;
+}
 
 // --- device tokens -------------------------------------------------------
 function devicesFor(phone) {
   const all = store.data.devices || (store.data.devices = {});
-  return all[phone] || (all[phone] = []);
+  const list = all[phone] || (all[phone] = []);
+  // v2.1.13 (L1): every read prunes dead devices, so counts everywhere
+  // (broadcast, dashboard, /me/devices) reflect active devices only.
+  return pruneDevices(phone);
+}
+// Number of ACTIVE devices for one phone (pruned, see devicesFor).
+function activeDeviceCount(phone) {
+  return devicesFor(phone).length;
+}
+// Total ACTIVE devices across all phones.
+function totalActiveDevices() {
+  let n = 0;
+  for (const phone of Object.keys(store.data.devices || {})) n += devicesFor(phone).length;
+  return n;
 }
 function registerDevice(phone, token, platform) {
   if (!token || typeof token !== 'string' || token.length < 10 || token.length > 4096) {
@@ -129,6 +165,8 @@ async function notifyUser(phone, opts) {
           data: { type: rec.type, notificationId: rec.id, ...(rec.data || {}) },
         });
         sent += 1;
+        // v2.1.13 (L1): a successful send proves the device is alive.
+        d.lastSentAt = nowIso();
       } catch (e) {
         // A dead token (app uninstalled / token rotated) is dropped so
         // later notifications do not keep failing on it.
@@ -207,6 +245,7 @@ function markAllRead(phone) {
 
 module.exports = {
   notifyUser, processSmsFallbacks, registerDevice, unregisterDevice,
-  devicesFor, notificationsFor, publicNotification, markRead, markAllRead,
-  SMS_FALLBACK_DELAY_MS,
+  devicesFor, activeDeviceCount, totalActiveDevices, deviceIsActive,
+  notificationsFor, publicNotification, markRead, markAllRead,
+  SMS_FALLBACK_DELAY_MS, DEVICE_INACTIVE_MS,
 };

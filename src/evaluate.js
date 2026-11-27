@@ -10,15 +10,19 @@
 //
 // Scoring (total /100):
 //   licence            20 — licence on file (mandatory at registration)
-//   syndicate          15 — evidence of syndicate membership in an
-//                             uploaded document name (نقابة / syndicate)
+//   syndicate          15 — ADMIN-VERIFIED certificate/course name
+//                             mentioning syndicate membership (نقابة /
+//                             syndicate). A file merely NAMED «نقابة.pdf»
+//                             scores NOTHING until the admin verifies it
+//                             (v2.1.13 M20 — filename-regex scoring removed).
 //   experience         20 — CV on file (10) + completed cases (10 if
-//                             >=10, 5 if 1–9, 0 if none)
+//                             >=10, 5 if 1–9, 0 if none). A CV counts
+//                             only when a document has kind === 'cv'.
 //   courses            15 — verified courses, +5 each (mirrors points)
-//   specializations    15 — certificate/course/document names matching
-//                             service areas (wound/NPWT, catheter,
-//                             physio, emergency, IV, elderly), +5 each
-//                             matched area (max 3)
+//   specializations    15 — ADMIN-VERIFIED certificate/course names
+//                             matching service areas (wound/NPWT,
+//                             catheter, physio, emergency, IV, elderly),
+//                             +5 each matched area (max 3)
 //   documents          15 — at least one uploaded document (5) + a CV
 //                             file (5) + >=3 documents (5)
 // Recommendation: >= 60 + interview passed -> 'approve'; 40–59 or
@@ -44,18 +48,28 @@ function docNames(p) {
   for (const d of p.documents || []) if (d && d.name) names.push(String(d.name));
   return names;
 }
+// v2.1.13 (M20): names that count toward syndicate / specialization
+// scoring — ADMIN-VERIFIED certificates and courses ONLY. Unverified
+// uploads and bare document filenames never score.
+function verifiedNames(p) {
+  const names = [];
+  for (const c of p.certificates || []) if (c && c.verified === true && c.name) names.push(String(c.name));
+  for (const c of p.courses || []) if (c && c.verified === true && c.name) names.push(String(c.name));
+  return names;
+}
 
 function evaluateProviderDocuments(p) {
-  const names = docNames(p);
-  const joined = names.join(' | ');
+  const verifiedJoined = verifiedNames(p).join(' | ');
   const verifiedCourses = (p.courses || []).filter((c) => c && c.verified === true).length;
   const verifiedCerts = (p.certificates || []).filter((c) => c && c.verified === true).length;
   const docs = Array.isArray(p.documents) ? p.documents : [];
-  const hasCv = docs.some((d) => d.kind === 'cv') || /(\bcv\b|سيرة|السيرة الذاتية)/i.test(joined);
+  // v2.1.13 (M20): a CV counts only from an explicit kind === 'cv'
+  // document — a file named «سيرة ذاتية.pdf» scores nothing by itself.
+  const hasCv = docs.some((d) => d.kind === 'cv');
   const hasLicence = !!(p.licenseHash || p.licenseLast4);
-  const syndicate = /نقابة|syndicate/i.test(joined);
+  const syndicate = /نقابة|syndicate/i.test(verifiedJoined);
 
-  const matched = SPECIALIZATION_KEYWORDS.filter((s) => s.re.test(joined));
+  const matched = SPECIALIZATION_KEYWORDS.filter((s) => s.re.test(verifiedJoined));
 
   const cases = p.completedVisits || 0;
   const experiencePts = (hasCv ? 10 : 0) + (cases >= 10 ? 10 : cases >= 1 ? 5 : 0);
@@ -63,10 +77,10 @@ function evaluateProviderDocuments(p) {
 
   const breakdown = {
     licence: { points: hasLicence ? 20 : 0, max: 20, note: hasLicence ? 'Licence on file (registration).' : 'No licence on file — registration requires one.' },
-    syndicate: { points: syndicate ? 15 : 0, max: 15, note: syndicate ? 'Syndicate membership evidence found in an uploaded document name.' : 'No syndicate membership evidence in uploaded documents.' },
+    syndicate: { points: syndicate ? 15 : 0, max: 15, note: syndicate ? 'Syndicate membership evidence found in a VERIFIED certificate/course name.' : 'No syndicate membership evidence in verified certificates/courses.' },
     experience: { points: experiencePts, max: 20, note: `CV on file: ${hasCv ? 'yes' : 'no'}; completed visits: ${cases}. Years of experience are confirmed by the admin from the CV.` },
     courses: { points: Math.min(15, verifiedCourses * 5), max: 15, note: `${verifiedCourses} verified course(s) (+5 each, max 15 — mirrors the points system).` },
-    specializations: { points: Math.min(15, matched.length * 5), max: 15, note: matched.length ? `Matched areas: ${matched.map((m) => m.label).join(', ')}.` : 'No specialization keywords matched in certificate / course / document names.' },
+    specializations: { points: Math.min(15, matched.length * 5), max: 15, note: matched.length ? `Matched areas: ${matched.map((m) => m.label).join(', ')}.` : 'No specialization keywords matched in verified certificate / course names.' },
     documents: { points: documentsPts, max: 15, note: `${docs.length} uploaded document(s)${hasCv ? ' including a CV' : ' (no CV file yet)'}.` },
   };
   const total = Object.values(breakdown).reduce((s, c) => s + c.points, 0);

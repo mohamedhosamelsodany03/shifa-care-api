@@ -70,11 +70,17 @@ function createApp() {
   }));
 
   // Rate limits.
+  // v2.1.13 — the full suites make far more auth/interview calls from
+  // one IP than any real user (dozens of logins/registrations/interviews
+  // per run); in NODE_ENV=test only, raise the IP caps. Production
+  // values are unchanged, and the per-phone caps in routes.js still
+  // apply (those are what the tests assert).
+  const TEST_ENV = process.env.NODE_ENV === 'test';
   const otpLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many OTP requests from this IP.' } });
   // v2.1.0 — verify attempts are rate-limited per IP as well as per
   // phone (the per-phone 5-attempt cap lives in /otp/verify itself).
   const otpVerifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many OTP verification attempts from this IP.' } });
-  const phoneLoginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many login attempts from this IP.' } });
+  const phoneLoginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: TEST_ENV ? 500 : 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many login attempts from this IP.' } });
   const pinLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many PIN attempts from this IP.' } });
   // BOOKING_LIMIT_MAX is test-only (smoke/integration raise it so one
   // run's many booking calls don't trip the limiter); production default 60.
@@ -95,8 +101,8 @@ function createApp() {
   app.use('/api/tourist-bookings', bookingLimiter);
   app.use('/api/npwt/bookings', bookingLimiter);
   // v2.1.1 (audit #27): limiters for the remaining sensitive endpoints.
-  app.use('/api/providers/register', genericLimiter(10, 'Too many provider registrations from this IP.'));
-  app.use('/api/providers/interview', genericLimiter(30, 'Too many interview requests from this IP.'));
+  app.use('/api/providers/register', genericLimiter(TEST_ENV ? 500 : 10, 'Too many provider registrations from this IP.'));
+  app.use('/api/providers/interview', genericLimiter(TEST_ENV ? 500 : 30, 'Too many interview requests from this IP.'));
   app.use('/api/postop', genericLimiter(60, 'Too many post-op booking requests from this IP.'));
   app.use('/api/npwt/calculate', genericLimiter(60, 'Too many NPWT calculations from this IP.'));
   app.use('/api/monitor/summary', rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'rate_limited', message: 'Too many monitor requests from this IP.' } }));

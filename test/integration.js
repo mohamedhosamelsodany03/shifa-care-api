@@ -97,9 +97,10 @@ const server = app.listen(PORT, async () => {
     r = await call('GET', '/api/admin/mock-otp?phone=01000000001', null, adminToken);
     check('mock-otp returns code for demo phone', r.status === 200 && r.body.code === '123456', JSON.stringify(r.body).slice(0, 200));
 
-    // 5. interview v2.1.1: 36 questions (30 common + 6 role), new shape
-    // {id, category, text, options:[{key, text}]}, dimensions + passRule,
-    // no correct answers / red-flag markers leaked to the client.
+    // 5. interview v2.1.1 (v2.1.13 H15: 90-question bank, 36 sampled per
+    // attempt by dimension quota) — new shape {id, category, text,
+    // options:[{text}]}, dimensions + passRule, no correct answers /
+    // red-flag markers leaked to the client.
     r = await call('GET', '/api/providers/interview/questions', null, provToken);
     check('GET interview/questions returns 36, 30min, dimensions, no leaks', r.status === 200 && Array.isArray(r.body.questions) && r.body.questions.length === 36 && r.body.minutes === 30 && Array.isArray(r.body.dimensions) && r.body.dimensions.length === 6 && r.body.passRule && !JSON.stringify(r.body).includes('correct') && !JSON.stringify(r.body).includes('redFlag'), JSON.stringify(r.body).slice(0, 300));
     check('interview dimensions total 8/7/6/6/5/4', r.body.dimensions && r.body.dimensions.find((d) => d.key === 'medical')?.questions === 8 && r.body.dimensions.find((d) => d.key === 'ethics')?.questions === 7 && r.body.dimensions.find((d) => d.key === 'safety')?.questions === 6, JSON.stringify(r.body.dimensions));
@@ -129,12 +130,12 @@ const server = app.listen(PORT, async () => {
     // v2.1.1: bookings require role 'patient' — the provider token is
     // rejected (403); the patient token from 2b is used.
     r = await call('POST', '/api/bookings', { ...TERMS,
-      name: 'Test Patient', phone: '01099999999', service: 'standard', date: '2026-11-25', time: '10:00',
+      name: 'Test Patient', phone: '01099999999', service: 'standard', date: '2027-06-15', time: '10:00',
       address: 'Test St', km: 8, transportProvided: false, paymentMethod: 'cash', charterAccepted: true,
     }, provToken);
     check('provider-role booking -> 403 (patient role required)', r.status === 403, JSON.stringify(r.body).slice(0, 200));
     r = await call('POST', '/api/bookings', { ...TERMS,
-      name: 'Test Patient', phone: '01099999999', service: 'standard', date: '2026-11-25', time: '10:00',
+      name: 'Test Patient', phone: '01099999999', service: 'standard', date: '2027-06-15', time: '10:00',
       address: 'Test St', km: 8, transportProvided: false, paymentMethod: 'cash', charterAccepted: true,
     }, patTokenEarly);
     check('frontend-shaped booking 201, fee +100 at 8km', r.status === 201 && r.body.total === 350 && r.body.amountEgp === 350, JSON.stringify(r.body).slice(0, 300));
