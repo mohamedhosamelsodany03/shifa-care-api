@@ -2221,9 +2221,9 @@ async function main() {
       const ua = (obj) => run(`__out = updateAvailable(${JSON.stringify(obj)});`);
       check('§28 update: no latestApp -> no update', ua(null) === false);
       check('§28 update: code 0 / empty URL -> no update', ua({ code: 0, apkUrl: '' }) === false);
-      check('§28 update: same code -> no update', ua({ code: 25, apkUrl: 'https://x/app.apk' }) === false);
-      check('§28 update: newer code + URL -> update', ua({ code: 26, apkUrl: 'https://x/app.apk' }) === true);
-      check('§28 update: newer code but no URL -> no update', ua({ code: 26, apkUrl: '' }) === false);
+      check('§28 update: same code -> no update', ua({ code: 26, apkUrl: 'https://x/app.apk' }) === false);
+      check('§28 update: newer code + URL -> update', ua({ code: 27, apkUrl: 'https://x/app.apk' }) === true);
+      check('§28 update: newer code but no URL -> no update', ua({ code: 27, apkUrl: '' }) === false);
       const dc = (obj) => run(`__out = updateDialogConfig(${JSON.stringify(obj)});`);
       check('§28 update dialog: optional update can be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: false }).hideCancel === false);
       check('§28 update dialog: forced update cannot be postponed', dc({ code: 22, version: '2.1.8', apkUrl: 'https://x', force: true }).hideCancel === true);
@@ -2324,7 +2324,7 @@ async function main() {
     check('§28 terms page shows a prominent scroll-to-accept hint', webJs.includes('termsScrollMust') && webJs.includes('termsScrollHintBox'), 'no prominent terms hint');
     check('§28 last-screen restore is wired (save on navigate, restore at boot)', webJs.includes('saveLastScreen(hash)') && webJs.includes('restoreLastScreen'), 'last-screen restore not wired');
     check('§28 update checker runs after bootstrap on launch', webJs.includes('await loadBootstrap(); checkForAppUpdate();'), 'update check not wired');
-    check('§28 version header is v2.1.11 code 25', webJs.includes('v2.1.11, code 25'), 'header not bumped');
+    check('§28 version header is v2.1.12 code 26', webJs.includes('v2.1.12, code 26'), 'header not bumped');
   }
 
   // --- §29. v2.1.8: password-gated login + push de-automation + responsive layout ---
@@ -2489,8 +2489,8 @@ async function main() {
   // 29f. Version header + responsive layout (360–430px audit).
   {
     const webJs = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
-    check('§29 version header is v2.1.11 code 25', webJs.includes('v2.1.11, code 25'), 'header not bumped');
-    check('§29 APP_VERSION_CODE is 25 / NAME is 2.1.11', webJs.includes('const APP_VERSION_CODE = 25;') && webJs.includes('const APP_VERSION_NAME = "2.1.11";'), 'version constants not bumped');
+    check('§29 version header is v2.1.12 code 26', webJs.includes('v2.1.12, code 26'), 'header not bumped');
+    check('§29 APP_VERSION_CODE is 26 / NAME is 2.1.12', webJs.includes('const APP_VERSION_CODE = 26;') && webJs.includes('const APP_VERSION_NAME = "2.1.12";'), 'version constants not bumped');
     check('§29 footer shows the installed version in-app', webJs.includes('v${APP_VERSION_NAME} (${APP_VERSION_CODE})'), 'footer has no version');
     const css = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'style.css'), 'utf8');
     check('§29 CSS: no horizontal page scroll (overflow-x clip safety net)', css.includes('overflow-x: clip'), 'no overflow-x guard');
@@ -2583,7 +2583,7 @@ async function main() {
     check('§30 CSS: option-sheet field + list styles exist', css.includes('.app-select') && css.includes('.opt-item') && css.includes('.opt-search'), 'sheet styles missing');
     check('§30 CSS: large complaint rows exist', css.includes('.opt-list.opt-large .opt-item'), 'large-row styles missing');
     // 30e. Version header.
-    check('§30 version header is v2.1.11 code 25', webJs.includes('v2.1.11, code 25') && webJs.includes('const APP_VERSION_CODE = 25;') && webJs.includes('const APP_VERSION_NAME = "2.1.11";'), 'header not bumped');
+    check('§30 version header is v2.1.12 code 26', webJs.includes('v2.1.12, code 26') && webJs.includes('const APP_VERSION_CODE = 26;') && webJs.includes('const APP_VERSION_NAME = "2.1.12";'), 'header not bumped');
     // 30g. The v2.1.9 interview SyntaxError (found by the zero-defect
     // tap-through): three radios embedded JSON.stringify (double
     // quotes) inside a DOUBLE-quoted inline handler — the attribute
@@ -2645,14 +2645,18 @@ async function main() {
     check('§31 registerPushToken + syncPushRegistration exist', webJs.includes('async function registerPushToken(push)') && webJs.includes('async function syncPushRegistration()'), 'push helpers missing');
     check('§31 syncPushRegistration runs from the notifications screen only', webJs.slice(webJs.indexOf('async function loadNotifications()'), webJs.indexOf('async function loadNotifications()') + 600).includes('syncPushRegistration();'), 'sync not wired to loadNotifications');
     check('§31 syncPushRegistration never runs from login', !webJs.slice(webJs.indexOf('async function completeLogin'), webJs.indexOf('async function completeLogin') + 2500).includes('syncPushRegistration') && !webJs.slice(webJs.indexOf('async function afterPasswordSet'), webJs.indexOf('async function afterPasswordSet') + 800).includes('syncPushRegistration'), 'sync leaked into the login path');
-    check('§31 registration listener marks + confirms only on server success', webJs.includes('markPushRegistered(); toast(t("pushEnabled"))'), 'registration confirm missing');
+    // v2.1.12: the one-liner became a try/catch with a visible failure
+    // path — the mark + toast still happen only after the POST succeeds,
+    // in that order, inside the registration listener.
+    const regListener31 = webJs.slice(webJs.indexOf('push.addListener("registration"'), webJs.indexOf('push.addListener("registrationError"'));
+    check('§31 registration listener marks + confirms only on server success', regListener31.indexOf('await api("/api/me/devices"') !== -1 && regListener31.indexOf('markPushRegistered();') > regListener31.indexOf('await api("/api/me/devices"') && regListener31.indexOf('toast(t("pushEnabled"));') > regListener31.indexOf('markPushRegistered();'), 'registration confirm missing');
     check('§31 pushRegistered flag key exists', webJs.includes('shifa_push_registered') && webJs.includes('function pushRegistered()') && webJs.includes('function markPushRegistered()'), 'push flag missing');
     check('§31 pushEnabled i18n exists in both languages', webJs.includes('pushEnabled: "تم تفعيل إشعارات الهاتف."') && webJs.includes('pushEnabled: "Phone notifications enabled."'), 'pushEnabled i18n missing');
     // 31c. Broadcast tab: accounts + devices + true audience, labelled.
     check('§31 broadcast tab shows accounts/devices/audience', webJs.includes('broadcastAccounts') && webJs.includes('broadcastAudience') && webJs.includes('d.broadcastAccounts'), 'broadcast tab labels missing');
     check('§31 broadcast i18n exists in both languages', webJs.includes('broadcastAccounts: "حسابات مسجلة"') && webJs.includes('broadcastAccounts: "Registered accounts"') && webJs.includes('broadcastAudience: "جمهور البث"') && webJs.includes('broadcastAudience: "Broadcast audience"'), 'broadcast i18n missing');
     // 31d. Version bump.
-    check('§31 app.js header + APP_VERSION_NAME are 2.1.11 / code 25', webJs.includes('v2.1.11, code 25') && webJs.includes('const APP_VERSION_NAME = "2.1.11"'), 'version not bumped');
+    check('§31 app.js header + APP_VERSION_NAME are 2.1.12 / code 26', webJs.includes('v2.1.12, code 26') && webJs.includes('const APP_VERSION_NAME = "2.1.12"'), 'version not bumped');
     // 31e. Dashboard counts: the true audience equals the dry-run users
     // count, and it always includes the registered accounts (the v2.1.9
     // 0/0 bug: broadcastUsers counted only phones with an FCM device, so
@@ -2683,22 +2687,25 @@ async function main() {
     const ei31 = webJs.indexOf(END31, bi31);
     check('§31 eye-toggle block is extractable from web/app.js', bi31 !== -1 && ei31 !== -1 && ei31 > bi31, `${bi31}/${ei31}`);
     if (bi31 !== -1 && ei31 !== -1) {
+      const eyeBlock31 = webJs.slice(bi31, ei31);
+      check('§31 eye toggle is pure inline SVG — no emoji anywhere in the toggle', eyeBlock31.includes('PW_EYE_SVG') && eyeBlock31.includes('data-icon="eye"') && eyeBlock31.includes('data-icon="eye-off"') && !eyeBlock31.includes('👁') && !eyeBlock31.includes('🙈'), 'emoji still in eye toggle');
       const fakeInput = { type: 'password' };
-      const fakeBtn = { textContent: '👁', attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } };
+      const fakeBtn = { innerHTML: '', attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } };
       const ctx31 = { document: { getElementById: (id) => (id === 'pw1' ? fakeInput : null) }, fakeBtn, console };
       ctx31.window = ctx31;
       vm31.createContext(ctx31);
       vm31.runInContext('function t(k){ return k; }', ctx31);
       vm31.runInContext(webJs.slice(bi31, ei31), ctx31);
       vm31.runInContext('togglePw("pw1", fakeBtn);', ctx31);
-      check('§31 togglePw flips password -> text and swaps the icon', fakeInput.type === 'text' && fakeBtn.textContent === '🙈' && fakeBtn.attrs['aria-label'] === 'pwHide', `${fakeInput.type}/${fakeBtn.textContent}`);
+      check('§31 togglePw flips password -> text and swaps to the eye-off SVG (accent state on)', fakeInput.type === 'text' && fakeBtn.innerHTML.includes('data-icon="eye-off"') && fakeBtn.attrs['data-visible'] === '1' && fakeBtn.attrs['aria-label'] === 'pwHide', `${fakeInput.type}/${String(fakeBtn.innerHTML).slice(0, 60)}`);
       vm31.runInContext('togglePw("pw1", fakeBtn);', ctx31);
-      check('§31 togglePw flips text -> password and swaps the icon back', fakeInput.type === 'password' && fakeBtn.textContent === '👁' && fakeBtn.attrs['aria-label'] === 'pwShow', `${fakeInput.type}/${fakeBtn.textContent}`);
+      check('§31 togglePw flips text -> password and swaps back to the eye SVG (accent state off)', fakeInput.type === 'password' && fakeBtn.innerHTML.includes('data-icon="eye"') && !fakeBtn.innerHTML.includes('eye-off') && fakeBtn.attrs['data-visible'] === '0' && fakeBtn.attrs['aria-label'] === 'pwShow', `${fakeInput.type}/${String(fakeBtn.innerHTML).slice(0, 60)}`);
       const eyeHtml = vm31.runInContext('pwEye("loginPassword");', ctx31);
-      check('§31 pwEye renders an eye button wired to its field', typeof eyeHtml === 'string' && eyeHtml.includes('class="pw-eye"') && eyeHtml.includes("togglePw('loginPassword'") && eyeHtml.includes('👁'), String(eyeHtml).slice(0, 120));
+      check('§31 pwEye renders an SVG eye button wired to its field', typeof eyeHtml === 'string' && eyeHtml.includes('class="pw-eye"') && eyeHtml.includes("togglePw('loginPassword'") && eyeHtml.includes('<svg') && eyeHtml.includes('data-icon="eye"') && !eyeHtml.includes('👁') && !eyeHtml.includes('🙈'), String(eyeHtml).slice(0, 120));
       vm31.runInContext('togglePw("missing-id", fakeBtn);', ctx31);
       check('§31 togglePw with an unknown id does nothing (no throw)', fakeInput.type === 'password', fakeInput.type);
     }
+    check('§31 CSS: .pw-eye is a 40px touch target, muted by default, accent when visible', css31.includes('min-width: 40px') && css31.includes('min-height: 40px') && css31.includes('.pw-eye svg') && css31.includes('.pw-eye[data-visible="1"]'), 'eye touch-target/accent styles missing');
   }
 
   // --- §32. v2.1.10 (follow-up): login persists — password sessions get
@@ -2793,6 +2800,282 @@ async function main() {
     const evalSrc33 = fs.readFileSync(path.join(__dirname, '..', 'src', 'evaluate.js'), 'utf8');
     check('§33 catalog has physio_session at 450, no old codes', catSrc33.includes("physio_session: { code: 'physio_session'") && catSrc33.includes('price_egp: 450') && !oldCodes.some((c) => catSrc33.replace(/\/\/.*$/gm, '').includes(c)), 'catalog wrong');
     check('§33 evaluate.js physio area maps to physio_session', evalSrc33.includes("serviceCodes: ['physio_session']"), 'evaluate mapping wrong');
+  }
+
+  // --- §34. v2.1.12: no native text-selection toolbar (owner report 27 Nov
+  // 2026) — double-tapping the broadcast message to select it exits the
+  // app: the WebView's floating text-selection ActionMode kills the
+  // process on the owner's Android 16 phones (same class as prompt(),
+  // <select>, FCM). Verified in desktop Chromium before building: neither
+  // user-select:none nor selectstart prevention stops a textarea's
+  // double-tap word selection — so the web guards shrink the trigger
+  // surface (no selection on plain text, no context menu, double-tap
+  // selections collapse at once) and the REAL fix is the MainActivity
+  // guard that aborts floating action modes before their toolbar window
+  // is created. The broadcast form gets an in-app clear button instead
+  // of select-and-delete.
+  console.log('\n[§34 v2.1.12]');
+  {
+    // 34a. Static: CSS never lets a selection start.
+    const css34 = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'style.css'), 'utf8');
+    check('§34 CSS: body + descendants are user-select none', css34.includes('body, body * { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }'), 'body rule missing');
+    check('§34 CSS: input/textarea explicitly user-select none', /input,\s*textarea\s*\{[^}]*user-select:\s*none/.test(css34), 'input/textarea rule missing');
+    check('§34 CSS: -webkit-touch-callout none present', css34.includes('-webkit-touch-callout: none'), 'touch-callout missing');
+    // 34b. Static: the web guards exist and are wired at boot.
+    const webJs34 = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
+    check('§34 collapseFieldSelection + initSelectionGuards exist', webJs34.includes('function collapseFieldSelection(el)') && webJs34.includes('function initSelectionGuards()'), 'guard helpers missing');
+    check('§34 guards run at boot', webJs34.includes('initSelectionGuards();'), 'guards not wired at boot');
+    check('§34 contextmenu is preventDefaulted', webJs34.includes('document.addEventListener("contextmenu", (e) => { e.preventDefault(); })'), 'contextmenu not suppressed');
+    check('§34 dblclick collapses field selections', webJs34.includes('document.addEventListener("dblclick"') && webJs34.includes('collapseFieldSelection(t)'), 'dblclick collapse missing');
+    check('§34 broadcast form has an in-app clear button', webJs34.includes('onclick="clearBroadcastForm()"') && webJs34.includes('t("broadcastClear")'), 'clear button missing');
+    check('§34 broadcastClear i18n exists in both languages', webJs34.includes('broadcastClear: "مسح الرسالة"') && webJs34.includes('broadcastClear: "Clear message"'), 'clear i18n missing');
+    check('§34 broadcast title/body text and flow unchanged', webJs34.includes('id="bcTitle"') && webJs34.includes('id="bcBody"') && webJs34.includes('window.sendBroadcast = async function (dryRun)'), 'broadcast form/flow changed');
+    check('§34 version header is v2.1.12 code 26', webJs34.includes('v2.1.12, code 26') && webJs34.includes('const APP_VERSION_CODE = 26;') && webJs34.includes('const APP_VERSION_NAME = "2.1.12";'), 'version not bumped');
+    // 34c. Static: the native guard exists in MainActivity.
+    const main34 = fs.readFileSync(path.join(__dirname, '..', '..', 'android', 'android', 'app', 'src', 'main', 'java', 'com', 'shifacare', 'elquseir', 'MainActivity.java'), 'utf8');
+    check('§34 MainActivity aborts floating action modes at creation', main34.includes('public ActionMode onWindowStartingActionMode(ActionMode.Callback callback, int type)') && main34.includes('if (type == ActionMode.TYPE_FLOATING)') && main34.includes('return null;'), 'onWindowStartingActionMode guard missing');
+    check('§34 MainActivity finishes any floating mode that starts', main34.includes('public void onActionModeStarted(ActionMode mode)') && main34.includes('mode.finish()'), 'onActionModeStarted guard missing');
+    check('§34 native guard log markers exist (build §9 asserts them in the dex)', main34.includes('ShifaCare floating action mode suppressed') && main34.includes('ShifaCare floating action mode finished'), 'guard markers missing');
+    check('§34 native guard never rethrows (guarded try/catch)', main34.includes('Floating action-mode guard failed') && main34.includes('Could not finish floating action mode'), 'guard try/catch missing');
+    // 34d. Functional: run the extracted guard block in a vm with fake
+    // DOM stubs — collapse a word selection, suppress a context menu,
+    // and clear the broadcast draft.
+    const vm34 = require('vm');
+    const BEGIN34 = '/* v2.1.12 — selection guards (BEGIN) */';
+    const END34 = '/* v2.1.12 — selection guards (END) */';
+    const bi34 = webJs34.indexOf(BEGIN34);
+    const ei34 = webJs34.indexOf(END34, bi34);
+    check('§34 selection-guard block is extractable from web/app.js', bi34 !== -1 && ei34 !== -1 && ei34 > bi34, `${bi34}/${ei34}`);
+    if (bi34 !== -1 && ei34 !== -1) {
+      const handlers = {};
+      const ctx34 = {
+        document: { addEventListener: (type, fn) => { handlers[type] = fn; } },
+        console,
+      };
+      ctx34.window = ctx34;
+      vm34.createContext(ctx34);
+      vm34.runInContext(webJs34.slice(bi34, ei34), ctx34);
+      vm34.runInContext('initSelectionGuards();', ctx34);
+      check('§34 initSelectionGuards registers contextmenu + dblclick listeners', typeof handlers.contextmenu === 'function' && typeof handlers.dblclick === 'function', Object.keys(handlers).join(','));
+      // A double-tapped word selection (start 17, end 22) collapses to the caret.
+      const calls = [];
+      const fakeField = { tagName: 'TEXTAREA', selectionStart: 17, selectionEnd: 22, setSelectionRange(a, b) { calls.push([a, b]); this.selectionStart = a; this.selectionEnd = b; } };
+      vm34.runInContext('__field = undefined;', ctx34);
+      ctx34.__field = fakeField;
+      vm34.runInContext('collapseFieldSelection(__field);', ctx34);
+      check('§34 collapseFieldSelection collapses a word selection to the caret', fakeField.selectionStart === 17 && fakeField.selectionEnd === 17 && calls.length === 1 && calls[0][0] === 17 && calls[0][1] === 17, JSON.stringify(calls));
+      // The dblclick listener collapses selections only inside fields:
+      // a div target must not throw and must not touch any selection.
+      const fakeDiv = { tagName: 'DIV', setSelectionRange() { throw new Error('must not be called on a div'); } };
+      ctx34.__div = fakeDiv;
+      ctx34.__dbl = handlers.dblclick;
+      let dblErr = null;
+      try { vm34.runInContext('__dbl({target: __div});', ctx34); } catch (e) { dblErr = e; }
+      check('§34 dblclick listener ignores non-field targets (no throw)', dblErr === null, String(dblErr));
+      // And the same listener collapses a real field selection.
+      ctx34.__field2 = fakeField;
+      vm34.runInContext('__dbl({target: __field2});', ctx34);
+      check('§34 dblclick listener collapses a field selection via the event', fakeField.selectionStart === 17 && fakeField.selectionEnd === 17, `${fakeField.selectionStart}/${fakeField.selectionEnd}`);
+      // Contextmenu is preventDefaulted.
+      let prevented = false;
+      const fakeEv = { preventDefault() { prevented = true; } };
+      ctx34.__ev = fakeEv;
+      // Invoke the registered contextmenu handler directly via the ctx.
+      ctx34.__handler = handlers.contextmenu;
+      vm34.runInContext('__handler(__ev);', ctx34);
+      check('§34 contextmenu handler preventDefaults the event', prevented === true, String(prevented));
+      // collapseFieldSelection tolerates a field without a selection API.
+      ctx34.__bad = { tagName: 'TEXTAREA' };
+      let badErr = null;
+      try { vm34.runInContext('collapseFieldSelection(__bad);', ctx34); } catch (e) { badErr = e; }
+      check('§34 collapseFieldSelection tolerates a field with no selection API', badErr === null, String(badErr));
+    }
+    // 34e. Functional: clearBroadcastForm clears title + body and refocuses body.
+    const BEGIN34B = '/* v2.1.12 — broadcast clear (BEGIN) */';
+    const END34B = '/* v2.1.12 — broadcast clear (END) */';
+    const bi34b = webJs34.indexOf(BEGIN34B);
+    const ei34b = webJs34.indexOf(END34B, bi34b);
+    check('§34 broadcast-clear block is extractable from web/app.js', bi34b !== -1 && ei34b !== -1 && ei34b > bi34b, `${bi34b}/${ei34b}`);
+    if (bi34b !== -1 && ei34b !== -1) {
+      const fakeTitle = { value: 'شكرًا يا شهد' };
+      const fakeBody = { value: 'أنتِ أول واحدة تجرّب التطبيق', focused: false, focus() { this.focused = true; } };
+      const ctx34b = {
+        document: { getElementById: (id) => (id === 'bcTitle' ? fakeTitle : id === 'bcBody' ? fakeBody : null) },
+        console,
+      };
+      ctx34b.window = ctx34b;
+      vm34.createContext(ctx34b);
+      vm34.runInContext(webJs34.slice(bi34b, ei34b), ctx34b);
+      vm34.runInContext('clearBroadcastForm();', ctx34b);
+      check('§34 clearBroadcastForm empties title + body and focuses the body', fakeTitle.value === '' && fakeBody.value === '' && fakeBody.focused === true, `${fakeTitle.value}/${fakeBody.value}/${fakeBody.focused}`);
+      // Missing fields: no throw.
+      const ctx34c = { document: { getElementById: () => null }, console };
+      ctx34c.window = ctx34c;
+      vm34.createContext(ctx34c);
+      vm34.runInContext(webJs34.slice(bi34b, ei34b), ctx34c);
+      let clearErr = null;
+      try { vm34.runInContext('clearBroadcastForm();', ctx34c); } catch (e) { clearErr = e; }
+      check('§34 clearBroadcastForm with missing fields does not throw', clearErr === null, String(clearErr));
+    }
+  }
+
+  // --- §35. v2.1.12: push registration hardening -----------------------
+  // Owner report 27 Nov 2026: the admin broadcast tab showed 0 devices
+  // while the server logs showed no push failure at all — there was
+  // simply no token to send to, and the app never said so. The fix:
+  // listeners attach BEFORE register() (documented Capacitor pattern),
+  // a registration that never completes shows a visible error within
+  // 10s instead of silence, and the notifications screen shows whether
+  // THIS device is registered (server count, not the local flag alone —
+  // the flag can outlive a deploy wipe).
+  console.log('\n[§35 v2.1.12]');
+  {
+    const webJs35 = fs.readFileSync(path.join(__dirname, '..', '..', 'web', 'app.js'), 'utf8');
+    // 35a. GET /api/me/devices: the honest per-user device count.
+    const xff35 = '10.35.1.1';
+    const reg35 = await req('POST', '/api/auth/register', { xff: xff35, body: { phone: '01029300001', password: 'pushreg1', terms: TERMS } });
+    const tok35 = reg35.json?.token;
+    check('§35 register for the push-device checks', reg35.status === 201 && !!tok35, JSON.stringify(reg35.json)?.slice(0, 120));
+    if (tok35) {
+      const noAuth35 = await req('GET', '/api/me/devices');
+      check('§35 GET /api/me/devices without a token is 401', noAuth35.status === 401, String(noAuth35.status));
+      const d0 = await req('GET', '/api/me/devices', { token: tok35 });
+      check('§35 GET /api/me/devices starts at 0 devices', d0.status === 200 && d0.json?.devices === 0, JSON.stringify(d0.json));
+      const short35 = await req('POST', '/api/me/devices', { token: tok35, body: { fcmToken: 'short', platform: 'android' } });
+      check('§35 POST /api/me/devices rejects a too-short token (400)', short35.status === 400, String(short35.status));
+      const p1 = await req('POST', '/api/me/devices', { token: tok35, body: { fcmToken: 'mock-fcm-token-viewport-test', platform: 'android' } });
+      check('§35 POST /api/me/devices registers one device', p1.status === 200 && p1.json?.devices === 1, JSON.stringify(p1.json));
+      const d1 = await req('GET', '/api/me/devices', { token: tok35 });
+      check('§35 GET /api/me/devices reads back 1 device', d1.status === 200 && d1.json?.devices === 1, JSON.stringify(d1.json));
+      const p2 = await req('POST', '/api/me/devices', { token: tok35, body: { fcmToken: 'mock-fcm-token-viewport-test', platform: 'android' } });
+      check('§35 re-registering the same token stays at 1 device (dedup)', p2.status === 200 && p2.json?.devices === 1, JSON.stringify(p2.json));
+      const del35 = await req('DELETE', '/api/me/devices', { token: tok35, body: { fcmToken: 'mock-fcm-token-viewport-test' } });
+      check('§35 DELETE /api/me/devices removes the device', del35.status === 200 && del35.json?.removed === 1, JSON.stringify(del35.json));
+      const d2 = await req('GET', '/api/me/devices', { token: tok35 });
+      check('§35 GET /api/me/devices reads back 0 after delete', d2.status === 200 && d2.json?.devices === 0, JSON.stringify(d2.json));
+    }
+    // 35b. Static: listeners-first order + the 10s timeout arm + the
+    // visible status box + the failure paths that used to be silent.
+    const regFnIdx = webJs35.indexOf('async function registerPushToken(push)');
+    const regFnEnd = webJs35.indexOf('\n}\n', regFnIdx);
+    const regFnBody = regFnIdx === -1 ? '' : webJs35.slice(regFnIdx, regFnEnd === -1 ? regFnIdx + 3000 : regFnEnd);
+    check('§35 registerPushToken attaches listeners BEFORE register()', regFnBody.indexOf('attachPushListeners(push)') !== -1 && regFnBody.indexOf('push.register()') !== -1 && regFnBody.indexOf('attachPushListeners(push)') < regFnBody.indexOf('push.register()'), 'listeners-first order broken');
+    check('§35 registerPushToken arms the 10s timeout', regFnBody.includes('setTimeout(onPushRegTimeout, PUSH_REG_TIMEOUT_MS)') && webJs35.includes('const PUSH_REG_TIMEOUT_MS = 10000'), 'timeout arm missing');
+    check('§35 register() failure surfaces a visible error (was a silent return)', regFnBody.includes('setPushRegError(t("pushRegFailed"))') && regFnBody.includes('toast(t("pushRegFailed"))'), 'register failure still silent');
+    const routesSrc35 = fs.readFileSync(path.join(__dirname, '..', 'src', 'routes.js'), 'utf8');
+    check('§35 GET /api/me/devices endpoint exists (count only)', routesSrc35.includes("router.get('/me/devices'"), 'GET /api/me/devices missing');
+    check('§35 notifications screen renders the per-device status box', webJs35.includes('id="pushStatusBox"') && webJs35.includes('pushStatusHTML()'), 'pushStatusBox missing');
+    check('§35 loadNotifications checks the server count and clears a stale flag', webJs35.includes('api("/api/me/devices")') && webJs35.includes('if (d.devices === 0 && pushRegistered()) clearPushRegistered()'), 'stale-flag repair missing');
+    check('§35 requestPushPermission verifies the flag against the server', webJs35.slice(webJs35.indexOf('async function requestPushPermission'), webJs35.indexOf('async function registerPushToken')).includes('api("/api/me/devices")'), 'flag verification missing');
+    check('§35 registrationError listener is visible now (was silent)', webJs35.includes('push.addListener("registrationError"') && !webJs35.slice(webJs35.indexOf('push.addListener("registrationError"'), webJs35.indexOf('push.addListener("registrationError"') + 400).includes('silent: in-app centre still works'), 'registrationError still silent');
+    check('§35 pushReg i18n exists in both languages', webJs35.includes('pushRegOn: "إشعارات الهاتف مفعّلة على هذا الجهاز ✓"') && webJs35.includes('pushRegOff: "إشعارات الهاتف غير مفعّلة على هذا الجهاز"') && webJs35.includes('pushRegTimeout: "تعذّر تفعيل إشعارات الهاتف') && webJs35.includes('pushRegOn: "Phone notifications are ON for this device ✓"') && webJs35.includes('pushRegTimeout: "Could not enable phone notifications'), 'pushReg i18n missing');
+    // 35c. Functional: run the extracted §35 state block in a vm with
+    // a fake localStorage/store/toast and drive every state.
+    const vm35 = require('vm');
+    const BEGIN35 = '/* v2.1.12 — push registration state (BEGIN';
+    const END35 = '/* v2.1.12 — push registration state (END) */';
+    const bi35 = webJs35.indexOf(BEGIN35);
+    const ei35 = webJs35.indexOf(END35, bi35);
+    check('§35 push-registration state block is extractable from web/app.js', bi35 !== -1 && ei35 !== -1 && ei35 > bi35, `${bi35}/${ei35}`);
+    if (bi35 !== -1 && ei35 !== -1) {
+      const ls35 = { _m: {}, getItem(k) { return Object.hasOwn(this._m, k) ? this._m[k] : null; }, setItem(k, v) { this._m[k] = String(v); }, removeItem(k) { delete this._m[k]; } };
+      const toasts35 = [];
+      const box35 = { innerHTML: '' };
+      const ctx35 = {
+        localStorage: ls35,
+        store: { pushDevices: null, pushRegError: null },
+        PUSH_REGISTERED_KEY: 'shifa_push_registered',
+        document: { getElementById: (id) => (id === 'pushStatusBox' ? box35 : null) },
+        console,
+      };
+      ctx35.pushRegistered = function () { try { return ls35.getItem('shifa_push_registered') === '1'; } catch (e) { return false; } };
+      ctx35.window = ctx35;
+      vm35.createContext(ctx35);
+      vm35.runInContext('function t(k){ return k; } function esc(s){ return String(s == null ? "" : s); }', ctx35);
+      ctx35.toast = (m) => { toasts35.push(m); };
+      vm35.runInContext(webJs35.slice(bi35, ei35), ctx35);
+      check('§35 initial state is off (no flag, no server count)', vm35.runInContext('pushRegState();', ctx35) === 'off' && vm35.runInContext('pushStatusHTML();', ctx35).includes('pushRegOff'), String(vm35.runInContext('pushRegState();', ctx35)));
+      vm35.runInContext('pushRegPending = true;', ctx35);
+      check('§35 pending state shows while waiting for the token', vm35.runInContext('pushRegState();', ctx35) === 'pending' && vm35.runInContext('pushStatusHTML();', ctx35).includes('pushRegPending'), String(vm35.runInContext('pushRegState();', ctx35)));
+      const fired35 = vm35.runInContext('onPushRegTimeout();', ctx35);
+      check('§35 the 10s timeout fires while pending (visible error + toast)', fired35 === true && ctx35.store.pushRegError === 'pushRegTimeout' && toasts35.includes('pushRegTimeout') && vm35.runInContext('pushRegState();', ctx35) === 'error', `fired=${fired35} err=${ctx35.store.pushRegError}`);
+      const firedAgain35 = vm35.runInContext('onPushRegTimeout();', ctx35);
+      check('§35 the timeout does nothing once the wait is over', firedAgain35 === false, String(firedAgain35));
+      vm35.runInContext('clearPushRegError(); localStorage.setItem("shifa_push_registered", "1"); store.pushDevices = 1;', ctx35);
+      check('§35 flag + server device = on', vm35.runInContext('pushRegState();', ctx35) === 'on' && vm35.runInContext('pushStatusHTML();', ctx35).includes('pushRegOn'), String(vm35.runInContext('pushRegState();', ctx35)));
+      vm35.runInContext('store.pushDevices = 0;', ctx35);
+      check('§35 flag with ZERO server devices = off (stale flag is not trusted)', vm35.runInContext('pushRegState();', ctx35) === 'off', String(vm35.runInContext('pushRegState();', ctx35)));
+      vm35.runInContext('clearPushRegistered();', ctx35);
+      check('§35 clearPushRegistered removes the flag', ls35.getItem('shifa_push_registered') === null, String(ls35.getItem('shifa_push_registered')));
+      vm35.runInContext('refreshPushStatusUI();', ctx35);
+      check('§35 refreshPushStatusUI writes the status into #pushStatusBox', box35.innerHTML.includes('pushRegOff'), box35.innerHTML.slice(0, 80));
+      ctx35.document.getElementById = () => null;
+      const uiErr35 = (() => { try { vm35.runInContext('refreshPushStatusUI();', ctx35); return null; } catch (e) { return e; } })();
+      check('§35 refreshPushStatusUI with no status box does not throw', uiErr35 === null, String(uiErr35));
+    }
+  }
+
+  // --- §36. v2.1.12: the sweep must actually complete -----------------
+  // Live fault (Railway logs, 27 Nov 2026 02:27–03:17): '[sweep] error:
+  // Cannot read properties of undefined (reading 'length')' every 5
+  // minutes, 11 times — so auto-release, review reminders and settlement
+  // notifications silently never ran. Local reproduction: the sweep is
+  // clean on a fresh store, with 2 users, in production mode, and across
+  // the whole suite with the interval on — the exact undefined read
+  // lives in production-only data state, so this section pins (a) the
+  // sweep succeeds on a fresh store and on a PARTIAL store (an empty {}
+  // data file, which before the fix made even admin PIN verify 500 with
+  // "reading 'push'"), and (b) the sweep failure now logs the STACK so
+  // the next occurrence names the exact line in the Railway logs.
+  console.log('\n[§36 v2.1.12]');
+  {
+    const serverJs36 = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+    check('§36 sweep failure logs the stack (not just the message)', serverJs36.includes("console.error('[sweep] error:', e && e.stack ? e.stack : e.message)"), 'stack logging missing');
+    const storeJs36 = fs.readFileSync(path.join(__dirname, '..', 'src', 'store.js'), 'utf8');
+    check('§36 applyDefaults backfills the core collections', storeJs36.includes("if (!this.data.users || typeof this.data.users !== 'object') this.data.users = {};") && storeJs36.includes("if (!Array.isArray(this.data.audit)) this.data.audit = [];") && storeJs36.includes("if (!this.data.bookings || typeof this.data.bookings !== 'object') this.data.bookings = {};"), 'core backfills missing');
+    check('§36 load() reseeds a data file that parses to a non-object', storeJs36.includes("if (parsed && typeof parsed === 'object' && !Array.isArray(parsed))"), 'non-object guard missing');
+    const routesJs36 = fs.readFileSync(path.join(__dirname, '..', 'src', 'routes.js'), 'utf8');
+    check('§36 sweepAutoRelease re-applies store defaults first', routesJs36.slice(routesJs36.indexOf('async function sweepAutoRelease()'), routesJs36.indexOf('async function sweepAutoRelease()') + 600).includes('store.applyDefaults();'), 'sweep self-heal missing');
+    // Throwaway servers: one with a fresh (missing) data file, one with
+    // a partial ({}) data file. Each must verify admin, run the sweep
+    // explicitly, and return the full result shape without throwing.
+    const { spawn: spawn36 } = require('child_process');
+    async function sweepOnStore36(dataFile, label) {
+      if (fs.existsSync(dataFile)) fs.unlinkSync(dataFile);
+      if (label === 'partial') fs.writeFileSync(dataFile, '{}\n', 'utf8');
+      const env36 = { ...process.env, PORT: '3457', NODE_ENV: 'test', DATA_FILE: dataFile, MOCK_OTP: 'true', JWT_SECRET: 'smoke-test-secret', ADMIN_PIN: TEST_ADMIN_PIN, SWEEP_INTERVAL_MS: '3600000' };
+      const child36 = spawn36('node', [path.join(__dirname, '..', 'server.js')], { env: env36, stdio: ['ignore', 'pipe', 'pipe'] });
+      let out36 = '';
+      child36.stdout.on('data', (d) => { out36 += d; });
+      child36.stderr.on('data', (d) => { out36 += d; });
+      try {
+        let up36 = false;
+        for (let i = 0; i < 40; i++) {
+          await sleep(250);
+          try { const hr = await fetch('http://127.0.0.1:3457/health'); if (hr.status === 200) { up36 = true; break; } } catch {}
+        }
+        check(`§36 ${label} store: throwaway server starts`, up36, out36.slice(0, 300));
+        if (!up36) return;
+        const ar36 = await fetch('http://127.0.0.1:3457/api/admin/pin/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin: TEST_ADMIN_PIN }) });
+        const aj36 = await ar36.json().catch(() => null);
+        check(`§36 ${label} store: admin PIN verify works`, ar36.status === 200 && !!aj36?.token, `status=${ar36.status}`);
+        if (!aj36?.token) return;
+        const sw36 = await fetch('http://127.0.0.1:3457/api/jobs/sweep', { method: 'POST', headers: { Authorization: 'Bearer ' + aj36.token } });
+        const sj36 = await sw36.json().catch(() => null);
+        check(`§36 ${label} store: sweep completes (200, full result shape)`, sw36.status === 200 && sj36?.ok === true && Array.isArray(sj36?.released) && Array.isArray(sj36?.overdue) && typeof sj36?.settlementsGenerated === 'number', `status=${sw36.status} body=${JSON.stringify(sj36)?.slice(0, 200)}`);
+        check(`§36 ${label} store: sweep logged no error`, !out36.includes('[sweep] error:'), out36.slice(0, 300));
+        if (label === 'partial') {
+          const after36 = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
+          check('§36 partial store: core collections backfilled on disk', typeof after36.users === 'object' && typeof after36.bookings === 'object' && Array.isArray(after36.audit) && Array.isArray(after36.settlements) && typeof after36.providers === 'object', `keys=${Object.keys(after36).slice(0, 12).join(',')}`);
+        }
+      } finally {
+        try { child36.kill('SIGTERM'); } catch {}
+        await sleep(400);
+        if (fs.existsSync(dataFile)) fs.unlinkSync(dataFile);
+      }
+    }
+    await sweepOnStore36(path.join(__dirname, 'sweep-fresh-data.json'), 'fresh');
+    await sweepOnStore36(path.join(__dirname, 'sweep-partial-data.json'), 'partial');
   }
 
   // --- 14. logout / refresh revocation ---------------------------------

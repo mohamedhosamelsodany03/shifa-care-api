@@ -204,6 +204,28 @@ class Store {
   // Collections added after the first seed — default them on load so an
   // older document (file or Postgres row) never breaks the new routes.
   applyDefaults() {
+    // v2.1.12 — CORE collections first: a partial document (an empty {}
+    // after a corrupt write, or a document from before a collection
+    // existed) must never leave these undefined. Every route reads them
+    // unguarded — Object.values(store.data.bookings) throws on undefined,
+    // and store.audit throws on a missing audit array (proved locally:
+    // a {} data file made admin PIN verify 500). Backfilling loses
+    // nothing: existing keys are preserved, only missing ones are made.
+    if (!this.data.users || typeof this.data.users !== 'object') this.data.users = {};
+    if (!this.data.providers || typeof this.data.providers !== 'object') this.data.providers = {};
+    if (!this.data.providersByPhone || typeof this.data.providersByPhone !== 'object') this.data.providersByPhone = {};
+    if (!this.data.bookings || typeof this.data.bookings !== 'object') this.data.bookings = {};
+    if (!this.data.interviews || typeof this.data.interviews !== 'object') this.data.interviews = {};
+    if (!this.data.otps || typeof this.data.otps !== 'object') this.data.otps = {};
+    if (!this.data.phoneLogins || typeof this.data.phoneLogins !== 'object') this.data.phoneLogins = {};
+    if (!this.data.refreshTokens || typeof this.data.refreshTokens !== 'object') this.data.refreshTokens = {};
+    if (!Array.isArray(this.data.audit)) this.data.audit = [];
+    if (!Array.isArray(this.data.sos)) this.data.sos = [];
+    if (!Array.isArray(this.data.safetyReports)) this.data.safetyReports = [];
+    if (!this.data.adminPin || typeof this.data.adminPin !== 'object') this.data.adminPin = { hash: '', failures: 0, lockedUntil: null };
+    if (!Array.isArray(this.data.hotels)) this.data.hotels = HOTELS;
+    if (this.data.version == null) this.data.version = 1;
+    if (!this.data.createdAt) this.data.createdAt = nowIso();
     if (!this.data.messages) this.data.messages = {};
     if (!this.data.circumventionReports) this.data.circumventionReports = [];
     if (!this.data.vouchers) this.data.vouchers = [];
@@ -272,10 +294,19 @@ class Store {
   load() {
     try {
       if (fs.existsSync(this.file)) {
-        this.data = JSON.parse(fs.readFileSync(this.file, 'utf8'));
-        this.applyDefaults();
-        this.syncAdminPinFromEnv();
-        return;
+        const parsed = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+        // v2.1.12: a file that parses to a non-object (null, [], a
+        // string — a truncated/corrupt write) is not a document at all;
+        // reseeding beats running on a value applyDefaults cannot fix.
+        // A parsed OBJECT — even an empty {} — is backfilled, never
+        // wiped: its keys (users, bookings, ...) are real data.
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          this.data = parsed;
+          this.applyDefaults();
+          this.syncAdminPinFromEnv();
+          return;
+        }
+        console.warn('[store] data file is not an object, reseeding');
       }
     } catch (e) {
       console.warn('[store] could not read data file, reseeding:', e.message);

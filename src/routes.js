@@ -1023,6 +1023,12 @@ function cairoDateStr(d = new Date()) { return d.toLocaleDateString('en-CA', { t
 function cairoWeekdayShort(d = new Date()) { return d.toLocaleDateString('en-US', { timeZone: 'Africa/Cairo', weekday: 'short' }); } // 'Thu'
 
 async function sweepAutoRelease() {
+  // v2.1.12 — self-heal first: re-apply the store defaults so a partial
+  // document (a collection missing after a corrupt write or a document
+  // from before a collection existed) can never reject this sweep every
+  // 5 minutes forever. applyDefaults is idempotent and preserves every
+  // existing key; the sweep then reads only collections that exist.
+  store.applyDefaults();
   const now = Date.now();
   const released = [];
   const overdue = [];
@@ -1311,6 +1317,17 @@ router.get('/me/vouchers', requireAuth, (req, res) => {
 // not reach the user (no device / FCM not configured / all sends failed,
 // or still unread 10 minutes later — see the sweep). FCM registration
 // tokens are stored server-side only and NEVER returned by any API.
+// v2.1.12 — the client asks "does the server hold a device for ME?"
+// (count only — tokens never leave the server). The notifications
+// screen shows an honest per-device indicator from this count: the
+// local "registered" flag alone can outlive the server record, because
+// a deploy wipes data.json (devices included) while localStorage on
+// the phone survives — that stale-flag gap is how the broadcast tab
+// sat at 0 devices with nobody able to see why.
+router.get('/me/devices', requireAuth, (req, res) => {
+  res.json({ ok: true, devices: notify.devicesFor(req.user.phone).length });
+});
+
 router.post('/me/devices', requireAuth, (req, res) => {
   const token = String(req.body?.fcmToken || '');
   const platform = String(req.body?.platform || '').slice(0, 20) || null;
